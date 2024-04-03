@@ -227,6 +227,13 @@ defmodule Module.Types.DescrTest do
     end
   end
 
+  describe "map operations" do
+    test "get" do
+      assert map_get!(map(a: integer()), :a) == integer()
+      assert map_get!(dynamic(), dynamic()) == dynamic()
+    end
+  end
+
   describe "to_quoted" do
     test "bitmap" do
       assert union(integer(), union(float(), binary())) |> to_quoted_string() ==
@@ -272,16 +279,15 @@ defmodule Module.Types.DescrTest do
     test "map" do
       assert map() |> to_quoted_string() == "%{..}"
       assert map(a: integer()) |> to_quoted_string() == "%{:a => integer()}"
+      assert map([a: float()], :open) |> to_quoted_string() == "%{:a => float(), ..}"
 
       assert map(a: integer(), b: atom()) |> to_quoted_string() ==
                "%{:a => integer(), :b => atom()}"
 
-      assert map([a: float()], :open) |> to_quoted_string() == "%{:a => float(), ..}"
+      assert difference(map([a: float()], :open), map([a: float()], :closed))
+             |> to_quoted_string() == "%{:a => float(), ..} and not %{:a => float()}"
 
-      t = difference(map([a: float()], :open), map([a: float()], :closed))
-      assert t |> to_quoted_string() == "%{:a => float(), ..(+others)}"
-
-      assert difference(map(), map([])) |> to_quoted_string() == "%{..(+others)}"
+      assert difference(map(), empty_map()) |> to_quoted_string() == "%{..} and not %{}"
     end
   end
 end
