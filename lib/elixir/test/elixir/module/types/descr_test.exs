@@ -52,6 +52,16 @@ defmodule Module.Types.DescrTest do
       assert equal?(union(term(), dynamic()), term())
       assert equal?(union(intersection(dynamic(), atom()), atom()), atom())
     end
+
+    test "map" do
+      assert equal?(union(map(), map()), map())
+      assert equal?(union(map(a: integer()), map()), map())
+
+      a_integer_open = map([a: integer()], :open)
+      assert equal?(union(map(a: integer()), a_integer_open), a_integer_open)
+
+      assert equal?(union(map(a: integer()), negation(map(a: integer()))), term())
+    end
   end
 
   describe "intersection" do
@@ -84,6 +94,19 @@ defmodule Module.Types.DescrTest do
       assert equal?(intersection(term(), dynamic()), dynamic())
       assert empty?(intersection(dynamic(), none()))
       assert empty?(intersection(intersection(dynamic(), atom()), integer()))
+    end
+
+    test "map" do
+      assert intersection(map(), map()) == map()
+      assert equal?(intersection(map(a: integer()), map()), map(a: integer()))
+
+      a_integer_open = map([a: integer()], :open)
+      assert equal?(intersection(map(a: integer()), a_integer_open), map(a: integer()))
+
+      optional_a_integer_closed = map([{{:optional, [], [:a]}, integer()}], :closed)
+      assert equal?(intersection(map(a: integer()), optional_a_integer_closed), map(a: integer()))
+
+      assert empty?(intersection(map(a: integer()), map(a: atom())))
     end
   end
 
@@ -118,6 +141,20 @@ defmodule Module.Types.DescrTest do
       assert empty?(difference(dynamic(), term()))
       assert empty?(difference(none(), dynamic()))
     end
+
+    test "map" do
+      assert empty?(difference(map(), map()))
+      assert empty?(difference(map(), term()))
+      assert equal?(difference(map(), none()), map())
+      assert empty?(difference(map(a: integer()), map()))
+      assert empty?(difference(map(a: integer()), map(a: integer())))
+      assert empty?(difference(map(a: integer()), map([a: integer()], :open)))
+
+      assert equal?(
+               difference(map([a: atom()], :open), map(b: integer())),
+               map([a: atom()], :open)
+             )
+    end
   end
 
   describe "subtype" do
@@ -145,6 +182,19 @@ defmodule Module.Types.DescrTest do
       assert subtype?(intersection(dynamic(), integer()), integer())
       assert subtype?(integer(), union(dynamic(), integer()))
     end
+
+    test "map" do
+      assert subtype?(map(), term())
+      assert subtype?(map([a: integer()], :closed), map())
+      assert subtype?(map([a: integer()], :closed), map([a: integer()], :closed))
+      assert subtype?(map([a: integer()], :closed), map([a: integer()], :open))
+      assert subtype?(map([a: integer(), b: atom()], :closed), map([a: integer()], :open))
+      assert subtype?(map(a: integer()), map(a: union(integer(), atom())))
+
+      # optional
+      refute subtype?(map([{{:optional, [], [:a]}, integer()}]), map(a: integer()))
+      assert subtype?(map(a: integer()), map([{{:optional, [], [:a]}, integer()}]))
+    end
   end
 
   describe "compatible" do
@@ -169,6 +219,11 @@ defmodule Module.Types.DescrTest do
       assert compatible?(term(), dynamic())
       assert compatible?(dynamic(), integer())
       assert compatible?(integer(), dynamic())
+    end
+
+    test "map" do
+      assert compatible?(map(a: integer()), map())
+      assert compatible?(intersection(dynamic(), map()), map(a: integer()))
     end
   end
 
@@ -212,6 +267,21 @@ defmodule Module.Types.DescrTest do
 
       assert union(atom([:foo, :bar]), dynamic()) |> to_quoted_string() ==
                "dynamic() or (:bar or :foo)"
+    end
+
+    test "map" do
+      assert map() |> to_quoted_string() == "%{..}"
+      assert map(a: integer()) |> to_quoted_string() == "%{:a => integer()}"
+
+      assert map(a: integer(), b: atom()) |> to_quoted_string() ==
+               "%{:a => integer(), :b => atom()}"
+
+      assert map([a: float()], :open) |> to_quoted_string() == "%{:a => float(), ..}"
+
+      t = difference(map([a: float()], :open), map([a: float()], :closed))
+      assert t |> to_quoted_string() == "%{:a => float(), ..(+others)}"
+
+      assert difference(map(), map([])) |> to_quoted_string() == "%{..(+others)}"
     end
   end
 end
