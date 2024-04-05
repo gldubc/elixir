@@ -266,6 +266,13 @@ defmodule Module.Types.DescrTest do
       assert map_may_have_key?(map(foo: integer()), :foo)
       assert map_may_have_key?(dynamic(), :foo)
       refute map_may_have_key?(intersection(dynamic(), map([foo: unset()], :open)), :foo)
+
+      assert map_keys(map(a: integer())) == :sets.from_list([:a])
+      assert map_keys(map(a: integer(), b: atom())) == :sets.from_list([:a, :b])
+      refute map_keys(union(map(a: integer()), map(b: atom()))) == :sets.from_list([:a, :b])
+      assert map_keys(union(map(a: integer()), map(a: atom()))) == :sets.from_list([:a])
+      assert map_keys(intersection(dynamic(), map(a: integer()))) == :sets.from_list([:a])
+      assert map_keys(map()) == :sets.new()
     end
 
     test "type-checking map access" do
@@ -331,23 +338,23 @@ defmodule Module.Types.DescrTest do
     end
 
     test "map" do
-      assert map() |> to_quoted_string() == "%{..}"
+      assert map() |> to_quoted_string() == "%{...}"
       assert map(a: integer()) |> to_quoted_string() == "%{:a => integer()}"
-      assert map([a: float()], :open) |> to_quoted_string() == "%{.., :a => float()}"
+      assert map([a: float()], :open) |> to_quoted_string() == "%{..., :a => float()}"
 
       assert map(a: integer(), b: atom()) |> to_quoted_string() ==
                "%{:a => integer(), :b => atom()}"
 
       assert difference(map([a: float()], :open), map([a: float()], :closed))
-             |> to_quoted_string() == "%{.., :a => float()} and not %{:a => float()}"
+             |> to_quoted_string() == "%{..., :a => float()} and not %{:a => float()}"
 
-      assert difference(map(), empty_map()) |> to_quoted_string() == "%{..} and not %{}"
+      assert difference(map(), empty_map()) |> to_quoted_string() == "%{...} and not %{}"
 
       assert map(foo: union(integer(), unset())) |> to_quoted_string() ==
                "%{optional(:foo) => integer()}"
 
       assert difference(map([a: integer()], :open), map(b: boolean())) |> to_quoted_string() ==
-               "%{.., :a => integer()}"
+               "%{..., :a => integer()}"
     end
   end
 end

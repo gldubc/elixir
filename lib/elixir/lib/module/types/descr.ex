@@ -544,7 +544,7 @@ defmodule Module.Types.Descr do
 
   # Add the unset type to `type`
   defp or_unset(type), do: Map.update(type, :bitmap, @bit_unset, &(&1 ||| @bit_unset))
-  defp contains_unset?(type), do: (Map.get(type, :bitmap, 0) &&& @bit_unset) != 0
+  defp has_unset?(type), do: (Map.get(type, :bitmap, 0) &&& @bit_unset) != 0
 
   defp remove_unset(type) do
     case type do
@@ -634,6 +634,33 @@ defmodule Module.Types.Descr do
     compatible?(descr, map([{key, term()}], :open))
   end
 
+  @doc """
+  Gets the set of keys that are always present in a map.
+  """
+  def map_keys(%{} = descr) do
+    if subtype?(descr, map()) do
+      # does not work for input none()
+      Map.get(descr, :dynamic, descr).map
+      |> map_get_dnf()
+      |> process_list(
+        fn {:map, [fields, _, _]} ->
+          :sets.from_list(for {key, {false, _}} <- fields, do: key)
+        end,
+        &:sets.intersection(&1, &2)
+      )
+    else
+      :sets.new(version: 2)
+    end
+  end
+
+  def process_list([single_element], f, _combine), do: f.(single_element)
+
+  def process_list(list, f, combine) do
+    [head | tail] = list
+    initial_acc = f.(head)
+    Enum.reduce(tail, initial_acc, fn element, acc -> combine.(acc, f.(element)) end)
+  end
+
   # Assuming `descr` is a static type. Accessing `key` will, if it succeeds,
   # return a value of the type returned. To guarantee that the key is always
   # present, use `map_has_key?`. To guarantee that the key may be present
@@ -651,15 +678,13 @@ defmodule Module.Types.Descr do
     end
   end
 
-  # Returns a normalized DNF representation of a map type, that is, a union of
-  # map literals. The algorithm goes through every possible field (key) in the
-  # map. For each key found, we transform the disjunctive normal form of the map
-  # into a disjunctive normal form of pairs `{value_type, rest_of_map}` where
-  # the `key` is removed from `rest_of_map`. Each `key` produces a DNF of pairs,
-  # that is each time normalized (that is, simplified into a union of pairs
-  # disjoint on their first component) as part of `map_split_on_key`. The result
-  # is then used to produce a single list that is a union of map literals of the
-  # form                `{:map_literal, [fields, is_open, has_empty]}`
+  # Given a map bdd, normalizes it into a union of maps of the form
+  #                {:map, [fields, is_open, has_empty]}
+  #
+  # For each key in the bdd, transform the dnf of the map into a dnf of pairs
+  # `{value_type, rest_of_map}` where `key` is removed from `rest_of_map`.
+  # Each `key` produces a dnf of pairs, that is each time normalized (into a
+  # disjoint union of pairs) as part of `map_split_on_key`. The result is used
   defp map_get_dnf(d), do: map_get_dnf(d, [])
 
   defp map_get_dnf(d, fields_acc) do
@@ -669,7 +694,7 @@ defmodule Module.Types.Descr do
         {is_open, has_empty} = empty_cases(d)
 
         if is_open or has_empty,
-          do: [{:map_literal, [Enum.sort(fields_acc), is_open, has_empty]}],
+          do: [{:map, [Enum.sort(fields_acc), is_open, has_empty]}],
           else: []
 
       {:key, key} ->
@@ -677,7 +702,7 @@ defmodule Module.Types.Descr do
         # on the rest of the map (which does not contain the key anymore)
         map_split_on_key(d, key)
         |> Enum.flat_map(fn {value_type, rest_of_map} ->
-          type_with_option = {contains_unset?(value_type), remove_unset(value_type)}
+          type_with_option = {has_unset?(value_type), remove_unset(value_type)}
           map_get_dnf(rest_of_map.map, [{key, type_with_option} | fields_acc])
         end)
     end
@@ -784,18 +809,18 @@ defmodule Module.Types.Descr do
     end
   end
 
-  def map_dnf_to_quoted({:map_literal, [fields, is_open, has_empty]}) do
+  def map_dnf_to_quoted({:map, [fields, is_open, has_empty]}) do
     case {is_open, has_empty} do
       {false, true} ->
         {:%{}, [], map_literal_to_quoted(fields, is_open)}
 
       {true, true} ->
-        {:%{}, [], [{:.., [], nil} | map_literal_to_quoted(fields, is_open)]}
+        {:%{}, [], [{:..., [], nil} | map_literal_to_quoted(fields, is_open)]}
 
       {true, false} ->
         {:and, [],
          [
-           {:%{}, [], [{:.., [], nil} | map_literal_to_quoted(fields, is_open)]},
+           {:%{}, [], [{:..., [], nil} | map_literal_to_quoted(fields, is_open)]},
            {:not, [], [{:%{}, [], map_literal_to_quoted(fields, is_open)}]}
          ]}
     end
