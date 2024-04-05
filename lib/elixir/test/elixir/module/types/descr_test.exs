@@ -56,11 +56,13 @@ defmodule Module.Types.DescrTest do
     test "map" do
       assert equal?(union(map(), map()), map())
       assert equal?(union(map(a: integer()), map()), map())
+      assert equal?(union(map(a: integer()), negation(map(a: integer()))), term())
 
       a_integer_open = map([a: integer()], :open)
       assert equal?(union(map(a: integer()), a_integer_open), a_integer_open)
 
-      assert equal?(union(map(a: integer()), negation(map(a: integer()))), term())
+      assert difference(map([a: integer()], :open), map(b: boolean()))
+             |> equal?(map([a: integer()], :open))
     end
   end
 
@@ -228,9 +230,58 @@ defmodule Module.Types.DescrTest do
   end
 
   describe "map operations" do
-    test "get" do
+    test "get field" do
       assert map_get!(map(a: integer()), :a) == integer()
       assert map_get!(dynamic(), dynamic()) == dynamic()
+
+      assert map_get!(intersection(dynamic(), map([a: integer()], :open)), :a) ==
+               intersection(integer(), dynamic())
+
+      assert equal?(
+               map_get!(
+                 intersection(
+                   map([my_map: map([foo: integer()], :open)], :open),
+                   map([my_map: map([bar: boolean()], :open)], :open)
+                 ),
+                 :my_map
+               ),
+               map([foo: integer(), bar: boolean()], :open)
+             )
+
+      assert map_get!(union(map(a: integer()), map(a: atom())), :a) == union(integer(), atom())
+      assert map_get!(union(map(a: integer()), map(b: atom())), :a) == integer()
+    end
+
+    test "key presence" do
+      assert map_has_key?(map(a: integer()), :a)
+      refute map_has_key?(map(a: integer()), :b)
+      refute map_has_key?(map(), :a)
+      refute map_has_key?(map(a: union(integer(), unset())), :a)
+      refute map_has_key?(union(map(a: integer()), map(b: atom())), :a)
+      assert map_has_key?(union(map(a: integer()), map(a: atom())), :a)
+      assert map_has_key?(intersection(dynamic(), map(a: integer())), :a)
+      refute map_has_key?(intersection(dynamic(), map(a: integer())), :b)
+
+      refute map_may_have_key?(map(foo: integer()), :bar)
+      assert map_may_have_key?(map(foo: integer()), :foo)
+      assert map_may_have_key?(dynamic(), :foo)
+      refute map_may_have_key?(intersection(dynamic(), map([foo: unset()], :open)), :foo)
+    end
+
+    test "type-checking map access" do
+      # dynamic() and %{..., :a => integer(), optional(:b) => none()}
+      t = intersection(dynamic(), map([a: integer(), c: unset()], :open))
+
+      assert subtype?(map_get!(t, :a), integer())
+      assert map_get!(t, :b) == dynamic()
+
+      assert map_has_key?(t, :a)
+      refute map_has_key?(t, :b)
+      refute map_has_key?(t, :c)
+
+      assert map_may_have_key?(t, :a)
+      assert map_may_have_key?(t, :b)
+      refute map_may_have_key?(t, :c)
     end
   end
 
@@ -274,20 +325,29 @@ defmodule Module.Types.DescrTest do
 
       assert union(atom([:foo, :bar]), dynamic()) |> to_quoted_string() ==
                "dynamic() or (:bar or :foo)"
+
+      assert intersection(dynamic(), map(a: integer())) |> to_quoted_string() ==
+               "dynamic() and %{:a => integer()}"
     end
 
     test "map" do
       assert map() |> to_quoted_string() == "%{..}"
       assert map(a: integer()) |> to_quoted_string() == "%{:a => integer()}"
-      assert map([a: float()], :open) |> to_quoted_string() == "%{:a => float(), ..}"
+      assert map([a: float()], :open) |> to_quoted_string() == "%{.., :a => float()}"
 
       assert map(a: integer(), b: atom()) |> to_quoted_string() ==
                "%{:a => integer(), :b => atom()}"
 
       assert difference(map([a: float()], :open), map([a: float()], :closed))
-             |> to_quoted_string() == "%{:a => float(), ..} and not %{:a => float()}"
+             |> to_quoted_string() == "%{.., :a => float()} and not %{:a => float()}"
 
       assert difference(map(), empty_map()) |> to_quoted_string() == "%{..} and not %{}"
+
+      assert map(foo: union(integer(), unset())) |> to_quoted_string() ==
+               "%{optional(:foo) => integer()}"
+
+      assert difference(map([a: integer()], :open), map(b: boolean())) |> to_quoted_string() ==
+               "%{.., :a => integer()}"
     end
   end
 end

@@ -7,8 +7,9 @@ defmodule Module.Types.Descr do
   # types require specific data structures.
 
   # Vocabulary:
-  # DNF: disjunctive normal form
-  # BDD: binary decision diagram
+  # DNF: disjunctive normal form (a union of intersections, encoded as a list)
+  # BDD: binary decision diagram (a tree representing a type)
+  # line: a path from the root of a BDD to a `true` leaf
 
   # TODO: When we convert from AST to descr, we need to normalize
   # the dynamic type.
@@ -27,7 +28,7 @@ defmodule Module.Types.Descr do
   @bit_fun 1 <<< 9
   @bit_top (1 <<< 10) - 1
 
-  @bit_undef 1 <<< 10
+  @bit_unset 1 <<< 10
 
   @atom_top {:negation, :sets.new(version: 2)}
   @map_top {{:open, %{}}, true, false}
@@ -40,14 +41,15 @@ defmodule Module.Types.Descr do
 
   # Map helpers
 
-  @undef %{bit: @bit_undef}
-  @term_or_undef %{bitmap: @bit_top ||| @bit_undef, atom: @atom_top, map: @map_top}
+  @unset %{bitmap: @bit_unset}
+  @term_or_unset %{bitmap: @bit_top ||| @bit_unset, atom: @atom_top, map: @map_top}
 
   # Type definitions
 
   def dynamic(), do: @dynamic
   def term(), do: @term
   def none(), do: @none
+  def unset(), do: @unset
 
   def atom(as), do: %{atom: atom_new(as)}
   def atom(), do: %{atom: @atom_top}
@@ -74,8 +76,8 @@ defmodule Module.Types.Descr do
   @doc """
   Check type is empty.
   """
-  def empty?(descr), do: descr == @none or not not_empty?(descr)
-  def term?(descr), do: Map.delete(descr, :dynamic) == @term or subtype?(@term, descr)
+  def empty?(descr), do: not not_empty?(descr)
+  def term?(descr), do: subtype_static(@term, Map.delete(descr, :dynamic))
   def gradual?(descr), do: is_map_key(descr, :dynamic)
 
   @doc """
@@ -188,19 +190,18 @@ defmodule Module.Types.Descr do
   def negation(%{} = descr), do: difference(term(), descr)
 
   @doc """
-  Check if a type is non-empty. For gradual types, check that the upper bound (in the dynamic part)
-  is non-empty.
+  Check if a type is non-empty. For gradual types, check that the upper bound
+  (the dynamic part) is non-empty. Stop as soon as one non-empty component is found.
+  Simpler components (bitmap, atom) are checked first for speed since, if they are
+  present, the type is non-empty as we normalize then during construction.
   """
   def not_empty?(%{} = descr) do
-    iterator_not_empty(:maps.next(:maps.iterator(Map.get(descr, :dynamic, descr))))
-  end
+    descr = Map.get(descr, :dynamic, descr)
 
-  # If `:bitmap` or `:atom` are set, the type is non-empty since we normalize
-  # them during construction.
-  @compile {:inline, not_empty?: 1}
-  def not_empty?(:bitmap, _val), do: true
-  def not_empty?(:atom, _val), do: true
-  def not_empty?(:map, bdd), do: map_get_dnf(bdd) != []
+    descr != @none and
+      (Map.has_key?(descr, :bitmap) or Map.has_key?(descr, :atom) or
+         (Map.has_key?(descr, :map) and map_get_dnf(descr.map) != []))
+  end
 
   @doc """
   Converts a descr to its quoted representation.
@@ -278,12 +279,6 @@ defmodule Module.Types.Descr do
   end
 
   defp iterator_difference(:none, map), do: map
-
-  defp iterator_not_empty({key, v, iterator}) do
-    if not_empty?(key, v), do: true, else: iterator_not_empty(:maps.next(iterator))
-  end
-
-  defp iterator_not_empty(:none), do: false
 
   ## Type relations
 
@@ -466,8 +461,8 @@ defmodule Module.Types.Descr do
     |> List.wrap()
   end
 
-  # Dynamic
-  #
+  ## Dynamic
+
   # A type with a dynamic component is a gradual type; without, it is a static
   # type. The dynamic component itself is a static type; hence, any gradual type
   # can be written using a pair of static types as the union:
@@ -548,25 +543,25 @@ defmodule Module.Types.Descr do
   # `unset()` has no meaning outside of map types.
 
   # Add the unset type to `type`
-  defp or_unset(type), do: Map.update(type, :bitmap, @bit_undef, &(&1 ||| @bit_undef))
-  defp contains_unset?(type), do: (Map.get(type, :bitmap, 0) &&& @bit_undef) != 0
+  defp or_unset(type), do: Map.update(type, :bitmap, @bit_unset, &(&1 ||| @bit_unset))
+  defp contains_unset?(type), do: (Map.get(type, :bitmap, 0) &&& @bit_unset) != 0
 
   defp remove_unset(type) do
     case type do
-      %{:bitmap => @bit_undef} -> Map.delete(type, :bitmap)
-      %{:bitmap => bitmap} -> Map.put(type, :bitmap, bitmap &&& ~~~@bit_undef)
+      %{:bitmap => @bit_unset} -> Map.delete(type, :bitmap)
+      %{:bitmap => bitmap} -> Map.put(type, :bitmap, bitmap &&& ~~~@bit_unset)
       _ -> type
     end
   end
 
   # Map
-  #
+
   # Map types are stored in a tree (binary decision diagram) that contains
   # map literals at the nodes.
   #
   # A map literal is a pair `{tag, fields}` where
   #   - `tag` is either `:open` or `:closed`.
-  #   - `fields` is a map that associates key literals with types
+  #   - `fields` is a map that associates key values with types
   #
   # The tree encodes arbitrary unions and intersections of map literals. For example,
   # the intersection of the closed map `%{a: integer()}` with the closed map
@@ -579,9 +574,9 @@ defmodule Module.Types.Descr do
   #       true                    false
   #
   # To see the type represented by this tree, start from the root and find every
-  # path to leaves containing `true`. Each path represents the intersection of
-  # its map literals, where each literal is either taken positively if followed
-  # by a left edge, or negated if followed by a right edge.
+  # path to `true` leaves. Each path represents the intersection of its map
+  # literals, where each literal is either taken positively if followed by a
+  # left edge, or negated if followed by a right edge.
   #
   # For example, this similar tree
   #
@@ -593,7 +588,11 @@ defmodule Module.Types.Descr do
   #
   # represents the union of (the intersection of `%{a: integer()}` and `%{a: atom()}`)
   # with (the intersection of `%{a: integer()}` and `not %{a: atom()}`).
+  #
+  # TODO: add domain key types https://www.irif.fr/~gc/papers/icfp23.pdf
+  # and adapt the constructors to support them.
 
+  # Creates a map literal. Keys have to be values.
   defp map_new(pairs, open_or_closed) do
     fields =
       Map.new(pairs, fn
@@ -604,25 +603,41 @@ defmodule Module.Types.Descr do
     bdd_new({open_or_closed, fields})
   end
 
-  defp map_make(tag, fields), do: %{map: bdd_new({tag, fields})}
+  defp descr_map_make(tag, fields), do: %{map: bdd_new({tag, fields})}
 
-  # Gets the type of a key in a type that can contain maps.
+  @doc """
+  Gets the type of the value returned by accessing `key` on `map`.
+  Does guarantee the key exists. To do that, use `map_has_key?`.
+  """
   def map_get!(%{} = descr, key) do
     if not gradual?(descr) do
       map_get_static(descr, key)
     else
       {dynamic, static} = Map.pop(descr, :dynamic)
-      dynamic_key_type = map_get_static(dynamic, key)
-      static_key_type = map_get_static(static, key)
-      union(intersection(dynamic(), dynamic_key_type), static_key_type)
+      dynamic_value_type = map_get_static(dynamic, key)
+      static_value_type = map_get_static(static, key)
+      union(intersection(dynamic(), dynamic_value_type), static_value_type)
     end
   end
 
-  # Assuming `descr` is a static type, returns the type of `key` in the intersection
-  # of `descr` with `map()`. This does not guarantee that `key` is always present in
-  # values of type `descr` (to do that, do a subtyping check), however, it guarantees
-  # that the type of a value obtained by accessing `key` in a value of type `descr`
-  # will be of the returned type.
+  @doc """
+  Check that a key is present.
+  """
+  def map_has_key?(descr, key) do
+    subtype?(descr, map([{key, term()}], :open))
+  end
+
+  @doc """
+  Check that a key may be present.
+  """
+  def map_may_have_key?(descr, key) do
+    compatible?(descr, map([{key, term()}], :open))
+  end
+
+  # Assuming `descr` is a static type. Accessing `key` will, if it succeeds,
+  # return a value of the type returned. To guarantee that the key is always
+  # present, use `map_has_key?`. To guarantee that the key may be present
+  # use `map_may_have_key?`. If key is never present, result will be `none()`.
   defp map_get_static(descr, key) do
     descr_map = intersection(descr, map())
 
@@ -632,19 +647,20 @@ defmodule Module.Types.Descr do
       map_split_on_key(descr_map.map, key)
       |> Enum.reduce(none(), fn {typeof_key, _}, union -> union(typeof_key, union) end)
       |> Kernel.then(fn typeof_key -> if empty?(typeof_key), do: raise(""), else: typeof_key end)
+      |> remove_unset()
     end
   end
 
-  # Returns a normalized DNF representation of a map type, that is, a union of map literals.
-  # The algorithm goes through every possible field (key) in the map.
-  # For each key found, we transform the disjunctive normal form of the
-  # map into a disjunctive normal form of pairs `{typeof key, rest_of_map}`
-  # where the field `key` is removed from `rest_of_map`.
-  # Each `key` produces a DNF of pairs, that is each time normalized (that is,
-  # simplified into a union of pairs disjoint on their first component)
-  # as part of `map_split_on_key`. The result is then used to produce
-  # a single list that is a union of map literals of the form `{:map_literal, [fields, is_open, has_empty]}`
-  def map_get_dnf(d), do: map_get_dnf(d, [])
+  # Returns a normalized DNF representation of a map type, that is, a union of
+  # map literals. The algorithm goes through every possible field (key) in the
+  # map. For each key found, we transform the disjunctive normal form of the map
+  # into a disjunctive normal form of pairs `{value_type, rest_of_map}` where
+  # the `key` is removed from `rest_of_map`. Each `key` produces a DNF of pairs,
+  # that is each time normalized (that is, simplified into a union of pairs
+  # disjoint on their first component) as part of `map_split_on_key`. The result
+  # is then used to produce a single list that is a union of map literals of the
+  # form                `{:map_literal, [fields, is_open, has_empty]}`
+  defp map_get_dnf(d), do: map_get_dnf(d, [])
 
   defp map_get_dnf(d, fields_acc) do
     case find_key(d) do
@@ -660,8 +676,8 @@ defmodule Module.Types.Descr do
         # Split the map on the found key; for each possible split, recurse
         # on the rest of the map (which does not contain the key anymore)
         map_split_on_key(d, key)
-        |> Enum.flat_map(fn {key_type, rest_of_map} ->
-          type_with_option = {contains_unset?(key_type), remove_unset(key_type)}
+        |> Enum.flat_map(fn {value_type, rest_of_map} ->
+          type_with_option = {contains_unset?(value_type), remove_unset(value_type)}
           map_get_dnf(rest_of_map.map, [{key, type_with_option} | fields_acc])
         end)
     end
@@ -672,11 +688,16 @@ defmodule Module.Types.Descr do
     case bdd do
       true -> nil
       false -> nil
-      {{_tag, fields}, _, _} when map_size(fields) > 0 -> {:key, Map.keys(fields) |> hd()}
+      {{_tag, fields}, _, _} when map_size(fields) != 0 -> {:key, Map.keys(fields) |> hd()}
       {_, left_bdd, right_bdd} -> find_key(left_bdd) || find_key(right_bdd)
     end
   end
 
+  # Given a map bdd with no named fields, returns a pair of booleans
+  # `{is_open, has_empty}` where `is_open` is true if the map is open, and
+  # `has_empty` is true if it contains the empty map.
+  # For example, `%{...}` returns `{true, true}`, `%{}` returns `{false, true}`,
+  # and `%{...} and not %{}` returns `{true, false}`.
   def empty_cases(bdd) do
     case bdd do
       true ->
@@ -700,26 +721,11 @@ defmodule Module.Types.Descr do
   end
 
   # Takes a map bdd and a key, and returns an equivalent dnf of pairs.
-  # See `aux_p`.
+  # See `split_line_on_key/5`.
   defp map_split_on_key(d, key) do
     bdd_get(d)
     |> Enum.flat_map(fn {pos, neg} -> split_line_on_key(pos, neg, key, [], []) end)
-    |> pair_simplify_dnf(@term_or_undef)
-  end
-
-  # Splits a map literal on a key. This means that given a map literal, compute
-  # the pair of types `{key_type, rest_of_map}` where `typeof_key` is the type
-  # of the key in the map, and `rest_of_map` is obtained by removing `key` from it.
-  defp single_split({tag, fields}, key) do
-    {key_type, rest_of_map} = Map.pop(fields, key)
-
-    cond do
-      key_type != nil -> {key_type, map_make(tag, rest_of_map)}
-      tag == :closed -> {@undef, map_make(tag, rest_of_map)}
-      # case where there is an open map with no keys { .. }
-      map_size(fields) == 0 -> :no_split
-      true -> {@term_or_undef, map_make(tag, rest_of_map)}
-    end
+    |> pair_simplify_dnf(@term_or_unset)
   end
 
   # Given a line, that is, a list `positive` of map literals and `negative` of
@@ -734,8 +740,8 @@ defmodule Module.Types.Descr do
         split_line_on_key(positive, negative, key, pos_acc, neg_acc)
 
       # {typeof l, rest} is added to the positive accumulator
-      {key_type, rest_of_map} ->
-        split_line_on_key(positive, negative, key, [{key_type, rest_of_map} | pos_acc], neg_acc)
+      {value_type, rest_of_map} ->
+        split_line_on_key(positive, negative, key, [{value_type, rest_of_map} | pos_acc], neg_acc)
     end
   end
 
@@ -746,8 +752,23 @@ defmodule Module.Types.Descr do
         []
 
       # {typeof l, rest_of_map} is added to the negative accumulator
-      {key_type, rest_of_map} ->
-        split_line_on_key([], negative, key, pos_acc, [{key_type, rest_of_map} | neg_acc])
+      {value_type, rest_of_map} ->
+        split_line_on_key([], negative, key, pos_acc, [{value_type, rest_of_map} | neg_acc])
+    end
+  end
+
+  # Splits a map literal on a key. This means that given a map literal, compute
+  # the pair of types `{value_type, rest_of_map}` where `value_type` is the type
+  # associated with `key`, and `rest_of_map` is obtained by removing `key`.
+  defp single_split({tag, fields}, key) do
+    {value_type, rest_of_map} = Map.pop(fields, key)
+
+    cond do
+      value_type != nil -> {value_type, descr_map_make(tag, rest_of_map)}
+      tag == :closed -> {@unset, descr_map_make(tag, rest_of_map)}
+      # case where there is an open map with no keys { .. }
+      map_size(fields) == 0 -> :no_split
+      true -> {@term_or_unset, descr_map_make(tag, rest_of_map)}
     end
   end
 
@@ -763,18 +784,18 @@ defmodule Module.Types.Descr do
     end
   end
 
-  defp map_dnf_to_quoted({:map_literal, [fields, is_open, has_empty]}) do
+  def map_dnf_to_quoted({:map_literal, [fields, is_open, has_empty]}) do
     case {is_open, has_empty} do
       {false, true} ->
         {:%{}, [], map_literal_to_quoted(fields, is_open)}
 
       {true, true} ->
-        {:%{}, [], map_literal_to_quoted(fields, is_open) ++ [{:.., [], nil}]}
+        {:%{}, [], [{:.., [], nil} | map_literal_to_quoted(fields, is_open)]}
 
       {true, false} ->
         {:and, [],
          [
-           {:%{}, [], map_literal_to_quoted(fields, is_open) ++ [{:.., [], nil}]},
+           {:%{}, [], [{:.., [], nil} | map_literal_to_quoted(fields, is_open)]},
            {:not, [], [{:%{}, [], map_literal_to_quoted(fields, is_open)}]}
          ]}
     end
@@ -784,8 +805,8 @@ defmodule Module.Types.Descr do
     for {key, {optional_field?, type}} <- map,
         not (is_open and optional_field? and term?(type)) do
       if optional_field?,
-        do: {{:optional, [], [key]}, to_quoted(type)},
-        else: {key, to_quoted(type)}
+        do: {{:optional, [], [literal(key)]}, to_quoted(type)},
+        else: {literal(key), to_quoted(type)}
     end
   end
 
@@ -796,7 +817,7 @@ defmodule Module.Types.Descr do
   # Set operations are generic tree merges, which use the global ordering of
   # values to approximately balance the tree. Semantic information (such as: is
   # the type empty?) is obtained when needed by extracting the information from
-  # the tree and normalizing it (see `map_get_dnf` for example).
+  # the tree and normalizing it (see `map_get_dnf/1` for example).
 
   defp bdd_new(literal), do: {literal, true, false}
 
@@ -846,15 +867,14 @@ defmodule Module.Types.Descr do
   # starts from the root and ends in a leaf with value `true` represents an intersection
   # of literals (where a literal is positive if the path goes left, and negative
   # if it goes right). The type is the union of all the lines.
-  defp bdd_get(bdd), do: bdd_get(bdd, [], [])
+  defp bdd_get(bdd), do: bdd_get([], bdd, [], [])
 
-  defp bdd_get(false, _pos, _neg), do: []
-  defp bdd_get(true, pos_acc, neg_acc), do: [{pos_acc, neg_acc}]
+  defp bdd_get(acc, false, _pos, _neg), do: acc
+  defp bdd_get(acc, true, pos_acc, neg_acc), do: [{pos_acc, neg_acc} | acc]
 
-  # TODO: optimize the ++
-  defp bdd_get({literal, bdd_left, bdd_right}, pos_acc, neg_acc) do
-    bdd_get(bdd_left, [literal | pos_acc], neg_acc) ++
-      bdd_get(bdd_right, pos_acc, [literal | neg_acc])
+  defp bdd_get(acc, {literal, bdd_left, bdd_right}, pos_acc, neg_acc) do
+    bdd_get(acc, bdd_right, pos_acc, [literal | neg_acc])
+    |> bdd_get(bdd_left, [literal | pos_acc], neg_acc)
   end
 
   # Pairs
@@ -863,74 +883,83 @@ defmodule Module.Types.Descr do
   # convert them into disjunctive normal forms of pairs of types, and define
   # normalization algorithms on pairs.
 
-  # Takes a pair DNF (list of lines, where each line is a pair of positive literals
-  # and negative literals) and simplifies into a equivalent type that is a
-  # single list (union) of type pairs. The optional `term` argument should be
-  # either `@term_or_undef` (for map value types) or `@term` (in general).
-  defp pair_simplify_dnf(dnf, term \\ @term) do
-    Enum.flat_map(dnf, &pair_simplify_line([], &1, term))
+  # Takes a DNF of pairs and simplifies it into a equivalent single list (union)
+  # of type pairs. The `term` argument should be either `@term_or_unset` (for
+  # map value types) or `@term` in general.
+  # Remark: all lines of a pair bdd are naturally disjoint, because choosing a
+  # different edge means intersect with a literal or its negation.
+  defp pair_simplify_dnf(dnf, term) do
+    Enum.flat_map(dnf, &pair_simplify_line(&1, term))
   end
 
-  def pair_simplify_line(accu, {positive, negative}, term \\ @term) do
+  # A line is a bdd path from the root to a `true` leaf. It is initially stored
+  # as a list of pairs `{positive, negative}` where `positive` is a list of
+  # literals and `negative` is a list of negated literals. Positive pairs can
+  # all be intersected component-wise. Negative ones are eliminated iteratively.
+  defp pair_simplify_line({positive, negative}, term) do
     {fst, snd} = pair_intersection(positive, term)
 
-    if empty?(fst) or empty?(snd) do
-      accu
-    else
-      residual = none()
-
-      {accu, residual} =
-        make_pairs_disjoint(negative)
-        |> Enum.reduce(
-          {accu, residual},
-          fn {t1, t2}, {accu, residual} ->
-            i = intersection(fst, t1)
-            j = intersection(snd, t2)
-
-            if not_empty?(i) and not_empty?(j) do
-              resid = union(residual, t1)
-              snd_diff = difference(snd, t2)
-
-              if not_empty?(snd_diff),
-                do: {add_pair_to_disjoint_list(accu, i, snd_diff, []), resid},
-                else: {accu, resid}
-            else
-              {accu, residual}
-            end
-          end
-        )
-
-      fst_diff = difference(fst, residual)
-
-      if not_empty?(fst_diff),
-        do: add_pair_to_disjoint_list(accu, fst_diff, snd, []),
-        else: accu
-    end
+    if empty?(fst) or empty?(snd),
+      do: [],
+      else: make_pairs_disjoint(negative) |> eliminate_negations(fst, snd)
   end
 
-  # Computes the component-wise intersection of a list of pairs.
-  def pair_intersection(pair_list, term \\ @term) do
+  # Eliminates negations from `{t, s} and not negative`.
+  # Formula:
+  #   if `negative` is a union of pairs disjoint on their first component:
+  #                 union<i=1..n> {t_i, s_i}
+  #   then
+  #                 {t, s} and not (union<i=1..n> {t_i, s_i})
+  #   is equivalent to
+  #                 union<i=1..n> {t and t_i, s and not s_i}
+  #                     or {t and not (union{i=1..n} t_i), s}
+  # which eliminates all top-level negations and produces a union of pairs
+  # that are disjoint on their first component.
+  defp eliminate_negations(negative, t, s) do
+    {pair_union, union_of_t_i} =
+      Enum.reduce(
+        negative,
+        {[], none()},
+        fn {t_i, s_i}, {accu, union_of_t_i} ->
+          i = intersection(t, t_i)
+          j = intersection(s, s_i)
+
+          # discard negative literals that do not intersect with the positive ones
+          if not_empty?(i) and not_empty?(j) do
+            union_of_t_i = union(union_of_t_i, t_i)
+            s_diff = difference(s, s_i)
+
+            if not_empty?(s_diff),
+              do: {[{i, s_diff} | accu], union_of_t_i},
+              else: {accu, union_of_t_i}
+          else
+            {accu, union_of_t_i}
+          end
+        end
+      )
+
+    t_diff = difference(t, union_of_t_i)
+
+    if not_empty?(t_diff),
+      do: [{t_diff, s} | pair_union],
+      else: pair_union
+  end
+
+  # Component-wise intersection of a list of pairs.
+  defp pair_intersection(pair_list, term) do
     Enum.reduce(pair_list, {term, term}, fn {x1, x2}, {acc1, acc2} ->
       {intersection(acc1, x1), intersection(acc2, x2)}
     end)
   end
 
-  # Given the invariant that `disjoint_pairs ++ acc` forms a list of disjoint pairs,
-  # the function goes through `disjoint_pairs` to see for which pairs `fst`
-  # has a non-empty intersection with (overlap). The decomposition of `{fst, snd}`
-  # over each such pair (at most three elements) gets added into `acc`.
-  # In particular, if a pair is found such that `fst` is a subtype of the first
-  # element, then there is no use to go through the whole list anymore (because
-  # this pair was disjoint with the others).
-
-  # Inserts a pair of types `{fst, snd}` into a list of pairs that are disjoint
+  # Inserts a pair of types {fst, snd} into a list of pairs that are disjoint
   # on their first component. The invariant on `acc` is that its elements are
-  # two-to-two disjoint with the pairs of the input list `pairs`.
+  # two-to-two disjoint with the first argument's `pairs`.
   #
-  # To insert a pair into a disjoint list `pairs`, we go through the list to find
-  # each pair whose first element has a non-empty intersection with `fst`. Then,
-  # we decompose `{fst, snd}` over each such pair, and add the decompositions
-  # into the accumulator..
+  # To insert {fst, snd} into a disjoint pairs list, we go through the list to find
+  # each pair whose first element has a non-empty intersection with `fst`. Then
+  # we decompose {fst, snd} over each such pair to produce disjoint ones, and add
+  # the decompositions into the accumulator.
   defp add_pair_to_disjoint_list([], fst, snd, acc), do: [{fst, snd} | acc]
 
   defp add_pair_to_disjoint_list([{s1, s2} | pairs], fst, snd, acc) do
@@ -947,9 +976,10 @@ defmodule Module.Types.Descr do
       cond do
         # case fst = s1
         empty_fst_diff and empty_s1_diff ->
-          add_pair_to_disjoint_list(pairs, fst, union(snd, s2), acc)
+          [{x, union(snd, s2)} | Enum.reverse(pairs, acc)]
 
-        # fst is a subtype of s1 and disjointness is ensured by the invariant
+        # special case: if fst is a subtype of s1, the disjointness invariant
+        # ensures we can safely add those two pairs and end the recursion
         empty_fst_diff ->
           [{s1_diff, s2}, {x, union(snd, s2)} | Enum.reverse(pairs, acc)]
 
@@ -965,7 +995,7 @@ defmodule Module.Types.Descr do
     end
   end
 
-  # Makes a list of pairs into an equivalent list of pairs disjoint on their first component.
+  # Makes a union (list) of pairs into an equivalent disjoint union of pairs.
   def make_pairs_disjoint(pairs) do
     Enum.reduce(pairs, [], fn {t1, t2}, acc -> add_pair_to_disjoint_list(acc, t1, t2, []) end)
   end
