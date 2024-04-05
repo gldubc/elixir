@@ -356,5 +356,28 @@ defmodule Module.Types.DescrTest do
       assert difference(map([a: integer()], :open), map(b: boolean())) |> to_quoted_string() ==
                "%{..., :a => integer()}"
     end
+
+    test "key domain types" do
+      map([], %{:integer => integer()}) |> to_quoted_string() |> dbg()
+
+      assert map([a: integer()], %{:atom => float()}) |> map_get!(:a) == integer()
+      assert map([a: integer()], %{:atom => float()}) |> map_get!(:b) == float()
+
+      assert intersection(
+               map([], %{:atom => union(integer(), atom())}),
+               map([], %{:atom => atom()})
+             )
+             |> to_quoted_string() ==
+               "%{optional(atom()) => atom()}"
+
+      assert intersection(map([], :open), map([], %{:integer => integer()}))
+             |> to_quoted_string() == "%{optional(integer()) => integer()}"
+
+      assert intersection(map([], :closed), map([], %{:integer => integer()}))
+             |> equal?(map([], :closed))
+
+      assert map([a: integer()], %{:integer => integer()}) |> to_quoted_string() ==
+               "%{:a => integer(), optional(integer()) => integer()}"
+    end
   end
 end

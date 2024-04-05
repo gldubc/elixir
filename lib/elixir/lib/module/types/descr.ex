@@ -43,6 +43,7 @@ defmodule Module.Types.Descr do
 
   @unset %{bitmap: @bit_unset}
   @term_or_unset %{bitmap: @bit_top ||| @bit_unset, atom: @atom_top, map: @map_top}
+  @steps [:binary, :integer, :float, :pid, :port, :reference, :list, :tuple, :fun, :term]
 
   # Type definitions
 
@@ -604,7 +605,7 @@ defmodule Module.Types.Descr do
     bdd_new({open_or_closed, fields})
   end
 
-  defp descr_map_make(tag, fields), do: %{map: bdd_new({tag, fields})}
+  defp map_descr(tag, fields), do: %{map: bdd_new({tag, fields})}
 
   @doc """
   Gets the type of the value returned by accessing `key` on `map`.
@@ -626,6 +627,23 @@ defmodule Module.Types.Descr do
   """
   def map_has_key?(descr, key) do
     subtype?(descr, map([{key, term()}], :open))
+  end
+
+  # Assuming `descr` is a static type. Accessing `key` will, if it succeeds,
+  # return a value of the type returned. To guarantee that the key is always
+  # present, use `map_has_key?`. To guarantee that the key may be present
+  # use `map_may_have_key?`. If key is never present, result will be `none()`.
+  defp map_get_static(descr, key) do
+    descr_map = intersection(descr, map())
+
+    if empty?(descr_map) do
+      none()
+    else
+      map_split_on_key(descr_map.map, {:key, key})
+      |> Enum.reduce(none(), fn {typeof_key, _}, union -> union(typeof_key, union) end)
+      |> Kernel.then(fn typeof_key -> if empty?(typeof_key), do: raise(""), else: typeof_key end)
+      |> remove_unset()
+    end
   end
 
   @doc """
@@ -663,22 +681,6 @@ defmodule Module.Types.Descr do
     Enum.reduce(tail, initial_acc, fn element, acc -> combine.(acc, f.(element)) end)
   end
 
-  # Assuming `descr` is a static type. Accessing `key` will, if it succeeds,
-  # return a value of the type returned. To guarantee that the key is always
-  # present, use `map_has_key?`. To guarantee that the key may be present
-  # use `map_may_have_key?`. If key is never present, result will be `none()`.
-  defp map_get_static(descr, key) do
-    descr_map = intersection(descr, map())
-
-    if empty?(descr_map) do
-      none()
-    else
-      map_split_on_key(descr_map.map, key)
-      |> Enum.reduce(none(), fn {typeof_key, _}, union -> union(typeof_key, union) end)
-      |> remove_unset()
-    end
-  end
-
   # Given a map bdd, normalizes it into a union of maps of the form
   #                {:map, [fields, is_open, has_empty]}
   #
@@ -686,36 +688,62 @@ defmodule Module.Types.Descr do
   # `{value_type, rest_of_map}` where `key` is removed from `rest_of_map`.
   # Each `key` produces a dnf of pairs, that is each time normalized (into a
   # disjoint union of pairs) as part of `map_split_on_key`. The result is used
-  defp map_get_dnf(d), do: map_get_dnf(d, [])
+  defp map_get_dnf(d), do: map_get_dnf(d, [], [])
 
-  defp map_get_dnf(d, fields_acc) do
-    case find_key(d) do
+  defp map_get_dnf(d, fields_acc, steps_acc) do
+    case find_key_or_step(d) do
       # `d` is a map bdd with no named fields (i.e., only %{..} or %{} appear at the nodes)
       nil ->
         {is_open, has_empty} = empty_cases(d)
 
-        if is_open or has_empty,
-          do: [{:map, [Enum.sort(fields_acc), is_open, has_empty]}],
-          else: []
+        cond do
+          is_open or has_empty and steps_acc == [] ->
+            [{:map, [Enum.sort(fields_acc), is_open, has_empty]}]
+
+          is_open or has_empty and steps_acc != [] ->
+            [{:map, [Enum.sort(fields_acc), Enum.sort(steps_acc), has_empty]}]
+
+          true ->
+            []
+        end
 
       {:key, key} ->
         # Split the map on the found key; for each possible split, recurse
         # on the rest of the map (which does not contain the key anymore)
-        map_split_on_key(d, key)
+        map_split_on_key(d, {:key, key})
         |> Enum.flat_map(fn {value_type, rest_of_map} ->
           type_with_option = {has_unset?(value_type), remove_unset(value_type)}
-          map_get_dnf(rest_of_map.map, [{key, type_with_option} | fields_acc])
+          map_get_dnf(rest_of_map.map, [{key, type_with_option} | fields_acc], steps_acc)
+        end)
+
+      {:step, step} ->
+        map_split_on_key(d, {:step, step})
+        |> Enum.flat_map(fn {step_type, rest_of_map} ->
+          map_get_dnf(rest_of_map.map, fields_acc, [{step, step_type} | steps_acc])
         end)
     end
   end
 
-  # Finds a defined key in the `bdd` representing a map, or returns `nil`
-  defp find_key(bdd) do
+  # Finds a defined key in the `bdd` representing a map, or a step, or returns `nil`
+  defp find_key_or_step(bdd), do: find_key_or_step(bdd, nil)
+
+  defp find_key_or_step(bdd, step_acc) do
     case bdd do
-      true -> nil
-      false -> nil
-      {{_tag, fields}, _, _} when map_size(fields) != 0 -> {:key, Map.keys(fields) |> hd()}
-      {_, left_bdd, right_bdd} -> find_key(left_bdd) || find_key(right_bdd)
+      true ->
+        if step_acc, do: {:step, step_acc}
+
+      false ->
+        if step_acc, do: {:step, step_acc}
+
+      {{_, fields}, _, _} when map_size(fields) != 0 ->
+        {:key, Map.keys(fields) |> hd()}
+
+      {{steps, _}, left_bdd, right_bdd} when map_size(steps) != 0 ->
+        one_step = Map.keys(steps) |> hd()
+        find_key_or_step(left_bdd, one_step) || find_key_or_step(right_bdd, one_step)
+
+      {_, left_bdd, right_bdd} ->
+        find_key_or_step(left_bdd, step_acc) || find_key_or_step(right_bdd, step_acc)
     end
   end
 
@@ -735,9 +763,11 @@ defmodule Module.Types.Descr do
       {{tag, fields}, left, right} ->
         {b1, b2} =
           cond do
+            is_map(tag) and map_size(tag) != 0 -> raise "there is a step remaining!"
             map_size(fields) != 0 -> raise "`empty_cases` called on non-empty map"
             tag == :open -> {true, true}
             tag == :closed -> {false, true}
+            is_map(tag) -> {true, true}
           end
 
         {c1, c2} = empty_cases(left)
@@ -786,15 +816,39 @@ defmodule Module.Types.Descr do
   # Splits a map literal on a key. This means that given a map literal, compute
   # the pair of types `{value_type, rest_of_map}` where `value_type` is the type
   # associated with `key`, and `rest_of_map` is obtained by removing `key`.
-  defp single_split({tag, fields}, key) do
+  defp single_split({tag, fields}, {:key, key}) do
     {value_type, rest_of_map} = Map.pop(fields, key)
 
     cond do
-      value_type != nil -> {value_type, descr_map_make(tag, rest_of_map)}
-      tag == :closed -> {@unset, descr_map_make(tag, rest_of_map)}
+      value_type != nil -> {value_type, map_descr(tag, rest_of_map)}
+      tag == :closed -> {@unset, map_descr(tag, rest_of_map)}
       # case where there is an open map with no keys { .. }
-      map_size(fields) == 0 -> :no_split
-      true -> {@term_or_unset, descr_map_make(tag, rest_of_map)}
+      tag == :open and map_size(fields) == 0 -> :no_split
+      tag == :open -> {@term_or_unset, map_descr(tag, rest_of_map)}
+      # key is necessarily an atom. search for the step :atom, then the step :term
+      is_map(tag) and is_map_key(tag, :atom) -> {or_unset(tag.atom), map_descr(tag, rest_of_map)}
+      is_map(tag) and is_map_key(tag, :term) -> {or_unset(tag.term), map_descr(tag, rest_of_map)}
+      # field really is undefined
+      true -> {@unset, map_descr(tag, rest_of_map)}
+    end
+  end
+
+  # fields is empty (no key could be found, so a step was returned)
+  defp single_split({tag_or_step, fields}, {:step, step}) do
+    case tag_or_step do
+      :closed ->
+        {@unset, map_descr(tag_or_step, fields)}
+
+      :open ->
+        {@term_or_unset, map_descr(tag_or_step, fields)}
+
+      steps when is_map(steps) ->
+        {step_type, rest_of_steps} = Map.pop(steps, step)
+
+        cond do
+          step_type != nil -> {step_type, map_descr(rest_of_steps, fields)}
+          true -> {@unset, map_descr(rest_of_steps, fields)}
+        end
     end
   end
 
@@ -810,7 +864,7 @@ defmodule Module.Types.Descr do
     end
   end
 
-  def map_dnf_to_quoted({:map, [fields, is_open, has_empty]}) do
+  def map_dnf_to_quoted({:map, [fields, is_open, has_empty]}) when is_boolean(is_open) do
     case {is_open, has_empty} do
       {false, true} ->
         {:%{}, [], map_literal_to_quoted(fields, is_open)}
@@ -824,6 +878,16 @@ defmodule Module.Types.Descr do
            {:%{}, [], [{:..., [], nil} | map_literal_to_quoted(fields, is_open)]},
            {:not, [], [{:%{}, [], map_literal_to_quoted(fields, is_open)}]}
          ]}
+    end
+  end
+
+  def map_dnf_to_quoted({:map, [fields, steps, has_empty]}) when is_list(steps) do
+    {:%{}, [], map_literal_to_quoted(fields, false) ++ map_steps_to_quoted(steps)}
+  end
+
+  def map_steps_to_quoted(steps) do
+    for {step, step_type} <- steps do
+      {{:optional, [], [{step, [], []}]}, to_quoted(step_type)}
     end
   end
 
