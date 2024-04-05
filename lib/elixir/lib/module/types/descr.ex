@@ -607,7 +607,7 @@ defmodule Module.Types.Descr do
 
   @doc """
   Gets the type of the value returned by accessing `key` on `map`.
-  Does guarantee the key exists. To do that, use `map_has_key?`.
+  Does not guarantee the key exists. To do that, use `map_has_key?`.
   """
   def map_get!(%{} = descr, key) do
     if not gradual?(descr) do
@@ -653,9 +653,9 @@ defmodule Module.Types.Descr do
     end
   end
 
-  def process_list([single_element], f, _combine), do: f.(single_element)
+  defp process_list([single_element], f, _combine), do: f.(single_element)
 
-  def process_list(list, f, combine) do
+  defp process_list(list, f, combine) do
     [head | tail] = list
     initial_acc = f.(head)
     Enum.reduce(tail, initial_acc, fn element, acc -> combine.(acc, f.(element)) end)
@@ -723,7 +723,7 @@ defmodule Module.Types.Descr do
   # `has_empty` is true if it contains the empty map.
   # For example, `%{...}` returns `{true, true}`, `%{}` returns `{false, true}`,
   # and `%{...} and not %{}` returns `{true, false}`.
-  def empty_cases(bdd) do
+  defp empty_cases(bdd) do
     case bdd do
       true ->
         {true, true}
@@ -1021,7 +1021,7 @@ defmodule Module.Types.Descr do
   end
 
   # Makes a union (list) of pairs into an equivalent disjoint union of pairs.
-  def make_pairs_disjoint(pairs) do
+  defp make_pairs_disjoint(pairs) do
     Enum.reduce(pairs, [], fn {t1, t2}, acc -> add_pair_to_disjoint_list(acc, t1, t2, []) end)
   end
 end
