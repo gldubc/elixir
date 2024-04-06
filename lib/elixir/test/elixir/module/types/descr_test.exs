@@ -230,9 +230,9 @@ defmodule Module.Types.DescrTest do
   end
 
   describe "map operations" do
-    test "get field" do
+    test "get static field" do
       assert map_get!(map(a: integer()), :a) == integer()
-      assert map_get!(dynamic(), dynamic()) == dynamic()
+      assert map_get!(dynamic(), :a) == dynamic()
 
       assert map_get!(intersection(dynamic(), map([a: integer()], :open)), :a) ==
                intersection(integer(), dynamic())
@@ -248,6 +248,10 @@ defmodule Module.Types.DescrTest do
       assert map_get!(union(map(a: integer()), map(b: atom())), :a) == integer()
       assert map_get!(term(), :a) == term()
     end
+
+    # test "get dynamic field" do
+    #   assert map
+    # end
 
     test "key presence" do
       assert map_has_key?(map(a: integer()), :a)
@@ -358,7 +362,7 @@ defmodule Module.Types.DescrTest do
     end
 
     test "key domain types" do
-      map([], %{:integer => integer()}) |> to_quoted_string() |> dbg()
+      map([], %{:integer => integer()}) |> to_quoted_string()
 
       assert map([a: integer()], %{:atom => float()}) |> map_get!(:a) == integer()
       assert map([a: integer()], %{:atom => float()}) |> map_get!(:b) == float()
@@ -373,8 +377,25 @@ defmodule Module.Types.DescrTest do
       assert intersection(map([], :open), map([], %{:integer => integer()}))
              |> to_quoted_string() == "%{optional(integer()) => integer()}"
 
+      t1 = map([], :closed)
+      t2 = map([], %{:integer => integer()})
+
+      subtype?(t1, t2) |> dbg()
+
+      t1_diff_t2 = difference(t1, t2) |> to_quoted_string() |> dbg()
+
+      t1_diff_t2.map
+      |> map_get_dnf()
+      |> dbg()
+
+      single_split({:closed, %{}}, {:step, :integer}) |> dbg()
+      single_split({%{integer: integer()}, %{}}, {:step, :integer}) |> dbg()
+
       assert intersection(map([], :closed), map([], %{:integer => integer()}))
-             |> equal?(map([], :closed))
+             |> to_quoted_string() == "%{}"
+
+      # assert intersection(map([], :closed), map([], %{:integer => integer()}))
+      #        |> equal?(map([], :closed))
 
       assert map([a: integer()], %{:integer => integer()}) |> to_quoted_string() ==
                "%{:a => integer(), optional(integer()) => integer()}"

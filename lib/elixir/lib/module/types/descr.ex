@@ -39,12 +39,6 @@ defmodule Module.Types.Descr do
   @none %{}
   @dynamic %{dynamic: @term}
 
-  # Map helpers
-
-  @unset %{bitmap: @bit_unset}
-  @term_or_unset %{bitmap: @bit_top ||| @bit_unset, atom: @atom_top, map: @map_top}
-  @steps [:binary, :integer, :float, :pid, :port, :reference, :list, :tuple, :fun, :term]
-
   # Type definitions
 
   def dynamic(), do: @dynamic
@@ -71,6 +65,25 @@ defmodule Module.Types.Descr do
 
   @boolset :sets.from_list([true, false], version: 2)
   def boolean(), do: %{atom: {:union, @boolset}}
+
+  # Map helpers
+
+  @unset %{bitmap: @bit_unset}
+  @term_or_unset %{bitmap: @bit_top ||| @bit_unset, atom: @atom_top, map: @map_top}
+
+  def step_types(step) do
+    case step do
+      :binary -> binary()
+      :integer -> integer()
+      :float -> float()
+      :pid -> pid()
+      :port -> port()
+      :reference -> reference()
+      :list -> union(empty_list(), non_empty_list())
+      :tuple -> tuple()
+      :fun -> fun()
+    end
+  end
 
   ## Set operations
 
@@ -633,7 +646,7 @@ defmodule Module.Types.Descr do
   # return a value of the type returned. To guarantee that the key is always
   # present, use `map_has_key?`. To guarantee that the key may be present
   # use `map_may_have_key?`. If key is never present, result will be `none()`.
-  defp map_get_static(descr, key) do
+  defp map_get_static(descr, key) when is_atom(key) do
     descr_map = intersection(descr, map())
 
     if empty?(descr_map) do
@@ -644,6 +657,10 @@ defmodule Module.Types.Descr do
       |> Kernel.then(fn typeof_key -> if empty?(typeof_key), do: raise(""), else: typeof_key end)
       |> remove_unset()
     end
+  end
+
+  # Given a key_type, returns the type of the value that is accessed by the key.
+  defp map_get_static(descr, key_type) do
   end
 
   @doc """
@@ -688,7 +705,7 @@ defmodule Module.Types.Descr do
   # `{value_type, rest_of_map}` where `key` is removed from `rest_of_map`.
   # Each `key` produces a dnf of pairs, that is each time normalized (into a
   # disjoint union of pairs) as part of `map_split_on_key`. The result is used
-  defp map_get_dnf(d), do: map_get_dnf(d, [], [])
+  def map_get_dnf(d), do: map_get_dnf(d, [], [])
 
   defp map_get_dnf(d, fields_acc, steps_acc) do
     case find_key_or_step(d) do
@@ -697,10 +714,10 @@ defmodule Module.Types.Descr do
         {is_open, has_empty} = empty_cases(d)
 
         cond do
-          is_open or has_empty and steps_acc == [] ->
+          is_open or (has_empty and steps_acc == []) ->
             [{:map, [Enum.sort(fields_acc), is_open, has_empty]}]
 
-          is_open or has_empty and steps_acc != [] ->
+          is_open or (has_empty and steps_acc != []) ->
             [{:map, [Enum.sort(fields_acc), Enum.sort(steps_acc), has_empty]}]
 
           true ->
@@ -767,7 +784,6 @@ defmodule Module.Types.Descr do
             map_size(fields) != 0 -> raise "`empty_cases` called on non-empty map"
             tag == :open -> {true, true}
             tag == :closed -> {false, true}
-            is_map(tag) -> {true, true}
           end
 
         {c1, c2} = empty_cases(left)
@@ -816,7 +832,7 @@ defmodule Module.Types.Descr do
   # Splits a map literal on a key. This means that given a map literal, compute
   # the pair of types `{value_type, rest_of_map}` where `value_type` is the type
   # associated with `key`, and `rest_of_map` is obtained by removing `key`.
-  defp single_split({tag, fields}, {:key, key}) do
+  def single_split({tag, fields}, {:key, key}) do
     {value_type, rest_of_map} = Map.pop(fields, key)
 
     cond do
@@ -834,7 +850,7 @@ defmodule Module.Types.Descr do
   end
 
   # fields is empty (no key could be found, so a step was returned)
-  defp single_split({tag_or_step, fields}, {:step, step}) do
+  def single_split({tag_or_step, fields}, {:step, step}) do
     case tag_or_step do
       :closed ->
         {@unset, map_descr(tag_or_step, fields)}
@@ -846,8 +862,14 @@ defmodule Module.Types.Descr do
         {step_type, rest_of_steps} = Map.pop(steps, step)
 
         cond do
-          step_type != nil -> {step_type, map_descr(rest_of_steps, fields)}
-          true -> {@unset, map_descr(rest_of_steps, fields)}
+          step_type != nil and map_size(rest_of_steps) == 0 ->
+            {step_type, map_descr(:closed, fields)}
+
+          step_type != nil ->
+            {step_type, map_descr(rest_of_steps, fields)}
+
+          true ->
+            {@unset, map_descr(rest_of_steps, fields)}
         end
     end
   end
@@ -1018,17 +1040,14 @@ defmodule Module.Types.Descr do
       else: make_pairs_disjoint(negative) |> eliminate_negations(fst, snd)
   end
 
-  # Eliminates negations from `{t, s} and not negative`.
+  # Eliminates negations from `{t, s} and not negative` where `negative` is a
+  # union of pairs disjoint on their first component.
   # Formula:
-  #   if `negative` is a union of pairs disjoint on their first component:
-  #                 union<i=1..n> {t_i, s_i}
-  #   then
-  #                 {t, s} and not (union<i=1..n> {t_i, s_i})
-  #   is equivalent to
-  #                 union<i=1..n> {t and t_i, s and not s_i}
-  #                     or {t and not (union{i=1..n} t_i), s}
-  # which eliminates all top-level negations and produces a union of pairs
-  # that are disjoint on their first component.
+  #   {t, s} and not (union<i=1..n> {t_i, s_i})
+  #       = union<i=1..n> {t and t_i, s and not s_i}
+  #            or {t and not (union{i=1..n} t_i), s}
+  # This eliminates all top-level negations and produces a union of pairs that
+  # are disjoint on their first component.
   defp eliminate_negations(negative, t, s) do
     {pair_union, union_of_t_i} =
       Enum.reduce(
@@ -1109,7 +1128,7 @@ defmodule Module.Types.Descr do
     end
   end
 
-  # Makes a union (list) of pairs into an equivalent disjoint union of pairs.
+  # Makes a union (list) of pairs into an equivalent union of disjoint pairs.
   defp make_pairs_disjoint(pairs) do
     Enum.reduce(pairs, [], fn {t1, t2}, acc -> add_pair_to_disjoint_list(acc, t1, t2, []) end)
   end
