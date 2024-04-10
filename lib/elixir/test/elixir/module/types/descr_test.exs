@@ -348,7 +348,10 @@ defmodule Module.Types.DescrTest do
       assert difference(map(), empty_map()) |> to_quoted_string() == "%{...} and not %{}"
 
       assert map(foo: union(integer(), unset())) |> to_quoted_string() ==
-               "%{optional(:foo) => integer()}"
+               "%{:foo => if_set(integer())}"
+
+      assert difference(map([a: integer()], :open), map([b: term()], :open))
+             |> to_quoted_string() == "%{..., :a => integer(), :b => not_set()}"
 
       assert difference(map([a: integer()], :open), map(b: boolean())) |> to_quoted_string() ==
                "%{..., :a => integer()}"

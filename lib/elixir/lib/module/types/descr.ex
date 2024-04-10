@@ -829,9 +829,11 @@ defmodule Module.Types.Descr do
   defp map_literal_to_quoted(map, is_open) do
     for {key, {optional_field?, type}} <- map,
         not (is_open and optional_field? and term?(type)) do
-      if optional_field?,
-        do: {{:optional, [], [literal(key)]}, to_quoted(type)},
-        else: {literal(key), to_quoted(type)}
+      cond do
+        optional_field? and empty?(type) -> {literal(key), {:not_set, [], []}}
+        optional_field? -> {literal(key), {:if_set, [], [to_quoted(type)]}}
+        true -> {literal(key), to_quoted(type)}
+      end
     end
   end
 
