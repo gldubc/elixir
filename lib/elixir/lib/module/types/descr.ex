@@ -533,14 +533,15 @@ defmodule Module.Types.Descr do
 
   # Unset
 
-  # `unset()` is a special base type that represents an unset field in a map.
-  # E.g., `%{a: integer(), b: unset(), ...}` represents a map with an integer
-  # field `a` and an unset field `b`, and possibly other fields.
+  # `not_set()` is a special base type that represents an absent field in a map.
+  # E.g., `%{a: integer(), b: not_set(), ...}` represents a map with an integer
+  # field `a` and an absent field `b`, and possibly other fields.
   # When writing down a map type, specifying a key as optional is syntactic sugar
-  # for specifying the key as a union of the key type and `unset()`. For example,
-  # `%{optional(:foo) => integer()}` is equivalent to `%{:foo => integer() or unset()}`.
+  # for specifying the key as a union of the key type and `not_set()`. For example,
+  # `%{optional(:foo) => integer()}` is equivalent to `%{:foo => integer() or not_set()}`,
+  # which can also be written `%{:foo => if_set(integer())}`.
 
-  # `unset()` has no meaning outside of map types.
+  # `not_set()` has no meaning outside of map types.
 
   # Add the unset type to `type`
   defp or_unset(type), do: Map.update(type, :bitmap, @bit_unset, &(&1 ||| @bit_unset))
@@ -674,7 +675,6 @@ defmodule Module.Types.Descr do
     else
       map_split_on_key(descr_map.map, key)
       |> Enum.reduce(none(), fn {typeof_key, _}, union -> union(typeof_key, union) end)
-      |> Kernel.then(fn typeof_key -> if empty?(typeof_key), do: raise(""), else: typeof_key end)
       |> remove_unset()
     end
   end
