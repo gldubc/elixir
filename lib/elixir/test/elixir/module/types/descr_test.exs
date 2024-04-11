@@ -264,12 +264,12 @@ defmodule Module.Types.DescrTest do
       assert map_may_have_key?(dynamic(), :foo)
       refute map_may_have_key?(intersection(dynamic(), map([foo: unset()], :open)), :foo)
 
-      assert map_keys(map(a: integer())) == :sets.from_list([:a])
-      assert map_keys(map(a: integer(), b: atom())) == :sets.from_list([:a, :b])
-      refute map_keys(union(map(a: integer()), map(b: atom()))) == :sets.from_list([:a, :b])
-      assert map_keys(union(map(a: integer()), map(a: atom()))) == :sets.from_list([:a])
-      assert map_keys(intersection(dynamic(), map(a: integer()))) == :sets.from_list([:a])
-      assert map_keys(map()) == :sets.new()
+      assert map_keys(map(a: integer())) == atom([:a])
+      assert map_keys(map(a: integer(), b: atom())) == atom([:a, :b])
+      refute map_keys(union(map(a: integer()), map(b: atom()))) == atom([:a, :b])
+      assert map_keys(union(map(a: integer()), map(a: atom()))) == atom([:a])
+      assert map_keys(intersection(dynamic(), map(a: integer()))) == atom([:a])
+      assert map_keys(map()) == atom([])
     end
 
     test "type-checking map access" do

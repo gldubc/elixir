@@ -200,7 +200,7 @@ defmodule Module.Types.Descr do
 
     descr != @none and
       (Map.has_key?(descr, :bitmap) or Map.has_key?(descr, :atom) or
-         (Map.has_key?(descr, :map) and map_get_dnf(descr.map) != []))
+         (Map.has_key?(descr, :map) and map_not_empty?(descr.map)))
   end
 
   @doc """
@@ -644,12 +644,13 @@ defmodule Module.Types.Descr do
       |> map_get_dnf()
       |> process_list(
         fn {:map, [fields, _, _]} ->
-          :sets.from_list(for {key, {false, _}} <- fields, do: key)
+          :sets.from_list(for({key, {false, _}} <- fields, do: key), version: 2)
         end,
         &:sets.intersection(&1, &2)
       )
+      |> Kernel.then(&%{atom: {:union, &1}})
     else
-      :sets.new(version: 2)
+      atom([])
     end
   end
 
@@ -834,6 +835,28 @@ defmodule Module.Types.Descr do
         optional_field? -> {literal(key), {:if_set, [], [to_quoted(type)]}}
         true -> {literal(key), to_quoted(type)}
       end
+    end
+  end
+
+  # Function similar to `map_get_dnf/1` but short-circuits if it finds a non-empty
+  # map literal in the union.
+  defp map_not_empty?(d), do: map_not_empty?(d, [])
+
+  defp map_not_empty?(d, fields_acc) do
+    case find_key(d) do
+      # `d` is a map bdd with no named fields (i.e., only %{..} or %{} appear at the nodes)
+      nil ->
+        {is_open, has_empty} = empty_cases(d)
+        is_open or has_empty
+
+      {:key, key} ->
+        # Split the map on the found key; for each possible split, recurse
+        # on the rest of the map (which does not contain the key anymore)
+        map_split_on_key(d, key)
+        |> Enum.any?(fn {value_type, rest_of_map} ->
+          type_with_option = {has_unset?(value_type), remove_unset(value_type)}
+          map_not_empty?(rest_of_map.map, [{key, type_with_option} | fields_acc])
+        end)
     end
   end
 
