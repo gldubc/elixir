@@ -44,7 +44,7 @@ defmodule Module.Types.Descr do
   def dynamic(), do: @dynamic
   def term(), do: @term
   def none(), do: @none
-  def unset(), do: @unset
+  def not_set(), do: @unset
 
   def atom(as), do: %{atom: atom_new(as)}
   def atom(), do: %{atom: @atom_top}
@@ -69,7 +69,7 @@ defmodule Module.Types.Descr do
   # Map helpers
 
   @unset %{bitmap: @bit_unset}
-  @term_or_unset %{bitmap: @bit_top ||| @bit_unset, atom: @atom_top, map: @map_top}
+  @term_if_set %{bitmap: @bit_top ||| @bit_unset, atom: @atom_top, map: @map_top}
 
   def step_types(step) do
     case step do
@@ -558,7 +558,7 @@ defmodule Module.Types.Descr do
   # `not_set()` has no meaning outside of map types.
 
   # Add the unset type to `type`
-  defp or_unset(type), do: Map.update(type, :bitmap, @bit_unset, &(&1 ||| @bit_unset))
+  defp if_set(type), do: Map.update(type, :bitmap, @bit_unset, &(&1 ||| @bit_unset))
   defp has_unset?(type), do: (Map.get(type, :bitmap, 0) &&& @bit_unset) != 0
 
   defp remove_unset(type) do
@@ -611,7 +611,7 @@ defmodule Module.Types.Descr do
   defp map_new(pairs, open_or_closed) do
     fields =
       Map.new(pairs, fn
-        {{:optional, [], [key]}, type} -> {key, or_unset(type)}
+        {{:optional, [], [key]}, type} -> {key, if_set(type)}
         {key, type} -> {key, type}
       end)
 
@@ -797,7 +797,7 @@ defmodule Module.Types.Descr do
   defp map_split_on_key(d, key) do
     bdd_get(d)
     |> Enum.flat_map(fn {pos, neg} -> split_line_on_key(pos, neg, key, [], []) end)
-    |> pair_simplify_dnf(@term_or_unset)
+    |> pair_simplify_dnf(@term_if_set)
   end
 
   # Given a line, that is, a list `positive` of map literals and `negative` of
@@ -840,10 +840,10 @@ defmodule Module.Types.Descr do
       tag == :closed -> {@unset, map_descr(tag, rest_of_map)}
       # case where there is an open map with no keys { .. }
       tag == :open and map_size(fields) == 0 -> :no_split
-      tag == :open -> {@term_or_unset, map_descr(tag, rest_of_map)}
+      tag == :open -> {@term_if_set, map_descr(tag, rest_of_map)}
       # key is necessarily an atom. search for the step :atom, then the step :term
-      is_map(tag) and is_map_key(tag, :atom) -> {or_unset(tag.atom), map_descr(tag, rest_of_map)}
-      is_map(tag) and is_map_key(tag, :term) -> {or_unset(tag.term), map_descr(tag, rest_of_map)}
+      is_map(tag) and is_map_key(tag, :atom) -> {if_set(tag.atom), map_descr(tag, rest_of_map)}
+      is_map(tag) and is_map_key(tag, :term) -> {if_set(tag.term), map_descr(tag, rest_of_map)}
       # field really is undefined
       true -> {@unset, map_descr(tag, rest_of_map)}
     end
@@ -856,7 +856,7 @@ defmodule Module.Types.Descr do
         {@unset, map_descr(tag_or_step, fields)}
 
       :open ->
-        {@term_or_unset, map_descr(tag_or_step, fields)}
+        {@term_if_set, map_descr(tag_or_step, fields)}
 
       steps when is_map(steps) ->
         {step_type, rest_of_steps} = Map.pop(steps, step)
@@ -929,7 +929,7 @@ defmodule Module.Types.Descr do
   defp map_not_empty?(d), do: map_not_empty?(d, [])
 
   defp map_not_empty?(d, fields_acc) do
-    case find_key(d) do
+    case find_key_or_step(d) do
       # `d` is a map bdd with no named fields (i.e., only %{..} or %{} appear at the nodes)
       nil ->
         {is_open, has_empty} = empty_cases(d)
@@ -1020,7 +1020,7 @@ defmodule Module.Types.Descr do
   # normalization algorithms on pairs.
 
   # Takes a DNF of pairs and simplifies it into a equivalent single list (union)
-  # of type pairs. The `term` argument should be either `@term_or_unset` (for
+  # of type pairs. The `term` argument should be either `@term_if_set` (for
   # map value types) or `@term` in general.
   # Remark: all lines of a pair bdd are naturally disjoint, because choosing a
   # different edge means intersect with a literal or its negation.
