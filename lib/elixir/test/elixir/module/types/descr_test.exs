@@ -370,43 +370,37 @@ defmodule Module.Types.DescrTest do
     end
 
     test "key domain types" do
-      map([], %{:integer => integer()}) |> to_quoted_string()
+      assert map([], :closed, %{:integer => integer()}) |> to_quoted_string() ==
+               "%{integer() => if_set(integer())}"
 
-      assert map([a: integer()], %{:atom => float()}) |> map_get!(:a) == integer()
-      assert map([a: integer()], %{:atom => float()}) |> map_get!(:b) == float()
+      assert map([], :open, %{:integer => integer()}) |> to_quoted_string() ==
+               "%{..., integer() => if_set(integer())}"
+
+      assert map([a: integer()], :closed, %{:atom => float()}) |> map_get!(:a) == integer()
+      assert map([a: integer()], :closed, %{:atom => float()}) |> map_get!(:b) == float()
+
+      assert map([], :closed, %{:atom => union(integer(), atom())})
+             |> intersection(map([], :closed, %{:atom => atom()}))
+             |> to_quoted_string() == "%{atom() => if_set(atom())}"
+
+      assert intersection(map([], :open), map([], :closed, %{:integer => integer()}))
+             |> to_quoted_string()
+             |> dbg() == "%{integer() => if_set(integer())}"
+
+      assert intersection(map([], :closed), map([], :closed, %{:integer => integer()}))
+             |> to_quoted_string() == "%{}"
 
       assert intersection(
-               map([], %{:atom => union(integer(), atom())}),
-               map([], %{:atom => atom()})
+               map([], :closed, %{:integer => integer()}),
+               map([], :closed, %{:atom => atom()})
              )
-             |> to_quoted_string() ==
-               "%{optional(atom()) => atom()}"
-
-      assert intersection(map([], :open), map([], %{:integer => integer()}))
-             |> to_quoted_string() == "%{optional(integer()) => integer()}"
-
-      t1 = map([], :closed)
-      t2 = map([], %{:integer => integer()})
-
-      subtype?(t1, t2) |> dbg()
-
-      t1_diff_t2 = difference(t1, t2) |> to_quoted_string() |> dbg()
-
-      t1_diff_t2.map
-      |> map_get_dnf()
-      |> dbg()
-
-      single_split({:closed, %{}}, {:step, :integer}) |> dbg()
-      single_split({%{integer: integer()}, %{}}, {:step, :integer}) |> dbg()
-
-      assert intersection(map([], :closed), map([], %{:integer => integer()}))
-             |> to_quoted_string() == "%{}"
+             |> empty?()
 
       # assert intersection(map([], :closed), map([], %{:integer => integer()}))
       #        |> equal?(map([], :closed))
 
-      assert map([a: integer()], %{:integer => integer()}) |> to_quoted_string() ==
-               "%{:a => integer(), optional(integer()) => integer()}"
+      assert map([a: integer()], :closed, %{:integer => integer()}) |> to_quoted_string() ==
+               "%{integer() => if_set(integer()), :a => integer()}"
     end
   end
 end

@@ -39,6 +39,11 @@ defmodule Module.Types.Descr do
   @none %{}
   @dynamic %{dynamic: @term}
 
+  # Map helpers
+
+  @unset %{bitmap: @bit_unset}
+  @term_if_set %{bitmap: @bit_top ||| @bit_unset, atom: @atom_top, map: @map_top}
+
   # Type definitions
 
   def dynamic(), do: @dynamic
@@ -54,6 +59,7 @@ defmodule Module.Types.Descr do
   def float(), do: %{bitmap: @bit_float}
   def fun(), do: %{bitmap: @bit_fun}
   def map(pairs, open_or_closed), do: %{map: map_new(pairs, open_or_closed)}
+  def map(pairs, open_or_closed, domains), do: %{map: map_new(pairs, open_or_closed, domains)}
   def map(pairs), do: %{map: map_new(pairs, :closed)}
   def map(), do: %{map: @map_top}
   def empty_map(), do: map([])
@@ -65,11 +71,6 @@ defmodule Module.Types.Descr do
 
   @boolset :sets.from_list([true, false], version: 2)
   def boolean(), do: %{atom: {:union, @boolset}}
-
-  # Map helpers
-
-  @unset %{bitmap: @bit_unset}
-  @term_if_set %{bitmap: @bit_top ||| @bit_unset, atom: @atom_top, map: @map_top}
 
   def step_types(step) do
     case step do
@@ -618,7 +619,18 @@ defmodule Module.Types.Descr do
     bdd_new({open_or_closed, fields})
   end
 
+  defp map_new(pairs, open_or_closed, domains) do
+    fields =
+      Map.new(pairs, fn
+        {{:optional, [], [key]}, type} -> {key, if_set(type)}
+        {key, type} -> {key, type}
+      end)
+
+    bdd_new({open_or_closed, fields, domains})
+  end
+
   defp map_descr(tag, fields), do: %{map: bdd_new({tag, fields})}
+  defp map_descr(tag, fields, domains), do: %{map: bdd_new({tag, fields, domains})}
 
   @doc """
   Gets the type of the value returned by accessing `key` on `map`.
@@ -652,10 +664,19 @@ defmodule Module.Types.Descr do
     if empty?(descr_map) do
       none()
     else
-      map_split_on_key(descr_map.map, {:key, key})
-      |> Enum.reduce(none(), fn {typeof_key, _}, union -> union(typeof_key, union) end)
-      |> Kernel.then(fn typeof_key -> if empty?(typeof_key), do: raise(""), else: typeof_key end)
-      |> remove_unset()
+      value_type =
+        map_split_on_key(descr_map.map, {:key, key})
+        |> Enum.reduce(none(), fn {typeof_key, _}, union -> union(typeof_key, union) end)
+
+      if has_unset?(value_type) do
+        domain_type =
+          map_split_on_key(descr_map.map, {:step, :atom})
+          |> Enum.reduce(none(), fn {typeof_key, _}, union -> union(typeof_key, union) end)
+
+        union(value_type, domain_type) |> remove_unset()
+      else
+        value_type
+      end
     end
   end
 
@@ -714,9 +735,11 @@ defmodule Module.Types.Descr do
             do: [{:map, [Enum.sort(fields_acc), is_open, has_empty]}],
             else: []
         else
-          if map_without_keys_empty?(d),
+          {is_open, is_empty} = map_without_keys_empty(d)
+
+          if is_empty,
             do: [],
-            else: [{:map, [Enum.sort(fields_acc), Enum.sort(steps_acc), false]}]
+            else: [{:map, [Enum.sort(fields_acc), Enum.sort(steps_acc), is_open]}]
         end
 
       {:key, key} ->
@@ -731,24 +754,17 @@ defmodule Module.Types.Descr do
       {:step, step} ->
         map_split_on_key(d, {:step, step})
         |> Enum.flat_map(fn {step_type, rest_of_map} ->
-          map_get_dnf(rest_of_map.map, fields_acc, [{step, step_type} | steps_acc])
+          map_get_dnf(rest_of_map.map, fields_acc, [{step, remove_unset(step_type)} | steps_acc])
         end)
     end
   end
 
   defp map_has_domains?(bdd) do
     case bdd do
-      true ->
-        false
-
-      false ->
-        false
-
-      {{steps, _}, left, right} when is_map(steps) ->
-        true
-
-      {_, left, right} ->
-        map_has_domains?(left) or map_has_domains?(right)
+      true -> false
+      false -> false
+      {{_, _, _}, _, _} -> true
+      {_, left, right} -> map_has_domains?(left) or map_has_domains?(right)
     end
   end
 
@@ -766,9 +782,12 @@ defmodule Module.Types.Descr do
       {{_, fields}, _, _} when map_size(fields) != 0 ->
         {:key, Map.keys(fields) |> hd()}
 
-      {{steps, _}, left_bdd, right_bdd} when map_size(steps) != 0 ->
+      {{_, fields, domains}, _, _} when map_size(fields) != 0 ->
+        {:key, Map.keys(fields) |> hd()}
+
+      {{_, _, domains}, left_bdd, right_bdd} ->
         one_step =
-          Enum.find_value(steps, fn {domain, type} ->
+          Enum.find_value(domains, fn {domain, type} ->
             if not (empty?(type) or term?(type)), do: domain
           end)
 
@@ -795,7 +814,6 @@ defmodule Module.Types.Descr do
       {{tag, fields}, left, right} ->
         {b1, b2} =
           cond do
-            is_map(tag) and map_size(tag) != 0 -> raise "there is a step remaining!"
             map_size(fields) != 0 -> raise "`empty_cases` called on non-empty map"
             tag == :open -> {true, true}
             tag == :closed -> {false, true}
@@ -864,36 +882,31 @@ defmodule Module.Types.Descr do
     end
   end
 
+  def single_split({tag, fields, domains}, {:key, key}) do
+    {value_type, %{map: {{tag, fields}, true, false}}} = single_split({tag, fields}, {:key, key})
+    {value_type, map_descr(tag, fields, domains)}
+  end
+
   # fields is empty (no key could be found, so a step was returned)
-  def single_split({tag_or_step, fields}, {:step, step}) do
-    case tag_or_step do
-      :closed ->
-        {@unset, map_descr(tag_or_step, fields)}
-
-      :open ->
-        {@term_if_set, map_descr(tag_or_step, fields)}
-
-      steps when is_map(steps) ->
-        # when we remove a step: replace it with none in the steps map
-        # if it doesn't exist, don't do anything to it ofc
-        {step_type, rest_of_steps} =
-          if Map.has_key?(steps, step) do
-            {steps[step], Map.put(steps, step, none())}
-          else
-            {nil, steps}
-          end
-
-        cond do
-          step_type != nil and map_size(rest_of_steps) == 0 ->
-            {if_set(step_type), map_descr(:closed, fields)}
-
-          step_type != nil ->
-            {if_set(step_type), map_descr(rest_of_steps, fields)}
-
-          true ->
-            {@unset, map_descr(rest_of_steps, fields)}
-        end
+  def single_split({tag, fields}, {:step, _step}) do
+    case tag do
+      :closed -> {@unset, map_descr(tag, fields)}
+      :open -> {@term_if_set, map_descr(tag, fields)}
     end
+  end
+
+  def single_split({tag, fields, domains}, {:step, step}) do
+    # when we remove a step: replace it with none in the steps map
+    # if it doesn't exist, don't do anything to it ofc
+    {step_type, rest_of_steps} =
+      cond do
+        is_map_key(domains, step) -> {if_set(domains[step]), Map.put(domains, step, none())}
+        # maybe i should remove the step from the domains here?
+        tag == :open -> {@term_if_set, domains}
+        tag == :closed -> {@unset, domains}
+      end
+
+    {step_type, map_descr(tag, fields, rest_of_steps)}
   end
 
   defp map_to_quoted(bdd) do
@@ -925,13 +938,21 @@ defmodule Module.Types.Descr do
     end
   end
 
-  def map_dnf_to_quoted({:map, [fields, steps, has_empty]}) when is_list(steps) do
-    {:%{}, [], map_literal_to_quoted(fields, false) ++ map_steps_to_quoted(steps)}
+  def map_dnf_to_quoted({:map, [fields, steps, open_or_closed]}) when is_list(steps) do
+    case open_or_closed do
+      :open ->
+        {:%{}, [],
+         [{:..., [], nil} | map_domains_to_quoted(steps) ++ map_literal_to_quoted(fields, false)]}
+
+      :closed ->
+        {:%{}, [], map_domains_to_quoted(steps) ++ map_literal_to_quoted(fields, false)}
+    end
   end
 
-  def map_steps_to_quoted(steps) do
-    for {step, step_type} <- steps do
-      {{:optional, [], [{step, [], []}]}, to_quoted(step_type)}
+  def map_domains_to_quoted(steps) do
+    for {step, step_type} <- steps,
+        not empty?(step_type) do
+      {{step, [], []}, {:if_set, [], [to_quoted(step_type)]}}
     end
   end
 
@@ -947,43 +968,47 @@ defmodule Module.Types.Descr do
   end
 
   # Checks if the map without keys represented by `dnf` is empty.
-  defp map_without_keys_empty?(dnf) do
-    dnf = bdd_get(dnf)
+  defp map_without_keys_empty?(bdd) do
+    bdd_get(bdd)
+    |> Enum.map(fn {pos, neg} -> {map_intersect_positive_literals(pos), neg} end)
+    |> check_for_empty_lines()
+
     Enum.all?(dnf, &map_line_without_keys_empty?/1)
   end
 
-  def test() do
-    x = map([], :open)
-    t = difference(map([]), map([], :open))
-
-    x = {:open, %{}}
-    z = {%{:atom => none(), :integer => term()}, %{}}
-    y = {x, false, {z, true, false}}
-
-    y
-    |> bdd_get()
-    |> dbg()
-    |> Enum.all?(&map_line_without_keys_empty?/1)
-    |> dbg()
-  end
-
   @all_domains [:atom, :integer]
+
+  defp check_for_empty([]), do: {false, true}
+  defp check_for_empty([line | rest]) do
+    {is_open, empty?} = map_line_without_keys_empty?(line)
+    if not empty? do
+      {is_open, empty?}
+    end
+  end
 
   # Checks that a line of a map bdd without keys is empty or not
   defp map_line_without_keys_empty?({positives, negatives}) do
     positive_intersection = map_intersect_positive_literals(positives)
 
-    case negatives do
-      [] ->
-        false
+    empty? =
+      case negatives do
+        [] ->
+          false
 
-      _ ->
-        Enum.any?(negatives, fn negative ->
-          Enum.all?(@all_domains, fn domain ->
-            map_literal_get_domain(positive_intersection, domain)
-            |> subtype?(map_literal_get_domain(negative, domain))
+        _ ->
+          Enum.any?(negatives, fn negative ->
+            Enum.all?(@all_domains, fn domain ->
+              map_literal_get_domain(positive_intersection, domain)
+              |> subtype?(map_literal_get_domain(negative, domain))
+            end)
           end)
-        end)
+      end
+
+    case positive_intersection do
+      {:closed, _} -> {false, empty?}
+      {:open, _} -> {true, empty?}
+      {:open, _, _} -> {true, empty?}
+      {:closed, _, _} -> {false, empty?}
     end
   end
 
@@ -998,17 +1023,24 @@ defmodule Module.Types.Descr do
       {:closed, _}, _acc ->
         {:closed, %{}}
 
-      {domains, _}, _acc when is_map(domains) ->
+      {_, _, domains} = literal, _acc when is_map(domains) ->
         for {domain, type} <- domains, into: %{} do
-          {domain, intersection(type, map_literal_get_domain(domains, domain))}
+          {domain, intersection(type, map_literal_get_domain(literal, domain))}
         end
     end)
   end
 
   # Takes a map literal, and gets the correct type associated to a domain
-  defp map_literal_get_domain({:open, _}, domain), do: @term
-  defp map_literal_get_domain({:closed, _}, domain), do: @none
-  defp map_literal_get_domain({domains, _}, domain), do: Map.get(domains, domain)
+  defp map_literal_get_domain({:open, _}, _domain), do: @term
+  defp map_literal_get_domain({:closed, _}, _domain), do: @none
+
+  defp map_literal_get_domain({tag, _, domains}, domain) do
+    if is_map_key(domains, domain) do
+      domains[domain]
+    else
+      if tag == :open, do: @term, else: @none
+    end
+  end
 
   # Function similar to `map_get_dnf/1` but short-circuits if it finds a non-empty
   # map literal in the union.
@@ -1225,4 +1257,4 @@ defmodule Module.Types.Descr do
   end
 end
 
-Module.Types.Descr.test()
+# Module.Types.Descr.test()
