@@ -28,7 +28,7 @@ defmodule Module.Types.Descr do
   @bit_fun 1 <<< 9
   @bit_top (1 <<< 10) - 1
 
-  @bit_unset 1 <<< 10
+  @bit_not_set 1 <<< 10
 
   @atom_top {:negation, :sets.new(version: 2)}
   @map_top {{:open, %{}}, true, false}
@@ -41,15 +41,15 @@ defmodule Module.Types.Descr do
 
   # Map helpers
 
-  @unset %{bitmap: @bit_unset}
-  @term_or_unset %{bitmap: @bit_top ||| @bit_unset, atom: @atom_top, map: @map_top}
+  @not_set %{bitmap: @bit_not_set}
+  @term_or_not_set %{bitmap: @bit_top ||| @bit_not_set, atom: @atom_top, map: @map_top}
 
   # Type definitions
 
   def dynamic(), do: @dynamic
   def term(), do: @term
   def none(), do: @none
-  def unset(), do: @unset
+  def not_set(), do: @not_set
 
   def atom(as), do: %{atom: atom_new(as)}
   def atom(), do: %{atom: @atom_top}
@@ -499,7 +499,7 @@ defmodule Module.Types.Descr do
   # on top of the static type. Though, the latter may be used for printing purposes.
   #
   # There are two ways for a descr to represent a static type: either the
-  # `:dynamic` field is unset, or it contains a type equal to the static component
+  # `:dynamic` field is not_set, or it contains a type equal to the static component
   # (that is, there are no extra dynamic values).
 
   defp dynamic_intersection(left, right) do
@@ -543,14 +543,14 @@ defmodule Module.Types.Descr do
 
   # `not_set()` has no meaning outside of map types.
 
-  # Add the unset type to `type`
-  defp or_unset(type), do: Map.update(type, :bitmap, @bit_unset, &(&1 ||| @bit_unset))
-  defp has_unset?(type), do: (Map.get(type, :bitmap, 0) &&& @bit_unset) != 0
+  # Add the not_set type to `type`
+  defp if_set(type), do: Map.update(type, :bitmap, @bit_not_set, &(&1 ||| @bit_not_set))
+  defp has_not_set?(type), do: (Map.get(type, :bitmap, 0) &&& @bit_not_set) != 0
 
-  defp remove_unset(type) do
+  defp remove_not_set(type) do
     case type do
-      %{:bitmap => @bit_unset} -> Map.delete(type, :bitmap)
-      %{:bitmap => bitmap} -> Map.put(type, :bitmap, bitmap &&& ~~~@bit_unset)
+      %{:bitmap => @bit_not_set} -> Map.delete(type, :bitmap)
+      %{:bitmap => bitmap} -> Map.put(type, :bitmap, bitmap &&& ~~~@bit_not_set)
       _ -> type
     end
   end
@@ -597,7 +597,7 @@ defmodule Module.Types.Descr do
   defp map_new(pairs, open_or_closed) do
     fields =
       Map.new(pairs, fn
-        {{:optional, [], [key]}, type} -> {key, or_unset(type)}
+        {{:optional, [], [key]}, type} -> {key, if_set(type)}
         {key, type} -> {key, type}
       end)
 
@@ -675,7 +675,7 @@ defmodule Module.Types.Descr do
     else
       map_split_on_key(descr_map.map, key)
       |> Enum.reduce(none(), fn {typeof_key, _}, union -> union(typeof_key, union) end)
-      |> remove_unset()
+      |> remove_not_set()
     end
   end
 
@@ -703,7 +703,7 @@ defmodule Module.Types.Descr do
         # on the rest of the map (which does not contain the key anymore)
         map_split_on_key(d, key)
         |> Enum.flat_map(fn {value_type, rest_of_map} ->
-          type_with_option = {has_unset?(value_type), remove_unset(value_type)}
+          type_with_option = {has_not_set?(value_type), remove_not_set(value_type)}
           map_get_dnf(rest_of_map.map, [{key, type_with_option} | fields_acc])
         end)
     end
@@ -751,7 +751,7 @@ defmodule Module.Types.Descr do
   defp map_split_on_key(d, key) do
     bdd_get(d)
     |> Enum.flat_map(fn {pos, neg} -> split_line_on_key(pos, neg, key, [], []) end)
-    |> pair_simplify_dnf(@term_or_unset)
+    |> pair_simplify_dnf(@term_or_not_set)
   end
 
   # Given a line, that is, a list `positive` of map literals and `negative` of
@@ -791,10 +791,10 @@ defmodule Module.Types.Descr do
 
     cond do
       value_type != nil -> {value_type, descr_map_make(tag, rest_of_map)}
-      tag == :closed -> {@unset, descr_map_make(tag, rest_of_map)}
+      tag == :closed -> {@not_set, descr_map_make(tag, rest_of_map)}
       # case where there is an open map with no keys { .. }
       map_size(fields) == 0 -> :no_split
-      true -> {@term_or_unset, descr_map_make(tag, rest_of_map)}
+      true -> {@term_or_not_set, descr_map_make(tag, rest_of_map)}
     end
   end
 
@@ -854,7 +854,7 @@ defmodule Module.Types.Descr do
         # on the rest of the map (which does not contain the key anymore)
         map_split_on_key(d, key)
         |> Enum.any?(fn {value_type, rest_of_map} ->
-          type_with_option = {has_unset?(value_type), remove_unset(value_type)}
+          type_with_option = {has_not_set?(value_type), remove_not_set(value_type)}
           map_not_empty?(rest_of_map.map, [{key, type_with_option} | fields_acc])
         end)
     end
@@ -934,7 +934,7 @@ defmodule Module.Types.Descr do
   # normalization algorithms on pairs.
 
   # Takes a DNF of pairs and simplifies it into a equivalent single list (union)
-  # of type pairs. The `term` argument should be either `@term_or_unset` (for
+  # of type pairs. The `term` argument should be either `@term_or_not_set` (for
   # map value types) or `@term` in general.
   # Remark: all lines of a pair bdd are naturally disjoint, because choosing a
   # different edge means intersect with a literal or its negation.

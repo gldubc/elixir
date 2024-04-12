@@ -156,6 +156,14 @@ defmodule Module.Types.DescrTest do
                difference(map([a: atom()], :open), map(b: integer())),
                map([a: atom()], :open)
              )
+
+      assert difference(map(), map([a: integer(), b: atom()], :open))
+             |> equal?(
+               union(
+                 map([a: integer(), b: not_set()], :open),
+                 map([a: negation(integer())], :open)
+               )
+             )
     end
   end
 
@@ -253,7 +261,7 @@ defmodule Module.Types.DescrTest do
       assert map_has_key?(map(a: integer()), :a)
       refute map_has_key?(map(a: integer()), :b)
       refute map_has_key?(map(), :a)
-      refute map_has_key?(map(a: union(integer(), unset())), :a)
+      refute map_has_key?(map(a: union(integer(), not_set())), :a)
       refute map_has_key?(union(map(a: integer()), map(b: atom())), :a)
       assert map_has_key?(union(map(a: integer()), map(a: atom())), :a)
       assert map_has_key?(intersection(dynamic(), map(a: integer())), :a)
@@ -262,7 +270,7 @@ defmodule Module.Types.DescrTest do
       refute map_may_have_key?(map(foo: integer()), :bar)
       assert map_may_have_key?(map(foo: integer()), :foo)
       assert map_may_have_key?(dynamic(), :foo)
-      refute map_may_have_key?(intersection(dynamic(), map([foo: unset()], :open)), :foo)
+      refute map_may_have_key?(intersection(dynamic(), map([foo: not_set()], :open)), :foo)
 
       assert map_keys(map(a: integer())) == atom([:a])
       assert map_keys(map(a: integer(), b: atom())) == atom([:a, :b])
@@ -274,7 +282,7 @@ defmodule Module.Types.DescrTest do
 
     test "type-checking map access" do
       # dynamic() and %{..., :a => integer(), optional(:b) => none()}
-      t = intersection(dynamic(), map([a: integer(), c: unset()], :open))
+      t = intersection(dynamic(), map([a: integer(), c: not_set()], :open))
 
       assert subtype?(map_get!(t, :a), integer())
       assert map_get!(t, :b) == dynamic()
@@ -347,7 +355,7 @@ defmodule Module.Types.DescrTest do
 
       assert difference(map(), empty_map()) |> to_quoted_string() == "%{...} and not %{}"
 
-      assert map(foo: union(integer(), unset())) |> to_quoted_string() ==
+      assert map(foo: union(integer(), not_set())) |> to_quoted_string() ==
                "%{:foo => if_set(integer())}"
 
       assert difference(map([a: integer()], :open), map([b: term()], :open))
