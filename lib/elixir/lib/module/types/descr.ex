@@ -659,10 +659,6 @@ defmodule Module.Types.Descr do
     end
   end
 
-  # Given a key_type, returns the type of the value that is accessed by the key.
-  defp map_get_static(descr, key_type) do
-  end
-
   @doc """
   Check that a key may be present.
   """
@@ -711,17 +707,16 @@ defmodule Module.Types.Descr do
     case find_key_or_step(d) do
       # `d` is a map bdd with no named fields (i.e., only %{..} or %{} appear at the nodes)
       nil ->
-        {is_open, has_empty} = empty_cases(d)
+        if not map_has_domains?(d) do
+          {is_open, has_empty} = empty_cases(d)
 
-        cond do
-          is_open or (has_empty and steps_acc == []) ->
-            [{:map, [Enum.sort(fields_acc), is_open, has_empty]}]
-
-          is_open or (has_empty and steps_acc != []) ->
-            [{:map, [Enum.sort(fields_acc), Enum.sort(steps_acc), has_empty]}]
-
-          true ->
-            []
+          if is_open or has_empty,
+            do: [{:map, [Enum.sort(fields_acc), is_open, has_empty]}],
+            else: []
+        else
+          if map_without_keys_empty?(d),
+            do: [],
+            else: [{:map, [Enum.sort(fields_acc), Enum.sort(steps_acc), false]}]
         end
 
       {:key, key} ->
@@ -741,6 +736,22 @@ defmodule Module.Types.Descr do
     end
   end
 
+  defp map_has_domains?(bdd) do
+    case bdd do
+      true ->
+        false
+
+      false ->
+        false
+
+      {{steps, _}, left, right} when is_map(steps) ->
+        true
+
+      {_, left, right} ->
+        map_has_domains?(left) or map_has_domains?(right)
+    end
+  end
+
   # Finds a defined key in the `bdd` representing a map, or a step, or returns `nil`
   defp find_key_or_step(bdd), do: find_key_or_step(bdd, nil)
 
@@ -756,7 +767,11 @@ defmodule Module.Types.Descr do
         {:key, Map.keys(fields) |> hd()}
 
       {{steps, _}, left_bdd, right_bdd} when map_size(steps) != 0 ->
-        one_step = Map.keys(steps) |> hd()
+        one_step =
+          Enum.find_value(steps, fn {domain, type} ->
+            if not (empty?(type) or term?(type)), do: domain
+          end)
+
         find_key_or_step(left_bdd, one_step) || find_key_or_step(right_bdd, one_step)
 
       {_, left_bdd, right_bdd} ->
@@ -859,14 +874,21 @@ defmodule Module.Types.Descr do
         {@term_if_set, map_descr(tag_or_step, fields)}
 
       steps when is_map(steps) ->
-        {step_type, rest_of_steps} = Map.pop(steps, step)
+        # when we remove a step: replace it with none in the steps map
+        # if it doesn't exist, don't do anything to it ofc
+        {step_type, rest_of_steps} =
+          if Map.has_key?(steps, step) do
+            {steps[step], Map.put(steps, step, none())}
+          else
+            {nil, steps}
+          end
 
         cond do
           step_type != nil and map_size(rest_of_steps) == 0 ->
-            {step_type, map_descr(:closed, fields)}
+            {if_set(step_type), map_descr(:closed, fields)}
 
           step_type != nil ->
-            {step_type, map_descr(rest_of_steps, fields)}
+            {if_set(step_type), map_descr(rest_of_steps, fields)}
 
           true ->
             {@unset, map_descr(rest_of_steps, fields)}
@@ -924,24 +946,93 @@ defmodule Module.Types.Descr do
     end
   end
 
+  # Checks if the map without keys represented by `dnf` is empty.
+  defp map_without_keys_empty?(dnf) do
+    dnf = bdd_get(dnf)
+    Enum.all?(dnf, &map_line_without_keys_empty?/1)
+  end
+
+  def test() do
+    x = map([], :open)
+    t = difference(map([]), map([], :open))
+
+    x = {:open, %{}}
+    z = {%{:atom => none(), :integer => term()}, %{}}
+    y = {x, false, {z, true, false}}
+
+    y
+    |> bdd_get()
+    |> dbg()
+    |> Enum.all?(&map_line_without_keys_empty?/1)
+    |> dbg()
+  end
+
+  @all_domains [:atom, :integer]
+
+  # Checks that a line of a map bdd without keys is empty or not
+  defp map_line_without_keys_empty?({positives, negatives}) do
+    positive_intersection = map_intersect_positive_literals(positives)
+
+    case negatives do
+      [] ->
+        false
+
+      _ ->
+        Enum.any?(negatives, fn negative ->
+          Enum.all?(@all_domains, fn domain ->
+            map_literal_get_domain(positive_intersection, domain)
+            |> subtype?(map_literal_get_domain(negative, domain))
+          end)
+        end)
+    end
+  end
+
+  # Takes a list of positive map literals without keys, and computes their fast intersection
+  defp map_intersect_positive_literals([]), do: {:open, %{}}
+
+  defp map_intersect_positive_literals(positive_literals) do
+    Enum.reduce(positive_literals, fn
+      {:open, _}, acc ->
+        acc
+
+      {:closed, _}, _acc ->
+        {:closed, %{}}
+
+      {domains, _}, _acc when is_map(domains) ->
+        for {domain, type} <- domains, into: %{} do
+          {domain, intersection(type, map_literal_get_domain(domains, domain))}
+        end
+    end)
+  end
+
+  # Takes a map literal, and gets the correct type associated to a domain
+  defp map_literal_get_domain({:open, _}, domain), do: @term
+  defp map_literal_get_domain({:closed, _}, domain), do: @none
+  defp map_literal_get_domain({domains, _}, domain), do: Map.get(domains, domain)
+
   # Function similar to `map_get_dnf/1` but short-circuits if it finds a non-empty
   # map literal in the union.
-  defp map_not_empty?(d), do: map_not_empty?(d, [])
+  defp map_not_empty?(d), do: map_not_empty?(d, [], [])
 
-  defp map_not_empty?(d, fields_acc) do
+  defp map_not_empty?(d, fields_acc, steps_acc) do
     case find_key_or_step(d) do
       # `d` is a map bdd with no named fields (i.e., only %{..} or %{} appear at the nodes)
       nil ->
-        {is_open, has_empty} = empty_cases(d)
-        is_open or has_empty
+        not map_without_keys_empty?(d)
 
       {:key, key} ->
         # Split the map on the found key; for each possible split, recurse
         # on the rest of the map (which does not contain the key anymore)
-        map_split_on_key(d, key)
+        map_split_on_key(d, {:key, key})
         |> Enum.any?(fn {value_type, rest_of_map} ->
           type_with_option = {has_unset?(value_type), remove_unset(value_type)}
-          map_not_empty?(rest_of_map.map, [{key, type_with_option} | fields_acc])
+          map_not_empty?(rest_of_map.map, [{key, type_with_option} | fields_acc], steps_acc)
+        end)
+
+      {:step, step} ->
+        map_split_on_key(d, {:step, step})
+        |> Enum.any?(fn {step_type, rest_of_map} ->
+          map_get_dnf(rest_of_map.map, fields_acc, [{step, step_type} | steps_acc])
         end)
     end
   end
@@ -1133,3 +1224,5 @@ defmodule Module.Types.Descr do
     Enum.reduce(pairs, [], fn {t1, t2}, acc -> add_pair_to_disjoint_list(acc, t1, t2, []) end)
   end
 end
+
+Module.Types.Descr.test()
