@@ -531,7 +531,7 @@ defmodule Module.Types.Descr do
     end
   end
 
-  # Unset
+  ## Not_set
 
   # `not_set()` is a special base type that represents an absent field in a map.
   # E.g., `%{a: integer(), b: not_set(), ...}` represents a map with an integer
@@ -544,7 +544,7 @@ defmodule Module.Types.Descr do
   # `not_set()` has no meaning outside of map types.
 
   # Add the not_set type to `type`
-  defp if_set(type), do: Map.update(type, :bitmap, @bit_not_set, &(&1 ||| @bit_not_set))
+  def if_set(type), do: Map.update(type, :bitmap, @bit_not_set, &(&1 ||| @bit_not_set))
   defp has_not_set?(type), do: (Map.get(type, :bitmap, 0) &&& @bit_not_set) != 0
 
   defp remove_not_set(type) do
@@ -555,7 +555,7 @@ defmodule Module.Types.Descr do
     end
   end
 
-  # Map
+  ## Map
 
   # Map types are stored in a tree (binary decision diagram) that contains
   # map literals at the nodes.
@@ -860,7 +860,7 @@ defmodule Module.Types.Descr do
     end
   end
 
-  # BDD (Binary Decision Diagrams)
+  ## BDD (Binary Decision Diagrams)
   #
   # Generic BDD operations. Binary decision diagrams are binary trees used to
   # encode unions of intersections of type literals (e.g., map literals).
@@ -927,7 +927,7 @@ defmodule Module.Types.Descr do
     |> bdd_get(bdd_left, [literal | pos_acc], neg_acc)
   end
 
-  # Pairs
+  ## Pairs
   #
   # To simplify disjunctive normal forms of e.g., map types, it is useful to
   # convert them into disjunctive normal forms of pairs of types, and define

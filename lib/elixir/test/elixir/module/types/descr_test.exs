@@ -157,11 +157,19 @@ defmodule Module.Types.DescrTest do
                map([a: atom()], :open)
              )
 
-      assert difference(map(), map([a: integer(), b: atom()], :open))
+      assert difference(map(), map([a: integer(), b: term()], :open))
              |> equal?(
                union(
                  map([a: integer(), b: not_set()], :open),
-                 map([a: negation(integer())], :open)
+                 map([a: if_set(negation(integer()))], :open)
+               )
+             )
+
+      assert difference(map(), map([a: integer(), b: atom()], :open))
+             |> equal?(
+               union(
+                 map([a: integer(), b: if_set(negation(atom()))], :open),
+                 map([a: if_set(negation(integer()))], :open)
                )
              )
     end
