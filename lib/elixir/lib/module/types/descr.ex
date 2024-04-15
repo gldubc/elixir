@@ -840,19 +840,19 @@ defmodule Module.Types.Descr do
 
   # Function similar to `map_get_dnf/1` but short-circuits if it finds a non-empty
   # map literal in the union.
-  defp map_not_empty?(d), do: map_not_empty?(d, [])
+  defp map_not_empty?(bdd), do: map_not_empty?(bdd, [])
 
-  defp map_not_empty?(d, fields_acc) do
-    case find_key(d) do
-      # `d` is a map bdd with no named fields (i.e., only %{..} or %{} appear at the nodes)
+  defp map_not_empty?(bdd, fields_acc) do
+    case find_key(bdd) do
+      # `bdd` is a map bdd with no named fields (i.e., only %{..} or %{} appear at the nodes)
       nil ->
-        {is_open, has_empty} = empty_cases(d)
+        {is_open, has_empty} = empty_cases(bdd)
         is_open or has_empty
 
       {:key, key} ->
         # Split the map on the found key; for each possible split, recurse
         # on the rest of the map (which does not contain the key anymore)
-        map_split_on_key(d, key)
+        map_split_on_key(bdd, key)
         |> Enum.any?(fn {value_type, rest_of_map} ->
           type_with_option = {has_not_set?(value_type), remove_not_set(value_type)}
           map_not_empty?(rest_of_map.map, [{key, type_with_option} | fields_acc])
