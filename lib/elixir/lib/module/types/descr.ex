@@ -637,6 +637,7 @@ defmodule Module.Types.Descr do
 
   @doc """
   Gets the set of keys that are always present in a map.
+  TODO: make it using on map_split_on_key
   """
   def map_keys(%{} = descr) do
     if subtype?(descr, map()) do
@@ -709,10 +710,29 @@ defmodule Module.Types.Descr do
     end
   end
 
+  # defp map_bdd_fold(bdd, seen, acc, fun) do
+  #   {{_tag, fields}, left, right} when fields != %{} ->
+  # acc = :maps.fold(fields, acc, fun)
+  # acc = map_bdd_fold(left, seen, acc, fun)
+  # map_bdd_fold(right, seen, acc, fun)
+  # end
+
+  # def map_emptiness() do
+  #   map_fold(bdd, [], fn key, acc ->
+  #     throw :omg
+  #   end)
+  #   catch
+  #     :omg -> fase
+  #   end
+  # end
+
+  # When i do emptiness, just send a throw
+
   # Finds a defined key in the `bdd` representing a map, or returns `nil`
   defp find_key(bdd) do
     case bdd do
       true -> nil
+
       false -> nil
       {{_tag, fields}, _, _} when map_size(fields) != 0 -> {:key, Map.keys(fields) |> hd()}
       {_, left_bdd, right_bdd} -> find_key(left_bdd) || find_key(right_bdd)
@@ -745,6 +765,9 @@ defmodule Module.Types.Descr do
         {(b1 and c1) or (not b1 and d1), (b2 and c2) or (not b2 and d2)}
     end
   end
+
+  # Idea: maybe build everything on top of the shape dnf b/c we are converting
+  # to it anyway
 
   # Takes a map bdd and a key, and returns an equivalent dnf of pairs.
   # See `split_line_on_key/5`.
@@ -954,6 +977,11 @@ defmodule Module.Types.Descr do
       else: make_pairs_disjoint(negative) |> eliminate_negations(fst, snd)
   end
 
+  # TODO:
+  # 1) if just one element postivie = [{fst, snd}], dont check emptines
+  # 2) if the pos/neg come from splitting, the intersection of rest_of_maps will
+  #    never be empty
+
   # Eliminates negations from `{t, s} and not negative`.
   # Formula:
   #   if `negative` is a union of pairs disjoint on their first component:
@@ -964,7 +992,7 @@ defmodule Module.Types.Descr do
   #                 union<i=1..n> {t and t_i, s and not s_i}
   #                     or {t and not (union{i=1..n} t_i), s}
   # which eliminates all top-level negations and produces a union of pairs
-  # that are disjoint on their first component.
+  # that are not empty disjoint on their first component.
   defp eliminate_negations(negative, t, s) do
     {pair_union, union_of_t_i} =
       Enum.reduce(
@@ -972,10 +1000,13 @@ defmodule Module.Types.Descr do
         {[], none()},
         fn {t_i, s_i}, {accu, union_of_t_i} ->
           i = intersection(t, t_i)
+
+          # rem: the condition where this one is empty is good for pretty printing
+          # but not for emptiness checking
           j = intersection(s, s_i)
 
           # discard negative literals that do not intersect with the positive ones
-          if not_empty?(i) and not_empty?(j) do
+          if not_empty?(i) do
             union_of_t_i = union(union_of_t_i, t_i)
             s_diff = difference(s, s_i)
 
