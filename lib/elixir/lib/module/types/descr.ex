@@ -732,7 +732,6 @@ defmodule Module.Types.Descr do
   defp find_key(bdd) do
     case bdd do
       true -> nil
-
       false -> nil
       {{_tag, fields}, _, _} when map_size(fields) != 0 -> {:key, Map.keys(fields) |> hd()}
       {_, left_bdd, right_bdd} -> find_key(left_bdd) || find_key(right_bdd)
@@ -972,15 +971,11 @@ defmodule Module.Types.Descr do
   defp pair_simplify_line({positive, negative}, term) do
     {fst, snd} = pair_intersection(positive, term)
 
-    if empty?(fst) or empty?(snd),
+    # don't check emptiness if no real intersection was computed
+    if (length(positive) > 1 and empty?(fst)) or empty?(snd),
       do: [],
       else: make_pairs_disjoint(negative) |> eliminate_negations(fst, snd)
   end
-
-  # TODO:
-  # 1) if just one element postivie = [{fst, snd}], dont check emptines
-  # 2) if the pos/neg come from splitting, the intersection of rest_of_maps will
-  #    never be empty
 
   # Eliminates negations from `{t, s} and not negative`.
   # Formula:
@@ -1006,7 +1001,7 @@ defmodule Module.Types.Descr do
           j = intersection(s, s_i)
 
           # discard negative literals that do not intersect with the positive ones
-          if not_empty?(i) do
+          if not_empty?(i) and not_empty?(j) do
             union_of_t_i = union(union_of_t_i, t_i)
             s_diff = difference(s, s_i)
 
@@ -1027,8 +1022,10 @@ defmodule Module.Types.Descr do
   end
 
   # Component-wise intersection of a list of pairs.
-  defp pair_intersection(pair_list, term) do
-    Enum.reduce(pair_list, {term, term}, fn {x1, x2}, {acc1, acc2} ->
+  defp pair_intersection([], term), do: {term, term}
+
+  defp pair_intersection(pair_list, _term) do
+    Enum.reduce(pair_list, fn {x1, x2}, {acc1, acc2} ->
       {intersection(acc1, x1), intersection(acc2, x2)}
     end)
   end
