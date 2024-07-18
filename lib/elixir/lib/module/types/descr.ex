@@ -45,7 +45,7 @@ defmodule Module.Types.Descr do
 
   defp unfold(:term), do: unfolded_term()
   defp unfold(other), do: other
-  defp unfolded_term, do: %{bitmap: @bit_top, atom: @atom_top, map: @map_top}
+  defp unfolded_term, do: %{bitmap: @bit_top, atom: @atom_top, tuple: @tuple_top, map: @map_top}
 
   def atom(as), do: %{atom: atom_new(as)}
   def atom(), do: %{atom: @atom_top}
@@ -712,6 +712,9 @@ defmodule Module.Types.Descr do
     {acc, dynamic?}
   end
 
+  defp optional?(%{bitmap: bitmap}) when (bitmap &&& @bit_optional) != 0, do: true
+  defp optional?(_), do: false
+
   defp map_tag_to_type(:open), do: term_or_optional()
   defp map_tag_to_type(:closed), do: not_set()
 
@@ -1121,11 +1124,14 @@ defmodule Module.Types.Descr do
   defp tuple_union(left, right), do: map_union(left, right)
 
   # Same as map_fetch, only the tuple descr field is accessed
+  def tuple_fetch(:term, _key), do: :badtuple
+
   def tuple_fetch(%{} = descr, key) do
     case :maps.take(:dynamic, descr) do
       :error ->
         if is_map_key(descr, :tuple) and tuple_only?(descr) do
-          {static_optional?, static_type} = tuple_fetch_static(descr, key) |> pop_optional()
+          {static_optional?, static_type} =
+            tuple_fetch_static(descr, key) |> pop_optional_static()
 
           if static_optional? or empty?(static_type) do
             :badindex
@@ -1136,13 +1142,26 @@ defmodule Module.Types.Descr do
           :badtuple
         end
 
+      {:term, static} ->
+        {static_optional?, static_type} =
+          tuple_fetch_static(static, key) |> pop_optional_static()
+
+        if static_optional? do
+          :badindex
+        else
+          {true, union(dynamic(), static_type)}
+        end
+
       {%{map: {:open, fields, []}}, static} when fields == %{} and static == @none ->
         {true, dynamic()}
 
       {dynamic, static} ->
         if is_map_key(dynamic, :tuple) and tuple_only?(static) do
-          {dynamic_optional?, dynamic_type} = tuple_fetch_static(dynamic, key) |> pop_optional()
-          {static_optional?, static_type} = tuple_fetch_static(static, key) |> pop_optional()
+          {dynamic_optional?, dynamic_type} =
+            tuple_fetch_static(dynamic, key) |> pop_optional_static()
+
+          {static_optional?, static_type} =
+            tuple_fetch_static(static, key) |> pop_optional_static()
 
           if static_optional? or empty?(dynamic_type) do
             :badindex
