@@ -179,6 +179,11 @@ defmodule Module.Types.DescrTest do
 
     test "tuple" do
       assert empty?(difference(open_tuple([atom()]), open_tuple([term()])))
+      refute empty?(difference(open_tuple(), empty_tuple()))
+
+      # this amoounts to the difference of 
+      # {:open, [], []} with {:closed, [], []}
+      # which produces {:open, [], [{:closed, []}]}
 
       assert difference(open_tuple([atom()]), tuple([integer(), integer()]))
              |> equal?(open_tuple([atom()]))
@@ -225,6 +230,8 @@ defmodule Module.Types.DescrTest do
 
       assert difference(open_map(a: atom()), closed_map(b: integer()))
              |> equal?(open_map(a: atom()))
+
+      refute empty?(difference(open_map(), empty_map()))
     end
   end
 

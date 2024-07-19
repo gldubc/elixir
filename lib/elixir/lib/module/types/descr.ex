@@ -1311,63 +1311,51 @@ defmodule Module.Types.Descr do
   end
 
   defp tuple_empty?(dnf) do
-    try do
-      for {tag, pos, negs} <- dnf do
-        tuple_empty?(tag, pos, negs)
-      end
-
-      true
-    catch
-      :not_empty -> false
-    end
+    Enum.all?(dnf, fn {tag, pos, negs} -> tuple_empty?(tag, pos, negs) end)
   end
 
-  defp tuple_empty?(_, _, []), do: throw(:not_empty)
-  defp tuple_empty?(_, _, [{:open, fs} | _]) when fs == [], do: true
+  defp tuple_empty?(_, _, []), do: false
+  defp tuple_empty?(_, _, [{:open, []} | _]), do: true
 
   defp tuple_empty?(tag, fields, [{neg_tag, neg_fields} | negs]) do
-    try do
-      for {neg_type, neg_index} <- neg_fields,
-          not Enum.any?(fields, fn {_, index} -> index == neg_index end) do
-        cond do
-          tag == :closed ->
-            throw(:discard_negative)
+    fields_length = length(fields)
 
-          tag == :open ->
-            diff = difference(term_or_optional(), neg_type)
+    Enum.all?(neg_fields, fn {neg_type, neg_index} ->
+      cond do
+        neg_index < fields_length ->
+          true
 
-            closed_pos = Enum.filter(fields, fn {_, index} -> index < neg_index end)
+        tag == :closed ->
+          false
 
-            open_pos = fields ++ [{remove_optional(diff), neg_index}]
-
-            tuple_empty?(:closed, closed_pos, negs) and tuple_empty?(tag, open_pos, negs)
-        end
+        tag == :open ->
+          diff = difference(term_or_optional(), neg_type)
+          closed_pos = Enum.filter(fields, fn {_, index} -> index < neg_index end)
+          open_pos = fields ++ [{remove_optional(diff), neg_index}]
+          tuple_empty?(:closed, closed_pos, negs) and tuple_empty?(tag, open_pos, negs)
       end
-
-      for {type, index} <- fields do
+    end) and
+      Enum.all?(fields, fn {type, index} ->
         case Enum.find(neg_fields, fn {_, neg_index} -> neg_index == index end) do
           {neg_type, _} ->
             diff = difference(type, neg_type)
 
             empty?(diff) or
-              tuple_empty?(tag, List.keyreplace(fields, index, 1, {diff, index}), negs)
+              tuple_empty?(tag, List.replace_at(fields, index, {diff, index}), negs)
 
           nil ->
             if neg_tag == :closed do
-              throw(:discard_negative)
+              dbg("neg_index")
+              false
             else
+              dbg("uh")
               diff = difference(type, tag_to_type(neg_tag))
 
               empty?(diff) or
-                tuple_empty?(tag, List.keyreplace(fields, index, 1, {diff, index}), negs)
+                tuple_empty?(tag, List.replace_at(fields, index, {diff, index}), negs)
             end
         end
-      end
-
-      true
-    catch
-      :discard_negative -> tuple_empty?(tag, fields, negs)
-    end
+      end)
   end
 
   defp tuple_split_on_index(dnf, index) do
