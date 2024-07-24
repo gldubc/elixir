@@ -801,18 +801,18 @@ defmodule Module.Types.Descr do
     end
   end
 
-  defp remove_optional(type) do
-    case type do
-      %{bitmap: @bit_optional} ->
-        Map.delete(type, :bitmap)
+  # defp remove_optional(type) do
+  #   case type do
+  #     %{bitmap: @bit_optional} ->
+  #       Map.delete(type, :bitmap)
 
-      %{bitmap: bitmap} when (bitmap &&& @bit_optional) != 0 ->
-        %{type | bitmap: bitmap - @bit_optional}
+  #     %{bitmap: bitmap} when (bitmap &&& @bit_optional) != 0 ->
+  #       %{type | bitmap: bitmap - @bit_optional}
 
-      _ ->
-        type
-    end
-  end
+  #     _ ->
+  #       type
+  #   end
+  # end
 
   # Union is list concatenation
   defp map_union(dnf1, dnf2), do: dnf1 ++ dnf2
@@ -1132,8 +1132,8 @@ defmodule Module.Types.Descr do
 
   defp zip_intersection(types1, types2, fun), do: zip_intersection(types1, types2, fun, [])
 
-  defp zip_intersection([], types2, _fun, acc), do: types2 ++ acc
-  defp zip_intersection(types1, [], _fun, acc), do: types1 ++ acc
+  defp zip_intersection([], types2, _fun, acc), do: Enum.reverse(acc, types2)
+  defp zip_intersection(types1, [], _fun, acc), do: Enum.reverse(acc, types1)
 
   defp zip_intersection([ty1 | types1], [ty2 | types2], fun, acc) do
     zip_intersection(types1, types2, fun, [fun.(ty1, ty2) | acc])
@@ -1310,53 +1310,110 @@ defmodule Module.Types.Descr do
     end
   end
 
+  # Pads the elements with the term type to the given length.
+  # Each elements is a pair {_, index}.
+  defp tuple_fill(elements, length) when length(elements) > length do
+    raise ArgumentError, "tuple_fill: elements are longer than the desired length"
+  end
+
+  defp tuple_fill(elements, length) when length(elements) == length, do: elements
+
+  defp tuple_fill(elements, length) do
+    padding = Enum.map(length(elements)..(length - 1), &{term(), &1})
+    elements ++ padding
+  end
+
   defp tuple_empty?(dnf) do
     Enum.all?(dnf, fn {tag, pos, negs} -> tuple_empty?(tag, pos, negs) end)
   end
 
   defp tuple_empty?(_, _, []), do: false
   defp tuple_empty?(_, _, [{:open, []} | _]), do: true
+  defp tuple_empty?(:open, _, [{:closed, _}]), do: false
 
-  defp tuple_empty?(tag, fields, [{neg_tag, neg_fields} | negs]) do
-    fields_length = length(fields)
+  defp tuple_empty?(tag, elements, [{neg_tag, neg_elements} | negs]) do
+    n = length(elements)
+    m = length(neg_elements)
 
-    Enum.all?(neg_fields, fn {neg_type, neg_index} ->
-      cond do
-        neg_index < fields_length ->
-          true
-
-        tag == :closed ->
-          false
-
-        tag == :open ->
-          diff = difference(term_or_optional(), neg_type)
-          closed_pos = Enum.filter(fields, fn {_, index} -> index < neg_index end)
-          open_pos = fields ++ [{remove_optional(diff), neg_index}]
-          tuple_empty?(:closed, closed_pos, negs) and tuple_empty?(tag, open_pos, negs)
-      end
-    end) and
-      Enum.all?(fields, fn {type, index} ->
-        case Enum.find(neg_fields, fn {_, neg_index} -> neg_index == index end) do
-          {neg_type, _} ->
-            diff = difference(type, neg_type)
-
-            empty?(diff) or
-              tuple_empty?(tag, List.replace_at(fields, index, {diff, index}), negs)
-
-          nil ->
-            if neg_tag == :closed do
-              dbg("neg_index")
-              false
-            else
-              dbg("uh")
-              diff = difference(type, tag_to_type(neg_tag))
-
-              empty?(diff) or
-                tuple_empty?(tag, List.replace_at(fields, index, {diff, index}), negs)
-            end
+    case {tag, neg_tag} do
+      {:closed, :open} ->
+        if n >= m do
+          fill = tuple_fill(neg_elements, n)
+          check_elements([], :closed, elements, fill, negs)
+        else
+          tuple_empty?(:closed, elements, negs)
         end
-      end)
+
+      {:closed, :closed} ->
+        if n == m do
+          check_elements([], :closed, elements, neg_elements, negs)
+        else
+          tuple_empty?(:closed, elements, negs)
+        end
+
+      {_, _} ->
+        check_elements([], tag, elements, neg_elements, negs) and
+          (n >= m or check_compatibility(n, m, elements, negs)) and
+          (neg_tag == :open or tuple_empty?(:open, tuple_fill(elements, max(m + 1, n)), negs))
+    end
   end
+
+  defp check_elements(_, _, _, [], _), do: true
+
+  defp check_elements(acc, tag, [{ty, _} = x | elements], [{neg_type, _} | neg_elements], negs) do
+    diff = difference(ty, neg_type)
+
+    (empty?(diff) or tuple_empty?(tag, acc ++ [{diff, length(acc)} | elements], negs)) and
+      check_elements(acc ++ [x], tag, elements, neg_elements, negs)
+  end
+
+  defp check_elements(acc, tag, [], [{neg_type, _} | neg_elements], negs) do
+    neg = negation(neg_type)
+
+    (empty?(neg) or tuple_empty?(tag, acc ++ [{neg, length(acc)}], negs)) and
+      check_elements(acc ++ [{term(), length(acc)}], tag, [], neg_elements, negs)
+  end
+
+  defp check_compatibility(n, m, elements, negs) do
+    Enum.all?(n..(m - 1), &tuple_empty?(:closed, tuple_fill(elements, &1), negs))
+  end
+
+  # defp check_elements(tag, acc, [], _, [], negs), do: true
+
+  # defp check_elements(tag, acc, [{ty, _} | elements], neg_tag, [], negs) do
+  #   if neg_tag == :closed do
+  #     check_elements(tag, acc ++ elements, negs)
+  #   else
+  #     true
+  #   end
+  # end
+
+  # defp check_elements(tag, acc, [], neg_tag, [{neg_ty, _} | neg_elements], negs) do
+  #   neg = negation(neg_ty)
+
+  #   (empty?(neg) or tuple_empty?(tag, acc ++ [{neg, length(acc)}], negs)) and
+  #     check_elements(tag, acc ++ [{term(), length(acc)}], [], neg_tag, neg_elements, negs)
+  # end
+
+  # defp check_elements(
+  #        tag,
+  #        acc,
+  #        [{ty, _} | elements],
+  #        neg_tag,
+  #        [{neg_ty, _} | neg_elements],
+  #        negs
+  #      ) do
+  #   diff = difference(ty, neg_ty)
+
+  #   (empty?(diff) or tuple_empty?(tag, acc ++ [{diff, length(acc)}] ++ elements, negs)) and
+  #     check_elements(tag, acc ++ [{ty, length(acc)}], elements, neg_tag, neg_elements, negs)
+  # end
+
+  # defp check_elements(tag, elements, []), do: true
+
+  # defp check_elements(tag, elements, [{neg_tag, neg_elements} | negs]) do
+  #   check_elements(tag, [], elements, neg_tag, neg_elements, negs)
+  # end
 
   defp tuple_split_on_index(dnf, index) do
     Enum.flat_map(dnf, fn

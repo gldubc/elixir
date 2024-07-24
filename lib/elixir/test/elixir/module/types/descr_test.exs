@@ -177,15 +177,57 @@ defmodule Module.Types.DescrTest do
       assert empty?(difference(none(), dynamic()))
     end
 
+    defp tuple_of_size_at_least(n) when is_integer(n), do: open_tuple(List.duplicate(term(), n))
+    defp tuple_of_size(n) when is_integer(n), do: tuple(List.duplicate(term(), n))
+
     test "tuple" do
       assert empty?(difference(open_tuple([atom()]), open_tuple([term()])))
       refute empty?(difference(open_tuple(), empty_tuple()))
+      refute tuple_of_size_at_least(2) |> difference(tuple_of_size(2)) |> empty?()
+      assert tuple_of_size_at_least(2) |> difference(tuple_of_size_at_least(1)) |> empty?()
+      assert tuple_of_size_at_least(3) |> difference(tuple_of_size_at_least(3)) |> empty?()
+      refute tuple_of_size_at_least(2) |> difference(tuple_of_size_at_least(3)) |> empty?()
+      refute tuple([term(), term()]) |> difference(tuple([atom(), term()])) |> empty?()
+      refute tuple([term(), term()]) |> difference(tuple([atom()])) |> empty?()
+      assert tuple([term(), term()]) |> difference(tuple([term(), term()])) |> empty?()
 
-      # this amoounts to the difference of 
-      # {:open, [], []} with {:closed, [], []}
-      # which produces {:open, [], [{:closed, []}]}
+      # {term(), term()} and not ({term(), term(), term(), ...} or {term(), term()}) is empty
+      assert tuple_of_size_at_least(2)
+             |> difference(tuple_of_size(2))
+             |> difference(tuple_of_size_at_least(3))
+             |> empty?()
 
-      assert difference(open_tuple([atom()]), tuple([integer(), integer()]))
+      # order does not matter
+      assert tuple_of_size_at_least(2)
+             |> difference(tuple_of_size_at_least(3))
+             |> difference(tuple_of_size(2))
+             |> empty?()
+
+      assert tuple([term(), term()])
+             |> difference(tuple([atom()]))
+             |> difference(open_tuple([term()]))
+             |> difference(empty_tuple())
+             |> empty?()
+
+      refute difference(open_tuple(), empty_tuple())
+             |> difference(open_tuple([term(), term()]))
+             |> empty?()
+
+      assert difference(open_tuple([term()]), open_tuple([term(), term()]))
+             |> difference(tuple([term()]))
+             |> empty?()
+
+      assert open_tuple()
+             |> difference(open_tuple([term()]))
+             |> difference(empty_tuple())
+             |> empty?()
+
+      assert open_tuple([atom()])
+             |> difference(tuple([integer(), integer()]))
+             |> equal?(open_tuple([atom()]))
+
+      assert open_tuple([atom()])
+             |> difference(tuple([integer(), integer()]))
              |> equal?(open_tuple([atom()]))
 
       assert tuple([union(atom(), integer()), term()])
@@ -271,6 +313,9 @@ defmodule Module.Types.DescrTest do
     end
 
     test "tuple" do
+      assert subtype?(empty_tuple(), tuple())
+      assert subtype?(tuple([integer(), atom()]), tuple())
+      refute subtype?(empty_tuple(), open_tuple([term()]))
       assert subtype?(tuple([integer(), atom()]), tuple([term(), term()]))
       refute subtype?(tuple([integer(), atom()]), tuple([integer(), integer()]))
       refute subtype?(tuple([integer(), atom()]), tuple([atom(), atom()]))
@@ -334,6 +379,30 @@ defmodule Module.Types.DescrTest do
   describe "empty" do
     test "tuple" do
       assert intersection(tuple([integer(), atom()]), open_tuple([atom()])) |> empty?
+      refute open_tuple([integer(), integer()]) |> difference(empty_tuple()) |> empty?
+      refute open_tuple([integer(), integer()]) |> difference(open_tuple([atom()])) |> empty?
+      refute open_tuple([term()]) |> difference(tuple([term()])) |> empty?
+
+      refute open_tuple([term()])
+             |> difference(tuple([term()]))
+             |> difference(tuple([term()]))
+             |> empty?
+
+      # {int, int or atom,...} \ {int, int, ...} \ {int, atom, ...}
+      assert tuple([integer(), union(integer(), atom())])
+             |> difference(tuple([integer(), integer()]))
+             |> difference(tuple([integer(), atom()]))
+             |> empty?
+
+      assert open_tuple()
+             |> difference(empty_tuple())
+             |> difference(open_tuple([term()]))
+             |> empty?
+
+      assert open_tuple()
+             |> difference(open_tuple([term()]))
+             |> difference(empty_tuple())
+             |> empty?
     end
 
     test "map" do
