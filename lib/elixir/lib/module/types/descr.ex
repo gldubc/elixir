@@ -1098,14 +1098,9 @@ defmodule Module.Types.Descr do
   # Tuple types {integer(), atom()} and open tuple types {atom(), boolean(), ...}
   # which represents every tuple of at least two elements that are an atom and a boolean.
   #
-  # Tuples are encoded as map records, where the keys are the indices.
-  # E.g., type {integer(), atom()} is encoded as type %{0 => integer(), 1 => atom()}.
-  # and {atom(), boolean(), ...} is encoded as the open map %{..., 0 => atom(), 1 => boolean()}.
-  #
-  # There is no overlap because map types and tuple types exist in different fields
-  # of the descr (:map and :tuple). While this encoding reuses the set-theoretic
-  # map operations, emptiness is slightly modified to account for the fact that
-  # tuple types do not admit optional indices.
+  # Tuples are encoded as pair {tag, elements} where elements is a list of types.
+  # E.g., type {integer(), atom()} is encoded as type {:closed, [integer(), atom()]}.
+  # and {atom(), boolean(), ...} is encoded as {:open [atom(), boolean()]}.
 
   defp tuple_new(tag, elements), do: [{tag, elements, []}]
 
