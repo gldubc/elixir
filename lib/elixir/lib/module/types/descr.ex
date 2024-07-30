@@ -712,9 +712,6 @@ defmodule Module.Types.Descr do
     {acc, dynamic?}
   end
 
-  defp optional?(%{bitmap: bitmap}) when (bitmap &&& @bit_optional) != 0, do: true
-  defp optional?(_), do: false
-
   defp tag_to_type(:open), do: term_or_optional()
   defp tag_to_type(:closed), do: not_set()
 
@@ -1130,53 +1127,31 @@ defmodule Module.Types.Descr do
     end
   end
 
-  defp zip_intersection(types1, types2, fun), do: zip_intersection(types1, types2, fun, [])
+  defp tuple_literal_intersection(tag1, elements1, tag2, elements2) do
+    case {tag1, tag2} do
+      {:open, :open} ->
+        {:open, tuple_literal_intersection_loop(elements1, elements2, [])}
 
-  defp zip_intersection([], types2, _fun, acc), do: Enum.reverse(acc, types2)
-  defp zip_intersection(types1, [], _fun, acc), do: Enum.reverse(acc, types1)
+      {:closed, :closed} ->
+        if length(elements1) != length(elements2) do
+          throw(:empty)
+        else
+          {:closed, tuple_literal_intersection_loop(elements1, elements2, [])}
+        end
 
-  defp zip_intersection([ty1 | types1], [ty2 | types2], fun, acc) do
-    zip_intersection(types1, types2, fun, [fun.(ty1, ty2) | acc])
-  end
+      {:closed, :open} ->
+        {:closed, tuple_literal_intersection_loop(elements2, elements1, [])}
 
-  # Open and closed: result is closed, all fields from open should be in closed
-  defp tuple_literal_intersection(:open, elements1, :open, elements2) do
-    new_fields =
-      zip_intersection(elements1, elements2, fn type1, type2 ->
-        non_empty_intersection!(type1, type2)
-      end)
-
-    {:open, new_fields}
-  end
-
-  defp tuple_literal_intersection(:closed, elements1, :closed, elements2) do
-    new_fields =
-      zip_intersection(elements1, elements2, fn type1, type2 ->
-        non_empty_intersection!(type1, type2)
-      end)
-
-    if length(new_fields) < length(elements1) or length(new_fields) < length(elements2) do
-      throw(:empty)
+      {_, _} ->
+        {:closed, tuple_literal_intersection_loop(elements1, elements2, [])}
     end
-
-    {:closed, new_fields}
   end
 
-  defp tuple_literal_intersection(:open, open, :closed, closed) do
-    tuple_literal_intersection_loop(open, closed, [])
-  end
-
-  defp tuple_literal_intersection(:closed, closed, :open, open) do
-    tuple_literal_intersection_loop(open, closed, [])
-  end
-
-  # Open and closed tuples: result is closed, closed should have at least as many elements as open
-  defp tuple_literal_intersection_loop(_types1, [], _result), do: throw(:empty)
-  defp tuple_literal_intersection_loop([], acc, result), do: {:closed, Enum.reverse(result, acc)}
+  defp tuple_literal_intersection_loop([], types2, acc), do: Enum.reverse(acc, types2)
+  defp tuple_literal_intersection_loop(_types1, [], _acc), do: throw(:empty)
 
   defp tuple_literal_intersection_loop([type1 | rest1], [type2 | rest2], acc) do
-    new_type = non_empty_intersection!(type1, type2)
-    tuple_literal_intersection_loop(rest1, rest2, [new_type | acc])
+    tuple_literal_intersection_loop(rest1, rest2, [non_empty_intersection!(type1, type2) | acc])
   end
 
   defp tuple_difference(dnf1, dnf2) do
@@ -1227,25 +1202,12 @@ defmodule Module.Types.Descr do
     end
   end
 
-  def tuple_literal_to_quoted({:closed, fields}) when map_size(fields) == 0 do
-    {:empty_map, [], []}
-  end
+  def tuple_literal_to_quoted({:closed, []}), do: {:{}, [], []}
 
-  def tuple_literal_to_quoted({tag, fields}) do
+  def tuple_literal_to_quoted({tag, elements}) do
     case tag do
-      :closed -> {:{}, [], tuple_fields_to_quoted(tag, fields)}
-      :open -> {:{}, [], tuple_fields_to_quoted(tag, fields) ++ [{:..., [], nil}]}
-    end
-  end
-
-  defp tuple_fields_to_quoted(tag, elements) do
-    for type <- elements,
-        not (tag == :open and optional?(type) and term_type?(type)) do
-      cond do
-        not optional?(type) -> to_quoted(type)
-        empty?(type) -> {:not_set, [], []}
-        true -> {:if_set, [], [to_quoted(type)]}
-      end
+      :closed -> {:{}, [], Enum.map(elements, &to_quoted/1)}
+      :open -> {:{}, [], Enum.map(elements, &to_quoted/1) ++ [{:..., [], nil}]}
     end
   end
 
@@ -1254,10 +1216,8 @@ defmodule Module.Types.Descr do
     raise ArgumentError, "tuple_fill: elements are longer than the desired length"
   end
 
-  defp tuple_fill(elements, length) when length(elements) == length, do: elements
-
-  defp tuple_fill(elements, length) do
-    elements ++ List.duplicate(term(), length - length(elements))
+  defp tuple_fill(elements, desired_length) do
+    elements ++ List.duplicate(term(), desired_length - length(elements))
   end
 
   defp tuple_empty?(dnf) do
@@ -1272,57 +1232,33 @@ defmodule Module.Types.Descr do
     n = length(elements)
     m = length(neg_elements)
 
-    case {tag, neg_tag} do
-      {:closed, :open} ->
-        if n >= m do
-          fill = tuple_fill(neg_elements, n)
-          check_elements([], :closed, elements, fill, negs)
-        else
-          tuple_empty?(:closed, elements, negs)
-        end
-
-      {:closed, :closed} ->
-        if n == m do
-          check_elements([], :closed, elements, neg_elements, negs)
-        else
-          tuple_empty?(:closed, elements, negs)
-        end
-
-      {:open, :closed} ->
-        if n <= m do
-          check_elements([], tag, elements, neg_elements, negs) and
-            check_compatibility(n, m, elements, negs) and
-            tuple_empty?(:open, tuple_fill(elements, max(m + 1, n)), negs)
-        else
-          tuple_empty?(:open, elements, negs)
-        end
-
-      {:open, :open} ->
-        check_elements([], tag, elements, neg_elements, negs) and
-          (n >= m or check_compatibility(n, m, elements, negs))
+    # Scenarios where the difference is guaranteed to be empty:
+    # 1. When removing larger tuples from a fixed-size positive tuple
+    # 2. When removing smaller tuples from larger tuples
+    if (tag == :closed and n < m) or (neg_tag == :closed and n > m) do
+      tuple_empty?(tag, elements, negs)
+    else
+      check_elements([], tag, elements, neg_elements, negs) and
+        check_compatibility(n, m, tag, elements, neg_tag, negs)
     end
   end
 
   defp check_elements(_, _, _, [], _), do: true
 
-  defp check_elements(acc, tag, [ty | elements], [neg_type | neg_elements], negs) do
+  defp check_elements(acc, tag, elements, [neg_type | neg_elements], negs) do
+    {ty, elements} = List.pop_at(elements, 0, term())
     diff = difference(ty, neg_type)
 
-    (empty?(diff) or tuple_empty?(tag, acc ++ [diff | elements], negs)) and
-      check_elements(acc ++ [ty], tag, elements, neg_elements, negs)
+    (empty?(diff) or tuple_empty?(tag, Enum.reverse(acc, [diff | elements]), negs)) and
+      check_elements([ty | acc], tag, elements, neg_elements, negs)
   end
 
-  defp check_elements(acc, tag, [], [neg_type | neg_elements], negs) do
-    neg = negation(neg_type)
-
-    (empty?(neg) or tuple_empty?(tag, acc ++ [neg], negs)) and
-      check_elements(acc ++ [term()], tag, [], neg_elements, negs)
-  end
-
-  defp check_compatibility(n, m, _, _) when n >= m, do: true
-
-  defp check_compatibility(n, m, elements, negs) do
-    Enum.all?(n..(m - 1), &tuple_empty?(:closed, tuple_fill(elements, &1), negs))
+  # Given tuples described by {tag, elements,} of size n, is the set obtained by removing
+  # tuples described by {neg_tag, m} empty?
+  defp check_compatibility(n, m, tag, elements, neg_tag, negs) do
+    tag == :closed or
+      (Enum.all?(n..(m - 1)//1, &tuple_empty?(:closed, tuple_fill(elements, &1), negs)) and
+         (neg_tag == :open or tuple_empty?(:open, tuple_fill(elements, m + 1), negs)))
   end
 
   # Same as map_fetch, only the tuple descr field is accessed
