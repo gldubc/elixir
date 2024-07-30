@@ -68,8 +68,13 @@ defmodule Module.Types.DescrTest do
       assert union(tuple([integer(), atom()]), tuple([integer(), binary()]))
              |> equal?(tuple([integer(), union(atom(), binary())]))
 
-      assert union(open_tuple([atom()]), tuple([atom(), integer()]))
+      assert open_tuple([atom()])
+             |> union(tuple([atom(), integer()]))
              |> equal?(open_tuple([atom()]))
+
+      assert tuple([union(integer(), atom())])
+             |> difference(open_tuple([atom()]))
+             |> equal?(tuple([integer()]))
     end
 
     test "map" do
@@ -453,15 +458,35 @@ defmodule Module.Types.DescrTest do
       assert tuple_fetch(tuple([integer(), atom()]), 2) == :badindex
       assert tuple_fetch(tuple([integer(), atom()]), -1) == :badindex
 
-      {true, type} =
-        tuple_fetch(union(tuple([integer(), atom()]), dynamic(open_tuple([atom()]))), 1)
+      assert difference(tuple([union(integer(), atom())]), open_tuple([atom()]))
+             |> tuple_fetch(0) == {false, integer()}
 
-      assert equal?(type, union(atom(), dynamic()))
+      assert tuple_fetch(union(tuple([integer(), atom()]), dynamic(open_tuple([atom()]))), 1)
+             |> Kernel.then(fn {opt, ty} -> opt and equal?(ty, union(atom(), dynamic())) end)
 
       assert tuple_fetch(union(tuple([integer()]), tuple([atom()])), 0) ==
                {false, union(integer(), atom())}
 
-      assert tuple_fetch(tuple(), 0) == :badindex
+      assert tuple([integer(), atom(), union(atom(), integer())])
+             |> difference(tuple([integer(), term(), atom()]))
+             |> tuple_fetch(2) == {false, integer()}
+
+      assert tuple([integer(), atom(), union(union(atom(), integer()), list())])
+             |> difference(tuple([integer(), term(), atom()]))
+             |> difference(open_tuple([term(), atom(), list()]))
+             |> tuple_fetch(2) == {false, integer()}
+
+      assert tuple([integer(), atom(), integer()])
+             |> difference(tuple([integer(), term(), integer()]))
+             |> tuple_fetch(1) == :badindex
+
+      assert tuple([integer(), atom(), integer()])
+             |> difference(tuple([integer(), term(), atom()]))
+             |> tuple_fetch(2) == {false, integer()}
+
+      # difference with map_fetch: querying the index 0 of tuple() is not an error
+      assert tuple_fetch(tuple(), 0)
+             |> Kernel.then(fn {opt, type} -> opt and equal?(type, term()) end)
     end
 
     test "tuple_fetch with dynamic" do
