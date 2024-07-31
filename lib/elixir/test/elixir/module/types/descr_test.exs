@@ -187,7 +187,7 @@ defmodule Module.Types.DescrTest do
 
     test "tuple" do
       assert empty?(difference(open_tuple([atom()]), open_tuple([term()])))
-      refute empty?(difference(open_tuple(), empty_tuple()))
+      refute empty?(difference(tuple(), empty_tuple()))
       refute tuple_of_size_at_least(2) |> difference(tuple_of_size(2)) |> empty?()
       assert tuple_of_size_at_least(2) |> difference(tuple_of_size_at_least(1)) |> empty?()
       assert tuple_of_size_at_least(3) |> difference(tuple_of_size_at_least(3)) |> empty?()
@@ -214,7 +214,7 @@ defmodule Module.Types.DescrTest do
              |> difference(empty_tuple())
              |> empty?()
 
-      refute difference(open_tuple(), empty_tuple())
+      refute difference(tuple(), empty_tuple())
              |> difference(open_tuple([term(), term()]))
              |> empty?()
 
@@ -222,7 +222,7 @@ defmodule Module.Types.DescrTest do
              |> difference(tuple([term()]))
              |> empty?()
 
-      assert open_tuple()
+      assert tuple()
              |> difference(open_tuple([term()]))
              |> difference(empty_tuple())
              |> empty?()
@@ -252,12 +252,12 @@ defmodule Module.Types.DescrTest do
              |> difference(open_tuple([term(), atom()]))
              |> equal?(tuple([term(), integer(), term()]))
 
-      assert open_tuple()
+      assert tuple()
              |> difference(open_tuple([term()]))
              |> difference(empty_tuple())
              |> empty?()
 
-      assert open_tuple()
+      assert tuple()
              |> difference(open_tuple([term(), term()]))
              |> equal?(union(tuple([term()]), tuple([])))
     end
@@ -399,12 +399,12 @@ defmodule Module.Types.DescrTest do
              |> difference(tuple([integer(), atom()]))
              |> empty?
 
-      assert open_tuple()
+      assert tuple()
              |> difference(empty_tuple())
              |> difference(open_tuple([term()]))
              |> empty?
 
-      assert open_tuple()
+      assert tuple()
              |> difference(open_tuple([term()]))
              |> difference(empty_tuple())
              |> empty?
@@ -453,13 +453,20 @@ defmodule Module.Types.DescrTest do
 
     test "tuple_fetch" do
       assert tuple_fetch(term(), 0) == :badtuple
+      assert tuple_fetch(integer(), 0) == :badtuple
       assert tuple_fetch(tuple([integer(), atom()]), 0) == {false, integer()}
       assert tuple_fetch(tuple([integer(), atom()]), 1) == {false, atom()}
       assert tuple_fetch(tuple([integer(), atom()]), 2) == :badindex
       assert tuple_fetch(tuple([integer(), atom()]), -1) == :badindex
+      assert tuple_fetch(empty_tuple(), 0) == :badindex
+
+      assert tuple([atom()]) |> difference(empty_tuple()) |> tuple_fetch(0) == {false, atom()}
 
       assert difference(tuple([union(integer(), atom())]), open_tuple([atom()]))
              |> tuple_fetch(0) == {false, integer()}
+
+      # with open_tuple() in the difference
+      assert difference(tuple(), tuple()) |> tuple_fetch(0) == :badindex
 
       assert tuple_fetch(union(tuple([integer(), atom()]), dynamic(open_tuple([atom()]))), 1)
              |> Kernel.then(fn {opt, ty} -> opt and equal?(ty, union(atom(), dynamic())) end)
@@ -492,8 +499,16 @@ defmodule Module.Types.DescrTest do
     test "tuple_fetch with dynamic" do
       assert tuple_fetch(dynamic(), 0) == {true, dynamic()}
 
+      assert tuple_fetch(dynamic(tuple()), 0)
+             |> Kernel.then(fn {opt, type} -> opt and equal?(type, dynamic()) end)
+
+      assert tuple_fetch(dynamic(empty_tuple()), 0) == :badindex
+      assert tuple_fetch(dynamic(tuple([integer(), atom()])), 2) == :badindex
+
       assert tuple_fetch(union(dynamic(), open_tuple([atom()])), 0) ==
                {true, union(atom(), dynamic())}
+
+      assert tuple_fetch(union(dynamic(), integer()), 0) == :badtuple
     end
 
     test "map_fetch" do
@@ -583,6 +598,12 @@ defmodule Module.Types.DescrTest do
 
       assert union(dynamic(open_map(a: atom())), open_map(a: integer()))
              |> map_fetch(:a) == {false, union(dynamic(atom()), integer())}
+
+      # this is bad
+      assert dynamic() |> map_fetch(:a) == {true, dynamic()}
+      assert union(dynamic(), integer()) |> map_fetch(:a) == {true, dynamic()}
+      assert union(dynamic(open_map(a: integer())), integer()) |> map_fetch(:a) == :badmap
+      assert union(dynamic(integer()), integer()) |> map_fetch(:a) == :badmap
     end
   end
 
