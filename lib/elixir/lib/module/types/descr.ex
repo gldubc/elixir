@@ -32,7 +32,6 @@ defmodule Module.Types.Descr do
 
   @atom_top {:negation, :sets.new(version: 2)}
   @tuple_top [{:open, [], []}]
-  @tuple_empty [{:closed, [], []}]
   @map_top [{:open, %{}, []}]
   @map_empty [{:closed, %{}, []}]
   @none %{}
@@ -63,9 +62,9 @@ defmodule Module.Types.Descr do
   def pid(), do: %{bitmap: @bit_pid}
   def port(), do: %{bitmap: @bit_port}
   def reference(), do: %{bitmap: @bit_reference}
-  def empty_tuple(), do: %{tuple: @tuple_empty}
   def open_tuple(elements), do: %{tuple: tuple_new(:open, elements)}
   def tuple(elements), do: %{tuple: tuple_new(:closed, elements)}
+  def empty_tuple(), do: tuple([])
   def tuple(), do: %{tuple: @tuple_top}
 
   @boolset :sets.from_list([true, false], version: 2)
@@ -1126,7 +1125,7 @@ defmodule Module.Types.Descr do
     end
   end
 
-  # Intersect two lists of types, and append the extra types to the result.
+  # Intersects two lists of types, and _appends_ the extra elements to the result.
   defp zip_intersection([], types2, acc), do: Enum.reverse(acc, types2)
   defp zip_intersection(types1, [], acc), do: Enum.reverse(acc, types1)
 
@@ -1135,13 +1134,13 @@ defmodule Module.Types.Descr do
   end
 
   defp tuple_difference(dnf1, dnf2) do
-    Enum.reduce(dnf2, dnf1, fn {tag2, fields2, negs2}, dnf1 ->
-      Enum.reduce(dnf1, [], fn {tag1, fields1, negs1}, acc ->
-        acc = [{tag1, fields1, [{tag2, fields2} | negs1]}] ++ acc
+    Enum.reduce(dnf2, dnf1, fn {tag2, elements2, negs2}, dnf1 ->
+      Enum.reduce(dnf1, [], fn {tag1, elements1, negs1}, acc ->
+        acc = [{tag1, elements1, [{tag2, elements2} | negs1]}] ++ acc
 
-        Enum.reduce(negs2, acc, fn {neg_tag2, neg_fields2}, acc ->
+        Enum.reduce(negs2, acc, fn {neg_tag2, neg_elements2}, acc ->
           try do
-            {tag, fields} = tuple_literal_intersection(tag1, fields1, neg_tag2, neg_fields2)
+            {tag, fields} = tuple_literal_intersection(tag1, elements1, neg_tag2, neg_elements2)
             [{tag, fields, negs1}] ++ acc
           catch
             :empty -> acc
@@ -1243,6 +1242,7 @@ defmodule Module.Types.Descr do
   # - Negative tuple: open or closed tuples of size m
   defp check_compatibility(n, m, tag, elements, neg_tag, negs) do
     # The tuples to consider are all those of size n to m - 1, and if the negative tuple is
+    # closed, we also need to consider tuples of size greater than m + 1.
     tag == :closed or
       (Enum.all?(n..(m - 1)//1, &tuple_empty?(:closed, tuple_fill(elements, &1), negs)) and
          (neg_tag == :open or tuple_empty?(:open, tuple_fill(elements, m + 1), negs)))
@@ -1343,11 +1343,8 @@ defmodule Module.Types.Descr do
         {fst, snd} = tuple_pop_index(tag, elements, index)
 
         case tuple_split_negative(negs, index) do
-          :empty ->
-            []
-
-          negative ->
-            negative |> pair_make_disjoint() |> pair_eliminate_negations(fst, snd)
+          :empty -> []
+          negative -> negative |> pair_make_disjoint() |> pair_eliminate_negations(fst, snd)
         end
     end)
   end
@@ -1380,7 +1377,7 @@ defmodule Module.Types.Descr do
     n = length(elements)
     m = length(neg_elements)
 
-    tag == :closed and (n < m or (neg_tag == :closed and n > m))
+    (tag == :closed and n < m) or (neg_tag == :closed and n > m)
   end
 
   ## Pairs

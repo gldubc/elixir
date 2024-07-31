@@ -196,16 +196,10 @@ defmodule Module.Types.DescrTest do
       refute tuple([term(), term()]) |> difference(tuple([atom()])) |> empty?()
       assert tuple([term(), term()]) |> difference(tuple([term(), term()])) |> empty?()
 
-      # {term(), term()} and not ({term(), term(), term(), ...} or {term(), term()}) is empty
+      # {term(), term(), ...} and not ({term(), term(), term(), ...} or {term(), term()})
       assert tuple_of_size_at_least(2)
              |> difference(tuple_of_size(2))
              |> difference(tuple_of_size_at_least(3))
-             |> empty?()
-
-      # order does not matter
-      assert tuple_of_size_at_least(2)
-             |> difference(tuple_of_size_at_least(3))
-             |> difference(tuple_of_size(2))
              |> empty?()
 
       assert tuple([term(), term()])
@@ -216,20 +210,11 @@ defmodule Module.Types.DescrTest do
 
       refute difference(tuple(), empty_tuple())
              |> difference(open_tuple([term(), term()]))
-             |> empty?()
+             |> empty?
 
       assert difference(open_tuple([term()]), open_tuple([term(), term()]))
              |> difference(tuple([term()]))
              |> empty?()
-
-      assert tuple()
-             |> difference(open_tuple([term()]))
-             |> difference(empty_tuple())
-             |> empty?()
-
-      assert open_tuple([atom()])
-             |> difference(tuple([integer(), integer()]))
-             |> equal?(open_tuple([atom()]))
 
       assert open_tuple([atom()])
              |> difference(tuple([integer(), integer()]))
@@ -248,17 +233,7 @@ defmodule Module.Types.DescrTest do
              |> difference(open_tuple([term(), integer()]))
              |> equal?(tuple([term(), atom(), term()]))
 
-      assert tuple([term(), union(atom(), integer()), term()])
-             |> difference(open_tuple([term(), atom()]))
-             |> equal?(tuple([term(), integer(), term()]))
-
-      assert tuple()
-             |> difference(open_tuple([term()]))
-             |> difference(empty_tuple())
-             |> empty?()
-
-      assert tuple()
-             |> difference(open_tuple([term(), term()]))
+      assert difference(tuple(), open_tuple([term(), term()]))
              |> equal?(union(tuple([term()]), tuple([])))
     end
 
@@ -387,26 +362,17 @@ defmodule Module.Types.DescrTest do
       refute open_tuple([integer(), integer()]) |> difference(empty_tuple()) |> empty?
       refute open_tuple([integer(), integer()]) |> difference(open_tuple([atom()])) |> empty?
       refute open_tuple([term()]) |> difference(tuple([term()])) |> empty?
+      assert difference(tuple(), empty_tuple()) |> difference(open_tuple([term()])) |> empty?
+      assert difference(tuple(), open_tuple([term()])) |> difference(empty_tuple()) |> empty?
 
       refute open_tuple([term()])
              |> difference(tuple([term()]))
              |> difference(tuple([term()]))
              |> empty?
 
-      # {int, int or atom,...} \ {int, int, ...} \ {int, atom, ...}
       assert tuple([integer(), union(integer(), atom())])
              |> difference(tuple([integer(), integer()]))
              |> difference(tuple([integer(), atom()]))
-             |> empty?
-
-      assert tuple()
-             |> difference(empty_tuple())
-             |> difference(open_tuple([term()]))
-             |> empty?
-
-      assert tuple()
-             |> difference(open_tuple([term()]))
-             |> difference(empty_tuple())
              |> empty?
     end
 
@@ -459,14 +425,11 @@ defmodule Module.Types.DescrTest do
       assert tuple_fetch(tuple([integer(), atom()]), 2) == :badindex
       assert tuple_fetch(tuple([integer(), atom()]), -1) == :badindex
       assert tuple_fetch(empty_tuple(), 0) == :badindex
-
+      assert difference(tuple(), tuple()) |> tuple_fetch(0) == :badindex
       assert tuple([atom()]) |> difference(empty_tuple()) |> tuple_fetch(0) == {false, atom()}
 
       assert difference(tuple([union(integer(), atom())]), open_tuple([atom()]))
              |> tuple_fetch(0) == {false, integer()}
-
-      # with open_tuple() in the difference
-      assert difference(tuple(), tuple()) |> tuple_fetch(0) == :badindex
 
       assert tuple_fetch(union(tuple([integer(), atom()]), dynamic(open_tuple([atom()]))), 1)
              |> Kernel.then(fn {opt, ty} -> opt and equal?(ty, union(atom(), dynamic())) end)
@@ -498,17 +461,15 @@ defmodule Module.Types.DescrTest do
 
     test "tuple_fetch with dynamic" do
       assert tuple_fetch(dynamic(), 0) == {true, dynamic()}
+      assert tuple_fetch(dynamic(empty_tuple()), 0) == :badindex
+      assert tuple_fetch(dynamic(tuple([integer(), atom()])), 2) == :badindex
+      assert tuple_fetch(union(dynamic(), integer()), 0) == :badtuple
 
       assert tuple_fetch(dynamic(tuple()), 0)
              |> Kernel.then(fn {opt, type} -> opt and equal?(type, dynamic()) end)
 
-      assert tuple_fetch(dynamic(empty_tuple()), 0) == :badindex
-      assert tuple_fetch(dynamic(tuple([integer(), atom()])), 2) == :badindex
-
       assert tuple_fetch(union(dynamic(), open_tuple([atom()])), 0) ==
                {true, union(atom(), dynamic())}
-
-      assert tuple_fetch(union(dynamic(), integer()), 0) == :badtuple
     end
 
     test "map_fetch" do
