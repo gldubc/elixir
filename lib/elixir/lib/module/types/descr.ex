@@ -905,44 +905,39 @@ defmodule Module.Types.Descr do
   defp map_empty?(:open, fs, [{:closed, _} | negs]), do: map_empty?(:open, fs, negs)
 
   defp map_empty?(tag, fields, [{neg_tag, neg_fields} | negs]) do
-    (Enum.all?(neg_fields, fn {neg_key, neg_type} ->
-       cond do
-         # Keys that are present in the negative map, but not in the positive one
-         is_map_key(fields, neg_key) ->
-           true
+    if map_empty_negation?(tag, fields, {neg_tag, neg_fields}) do
+      map_empty?(tag, fields, negs)
+    else
+      Enum.all?(neg_fields, fn {neg_key, neg_type} ->
+        cond do
+          # Keys that are present in the negative map, but not in the positive one
+          is_map_key(fields, neg_key) ->
+            true
 
-         # The key is not shared between positive and negative maps,
-         # and because the negative type is required, there is no value in common
-         tag == :closed and not is_optional_static(neg_type) ->
-           false
+          # The key is not shared between positive and negative maps,
+          # but because the negative type is not required, there may be a value in common
+          tag == :closed ->
+            true
 
-         # The key is not shared between positive and negative maps,
-         # but because the negative type is not required, there may be a value in common
-         tag == :closed ->
-           true
+          # There may be value in common
+          tag == :open ->
+            diff = difference(term_or_optional(), neg_type)
+            empty?(diff) or map_empty?(tag, Map.put(fields, neg_key, diff), negs)
+        end
+      end) and
+        Enum.all?(fields, fn {key, type} ->
+          case neg_fields do
+            %{^key => neg_type} ->
+              diff = difference(type, neg_type)
+              empty?(diff) or map_empty?(tag, Map.put(fields, key, diff), negs)
 
-         # There may be value in common
-         tag == :open ->
-           diff = difference(term_or_optional(), neg_type)
-           empty?(diff) or map_empty?(tag, Map.put(fields, neg_key, diff), negs)
-       end
-     end) and
-       Enum.all?(fields, fn {key, type} ->
-         case neg_fields do
-           %{^key => neg_type} ->
-             diff = difference(type, neg_type)
-             empty?(diff) or map_empty?(tag, Map.put(fields, key, diff), negs)
-
-           %{} ->
-             if neg_tag == :closed and not is_optional_static(type) do
-               false
-             else
-               # an absent key in a open negative map can be ignored
-               diff = difference(type, tag_to_type(neg_tag))
-               empty?(diff) or map_empty?(tag, Map.put(fields, key, diff), negs)
-             end
-         end
-       end)) or map_empty?(tag, fields, negs)
+            %{} ->
+              # an absent key in a open negative map can be ignored
+              diff = difference(type, tag_to_type(neg_tag))
+              empty?(diff) or map_empty?(tag, Map.put(fields, key, diff), negs)
+          end
+        end)
+    end
   end
 
   # Takes a map dnf and a key and returns a list of unions of types
