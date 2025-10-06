@@ -2668,7 +2668,7 @@ defmodule Module.Types.Descr do
           acc
 
         {tag, fields} ->
-          if init_map_line_empty?(tag, fields, negs) do
+          if init_map_line_empty?(tag, fields, negs, %{}) |> elem(0) do
             acc
           else
             [{tag, fields, negs} | acc]
@@ -3325,35 +3325,45 @@ defmodule Module.Types.Descr do
   # as throw/catch.
   defp map_empty?(bdd) do
     bdd_to_dnf(bdd)
-    |> Enum.all?(fn {pos, negs} ->
+    |> Enum.reduce_while({true, %{}}, fn {pos, negs}, {result, cache} ->
       case non_empty_map_literals_intersection(pos) do
         :empty ->
-          true
+          {:cont, {true, cache}}
 
         {tag, fields} when is_map(fields) ->
           # We check the emptiness of the fields because non_empty_map_literal_intersection
           # will not return :empty on fields that are set to none() and that exist
           # just in one map, but not the other.
-          init_map_line_empty?(tag, fields, negs)
+          {result, cache} = init_map_line_empty?(tag, fields, negs, cache)
+
+          if not result do
+            {:halt, {false, cache}}
+          else
+            {:cont, {result, cache}}
+          end
       end
     end)
+    |> elem(0)
   end
 
-  defp init_map_line_empty?(tag, fields, negs) do
-    Enum.any?(Map.to_list(fields), fn {_key, type} -> empty?(type) end) or
-      map_line_empty?(tag, fields, negs, %{}) |> elem(0)
+  defp init_map_line_empty?(tag, fields, negs, cache) do
+    if Enum.any?(Map.to_list(fields), fn {_key, type} -> empty?(type) end) do
+      {true, cache}
+    else
+      map_line_empty?(tag, fields, negs, cache)
+    end
   end
 
   # These positives get checked once when calling init_map_line_empty?, and then every time
   # an intersection or difference is computed, its emptiness is checked again.
   # So they are all necessarily non-empty.
   defp map_line_empty?(tag, fields, [], cache) do
-    {false, Map.put(cache, {:open, fields, []}, false)}
+    {false, Map.put(cache, {tag, fields, []}, false)}
   end
 
   defp map_line_empty?(tag, fields, neg_list = [{:open, neg_fields} | _], cache)
        when neg_fields == %{} do
-    {true, Map.put(cache, {:open, neg_fields, neg_list}, true)}
+    {true, Map.put(cache, {tag, neg_fields, neg_list}, true)}
   end
 
   defp map_line_empty?(:open, fs, [{:closed, _} | negs] = neg_list, cache) do
@@ -3364,11 +3374,8 @@ defmodule Module.Types.Descr do
   defp map_line_empty?(tag, fields, [{neg_tag, neg_fields} | negs], cache) do
     cache_key = {tag, fields, [{neg_tag, neg_fields} | negs]}
 
-    # IO.puts("cache_key: #{inspect(cache_key)}")
-
     cond do
       Map.has_key?(cache, cache_key) ->
-        IO.puts("cache hit")
         {Map.get(cache, cache_key), cache}
 
       map_check_domain_keys(tag, neg_tag) ->
@@ -3437,49 +3444,54 @@ defmodule Module.Types.Descr do
         if not result1 do
           {false, Map.put(cache, cache_key, false)}
         else
-          Enum.reduce_while(Map.to_list(fields), {true, cache}, fn {key, type}, {result, cache} ->
-            case neg_fields do
-              %{^key => neg_type} ->
-                diff = difference(type, neg_type)
+          {result2, cache} =
+            Enum.reduce_while(Map.to_list(fields), {true, cache}, fn {key, type},
+                                                                     {result, cache} ->
+              case neg_fields do
+                %{^key => neg_type} ->
+                  diff = difference(type, neg_type)
 
-                if empty?(diff) do
-                  {:cont, {result, cache}}
-                else
-                  {result, cache} = map_line_empty?(tag, Map.put(fields, key, diff), negs, cache)
-
-                  if result do
+                  if empty?(diff) do
                     {:cont, {result, cache}}
                   else
-                    {:halt, {false, cache}}
-                  end
-                end
+                    {result, cache} =
+                      map_line_empty?(tag, Map.put(fields, key, diff), negs, cache)
 
-              %{} ->
-                cond do
-                  # The key is only in the positive map, while the negative map is open
-                  # so this key is absorbed (e.g. %{a: integer} and not %{...})
-                  neg_tag == :open ->
-                    {:cont, {result, cache}}
-
-                  true ->
-                    # an absent key in a open negative map can be ignored
-                    diff = difference(type, neg_atom_default)
-
-                    if empty?(diff) do
+                    if result do
                       {:cont, {result, cache}}
                     else
-                      {result, cache} =
-                        map_line_empty?(tag, Map.put(fields, key, diff), negs, cache)
+                      {:halt, {false, cache}}
+                    end
+                  end
 
-                      if result do
+                %{} ->
+                  cond do
+                    # The key is only in the positive map, while the negative map is open
+                    # so this key is absorbed (e.g. %{a: integer} and not %{...})
+                    neg_tag == :open ->
+                      {:cont, {result, cache}}
+
+                    true ->
+                      # an absent key in a open negative map can be ignored
+                      diff = difference(type, neg_atom_default)
+
+                      if empty?(diff) do
                         {:cont, {result, cache}}
                       else
-                        {:halt, {false, cache}}
+                        {result, cache} =
+                          map_line_empty?(tag, Map.put(fields, key, diff), negs, cache)
+
+                        if result do
+                          {:cont, {result, cache}}
+                        else
+                          {:halt, {false, cache}}
+                        end
                       end
-                    end
-                end
-            end
-          end)
+                  end
+              end
+            end)
+
+          {result2, Map.put(cache, cache_key, result2)}
         end
 
       true ->
