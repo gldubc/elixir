@@ -3341,65 +3341,149 @@ defmodule Module.Types.Descr do
 
   defp init_map_line_empty?(tag, fields, negs) do
     Enum.any?(Map.to_list(fields), fn {_key, type} -> empty?(type) end) or
-      map_line_empty?(tag, fields, negs)
+      map_line_empty?(tag, fields, negs, %{}) |> elem(0)
   end
 
   # These positives get checked once when calling init_map_line_empty?, and then every time
   # an intersection or difference is computed, its emptiness is checked again.
   # So they are all necessarily non-empty.
-  defp map_line_empty?(_, _pos, []), do: false
-  defp map_line_empty?(_, _, [{:open, neg_fields} | _]) when neg_fields == %{}, do: true
-  defp map_line_empty?(:open, fs, [{:closed, _} | negs]), do: map_line_empty?(:open, fs, negs)
+  defp map_line_empty?(tag, fields, [], cache) do
+    {false, Map.put(cache, {:open, fields, []}, false)}
+  end
 
-  defp map_line_empty?(tag, fields, [{neg_tag, neg_fields} | negs]) do
-    if map_check_domain_keys(tag, neg_tag) do
-      atom_default = map_key_tag_to_type(tag)
-      neg_atom_default = map_key_tag_to_type(neg_tag)
+  defp map_line_empty?(tag, fields, neg_list = [{:open, neg_fields} | _], cache)
+       when neg_fields == %{} do
+    {true, Map.put(cache, {:open, neg_fields, neg_list}, true)}
+  end
 
-      Enum.all?(Map.to_list(neg_fields), fn {neg_key, neg_type} ->
-        cond do
-          # Ignore keys present in both maps; will be handled below
-          is_map_key(fields, neg_key) ->
-            true
+  defp map_line_empty?(:open, fs, [{:closed, _} | negs] = neg_list, cache) do
+    {result, cache} = map_line_empty?(:open, fs, negs, cache)
+    {result, Map.put(cache, {:open, fs, neg_list}, result)}
+  end
 
-          # The keys is only in the negative map, and the positive map is closed
-          # in that case, this field is not_set(), and its difference with the negative map type is empty iff
-          # the negative type is optional.
-          tag == :closed ->
-            is_optional_static(neg_type) or map_line_empty?(tag, fields, negs)
+  defp map_line_empty?(tag, fields, [{neg_tag, neg_fields} | negs], cache) do
+    cache_key = {tag, fields, [{neg_tag, neg_fields} | negs]}
 
-          # There may be value in common
-          tag == :open ->
-            diff = difference(term_or_optional(), neg_type)
-            empty?(diff) or map_line_empty?(tag, Map.put(fields, neg_key, diff), negs)
+    # IO.puts("cache_key: #{inspect(cache_key)}")
 
-          true ->
-            diff = difference(atom_default, neg_type)
-            empty?(diff) or map_line_empty?(tag, Map.put(fields, neg_key, diff), negs)
+    cond do
+      Map.has_key?(cache, cache_key) ->
+        IO.puts("cache hit")
+        {Map.get(cache, cache_key), cache}
+
+      map_check_domain_keys(tag, neg_tag) ->
+        atom_default = map_key_tag_to_type(tag)
+        neg_atom_default = map_key_tag_to_type(neg_tag)
+
+        {result1, cache} =
+          Enum.reduce_while(Map.to_list(neg_fields), {true, cache}, fn {neg_key, neg_type},
+                                                                       {result, cache} ->
+            cond do
+              # Ignore keys present in both maps; will be handled below
+              is_map_key(fields, neg_key) ->
+                {:cont, {result, cache}}
+
+              # The keys is only in the negative map, and the positive map is closed
+              # in that case, this field is not_set(), and its difference with the negative map type is empty iff
+              # the negative type is optional.
+              tag == :closed ->
+                if is_optional_static(neg_type) do
+                  {:cont, {true, cache}}
+                else
+                  {result, cache} = map_line_empty?(tag, fields, negs, cache)
+
+                  if result do
+                    {:cont, {result, cache}}
+                  else
+                    {:halt, {false, cache}}
+                  end
+                end
+
+              # There may be value in common
+              tag == :open ->
+                diff = difference(term_or_optional(), neg_type)
+
+                if empty?(diff) do
+                  {:cont, {result, cache}}
+                else
+                  {result, cache} =
+                    map_line_empty?(tag, Map.put(fields, neg_key, diff), negs, cache)
+
+                  if result do
+                    {:cont, {result, cache}}
+                  else
+                    {:halt, {false, cache}}
+                  end
+                end
+
+              true ->
+                diff = difference(atom_default, neg_type)
+
+                if empty?(diff) do
+                  {:cont, {result, cache}}
+                else
+                  {result, cache} =
+                    map_line_empty?(tag, Map.put(fields, neg_key, diff), negs, cache)
+
+                  if result do
+                    {:cont, {result, cache}}
+                  else
+                    {:halt, {false, cache}}
+                  end
+                end
+            end
+          end)
+
+        if not result1 do
+          {false, Map.put(cache, cache_key, false)}
+        else
+          Enum.reduce_while(Map.to_list(fields), {true, cache}, fn {key, type}, {result, cache} ->
+            case neg_fields do
+              %{^key => neg_type} ->
+                diff = difference(type, neg_type)
+
+                if empty?(diff) do
+                  {:cont, {result, cache}}
+                else
+                  {result, cache} = map_line_empty?(tag, Map.put(fields, key, diff), negs, cache)
+
+                  if result do
+                    {:cont, {result, cache}}
+                  else
+                    {:halt, {false, cache}}
+                  end
+                end
+
+              %{} ->
+                cond do
+                  # The key is only in the positive map, while the negative map is open
+                  # so this key is absorbed (e.g. %{a: integer} and not %{...})
+                  neg_tag == :open ->
+                    {:cont, {result, cache}}
+
+                  true ->
+                    # an absent key in a open negative map can be ignored
+                    diff = difference(type, neg_atom_default)
+
+                    if empty?(diff) do
+                      {:cont, {result, cache}}
+                    else
+                      {result, cache} =
+                        map_line_empty?(tag, Map.put(fields, key, diff), negs, cache)
+
+                      if result do
+                        {:cont, {result, cache}}
+                      else
+                        {:halt, {false, cache}}
+                      end
+                    end
+                end
+            end
+          end)
         end
-      end) and
-        Enum.all?(Map.to_list(fields), fn {key, type} ->
-          case neg_fields do
-            %{^key => neg_type} ->
-              diff = difference(type, neg_type)
-              empty?(diff) or map_line_empty?(tag, Map.put(fields, key, diff), negs)
 
-            %{} ->
-              cond do
-                # The key is only in the positive map, while the negative map is open
-                # so this key is absorbed (e.g. %{a: integer} and not %{...})
-                neg_tag == :open ->
-                  true
-
-                true ->
-                  # an absent key in a open negative map can be ignored
-                  diff = difference(type, neg_atom_default)
-                  empty?(diff) or map_line_empty?(tag, Map.put(fields, key, diff), negs)
-              end
-          end
-        end)
-    else
-      map_line_empty?(tag, fields, negs)
+      true ->
+        map_line_empty?(tag, fields, negs, cache)
     end
   end
 
