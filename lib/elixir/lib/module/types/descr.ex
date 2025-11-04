@@ -3804,65 +3804,140 @@ defmodule Module.Types.Descr do
     end
   end
 
-  defp tuple_empty?(bdd) do
+  def tuple_empty?(bdd) do
     bdd_to_dnf(bdd)
     |> Enum.all?(fn {pos, negs} ->
       case non_empty_tuple_literals_intersection(pos) do
-        :empty -> true
-        {tag, fields} -> tuple_line_empty?(tag, fields, negs)
+        :empty ->
+          true
+
+        {_tag, _elements} when negs == [] ->
+          false
+
+        {tag, elements} ->
+          k = length(elements)
+
+          max_arity =
+            Enum.reduce(negs, k, fn {_neg_tag, neg_elements}, acc ->
+              max(acc, length(neg_elements))
+            end)
+
+          partition = partition_negatives(k, max_arity, tag, negs)
+
+          cond do
+            partition == [] ->
+              false
+
+            tag == :closed ->
+              [{_, closed_negs, open_negs}] = partition
+              negs = closed_negs ++ open_negs
+
+              case negs do
+                [] -> false
+                [one_neg | rest] -> tuple_diff_empty?([], elements, one_neg, rest)
+              end
+
+            true ->
+              tuple_partition(elements, partition)
+          end
       end
     end)
   end
 
-  # No negations, so not empty unless there's an empty type
-  # Note: since the extraction from the BDD is done in a way that guarantees that
-  # the elements are non-empty, we can avoid checking for empty types there.
-  # Otherwise, tuple_empty?(_, elements, []) would be Enum.any?(elements, &empty?/1)
-  defp tuple_line_empty?(_, _, []), do: false
-  # Open empty negation makes it empty
-  defp tuple_line_empty?(_, _, [{:open, []} | _]), do: true
-  # Open positive can't be emptied by a single closed negative
-  defp tuple_line_empty?(:open, _pos, [{:closed, _}]), do: false
+  # Open-tuple emptiness across arities
+  #
+  # Given a partition like [{arity, closed_negs, open_negs}, ...] (ascending arity):
+  #   - Pad the positive tuple to the current arity and test against all negatives
+  #     at that arity.
+  #   - If the line is empty and there are only open negatives at this arity,
+  #     short‑circuit to true: the type is empty overall.
+  #   - If the line is empty but there are also closed negatives at this arity,
+  #     continue checking higher arities.
+  #   - If the line is not empty at any arity, the type is not empty.
 
-  defp tuple_line_empty?(tag, elements, [{neg_tag, neg_elements} | negs]) do
-    n = length(elements)
-    m = length(neg_elements)
+  def tuple_partition(_elements, []) do
+    # No negatives at this arity — the line is not empty
+    false
+  end
 
-    # Scenarios where the difference is guaranteed to be empty:
-    # 1. When removing larger tuples from a fixed-size positive tuple
-    # 2. When removing smaller tuples from larger tuples
-    if (tag == :closed and n < m) or (neg_tag == :closed and n > m) do
-      tuple_line_empty?(tag, elements, negs)
-    else
-      tuple_elements_empty?([], tag, elements, neg_elements, negs) and
-        tuple_empty_arity?(n, m, tag, elements, neg_tag, negs)
+  def tuple_partition(elements, [{arity, closed_negs, open_negs} | rest]) do
+    # If this arity is empty and there are only open negatives here,
+    # we can short‑circuit to true; otherwise, keep checking higher arities.
+    has_only_opens = closed_negs == []
+
+    # Pad the positive elements to the current arity and check emptiness.
+    filled_elements = tuple_fill(elements, arity)
+    all_negs = closed_negs ++ open_negs
+
+    this_arity_is_empty =
+      case all_negs do
+        [] -> false
+        [one_neg | rest] -> tuple_diff_empty?([], filled_elements, one_neg, rest)
+      end
+
+    cond do
+      this_arity_is_empty and has_only_opens -> true
+      this_arity_is_empty -> tuple_partition(elements, rest)
+      true -> false
     end
   end
 
-  # Recursively check elements for emptiness
-  defp tuple_elements_empty?(_, _, _, [], _), do: true
+  # Element-wise emptiness check.
+  # Returns true if, at every position, both the "diff" (escape) and the "meet"
+  # (match) branches ultimately lead to emptiness across all negatives.
+  defp tuple_diff_empty?(_acc_meet, _elements, [], _), do: true
 
-  defp tuple_elements_empty?(acc_meet, tag, elements, [neg_type | neg_elements], negs) do
-    # Handles the case where {tag, elements} is an open tuple, like {:open, []}
+  defp tuple_diff_empty?(acc_meet, elements, [neg_type | neg_elements], rest) do
+    # Pop next positive element, defaulting to `term()` when missing (open tuples)
     {ty, elements} = List.pop_at(elements, 0, term())
     diff = difference(ty, neg_type)
     meet = intersection(ty, neg_type)
 
-    # In this case, there is no intersection between the positive and this negative.
-    # So we should just "go next"
-    (empty?(diff) or tuple_line_empty?(tag, Enum.reverse(acc_meet, [diff | elements]), negs)) and
-      (empty?(meet) or tuple_elements_empty?([meet | acc_meet], tag, elements, neg_elements, negs))
+    # The line is empty iff both branches fail to escape:
+    # - Diff branch: escaping here is empty (or, if non-empty, it still fails against remaining negatives)
+    # - Meet branch: matching here is empty (or, if non-empty, it still fails against remaining negatives)
+    (empty?(diff) or
+       case rest do
+         [] ->
+           false
+
+         [next_neg | rest] ->
+           tuple_diff_empty?([], Enum.reverse(acc_meet, [diff | elements]), next_neg, rest)
+       end) and
+      (empty?(meet) or tuple_diff_empty?([meet | acc_meet], elements, neg_elements, rest))
   end
 
-  # Determines if the set difference is empty when:
-  # - Positive tuple: {tag, elements} of size n
-  # - Negative tuple: open or closed tuples of size m
-  defp tuple_empty_arity?(n, m, tag, elements, neg_tag, negs) do
-    # The tuples to consider are all those of size n to m - 1, and if the negative tuple is
-    # closed, we also need to consider tuples of size greater than m + 1.
-    tag == :closed or
-      (Enum.all?(n..(m - 1)//1, &tuple_line_empty?(:closed, tuple_fill(elements, &1), negs)) and
-         (neg_tag == :open or tuple_line_empty?(:open, tuple_fill(elements, m + 1), negs)))
+  # So first I'm going through the list of tuple negatives
+  # And I build a list [{arity, closed_negatives_of_that_arity, open_negative_of_that_arity}]
+  defp partition_negatives(k, l, positive_tag, negatives) do
+    for positive_arity <- k..if(positive_tag == :closed, do: k, else: l) do
+      {closed_negatives, open_negatives} =
+        Enum.reduce(negatives, {[], []}, fn {neg_tag, neg_elements}, {closed, open} = acc ->
+          neg_arity = length(neg_elements)
+
+          # Negatives with arity smaller than the positive tuple cannot rule it out.
+          # Additionally, when the positive tuple is closed we only keep negatives
+          # of exactly the same arity.
+          cond do
+            # With a closed positive, we only keep
+            # A) open negatives of a lower or equal arity
+            neg_arity > positive_arity ->
+              acc
+
+            # B) closed negatives of the same arity
+            neg_tag == :closed and neg_arity != positive_arity ->
+              acc
+
+            neg_tag == :open ->
+              {closed, [tuple_fill(neg_elements, positive_arity) | open]}
+
+            true ->
+              {[neg_elements | closed], open}
+          end
+        end)
+
+      {positive_arity, closed_negatives, open_negatives}
+    end
   end
 
   defp tuple_eliminate_negations(tag, elements, negs) do
@@ -3938,8 +4013,8 @@ defmodule Module.Types.Descr do
     here_branch ++ later_branches
   end
 
-  # No more negative elements to process: there is no “all-equal” branch to add,
-  # because we’re constructing {t} ant not {u}, which must differ somewhere.
+  # No more negative elements to process: there is no "all-equal" branch to add,
+  # because we're constructing {t} ant not {u}, which must differ somewhere.
   defp tuple_elim_content(_acc, _tag, _elements, []) do
     []
   end
@@ -4148,7 +4223,7 @@ defmodule Module.Types.Descr do
     pad_length = desired_length - length(elements)
 
     if pad_length < 0 do
-      raise ArgumentError, "tuple_fill: elements are longer than the desired length"
+      elements
     else
       elements ++ List.duplicate(term(), pad_length)
     end

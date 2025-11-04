@@ -484,6 +484,8 @@ defmodule Module.Types.DescrTest do
       refute tuple_of_size_at_least(2) |> difference(tuple_of_size(2)) |> empty?()
       assert tuple_of_size_at_least(2) |> difference(tuple_of_size_at_least(1)) |> empty?()
       assert tuple_of_size_at_least(3) |> difference(tuple_of_size_at_least(3)) |> empty?()
+      # {term, term, ...} and not {term, term, term, ...}
+      # this should give, for partition, [{2, [], []}, {3, [], [[term, term, term]]}]
       refute tuple_of_size_at_least(2) |> difference(tuple_of_size_at_least(3)) |> empty?()
       refute tuple([term(), term()]) |> difference(tuple([atom(), term()])) |> empty?()
       refute tuple([term(), term()]) |> difference(tuple([atom()])) |> empty?()
