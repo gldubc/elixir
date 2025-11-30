@@ -2615,4 +2615,288 @@ defmodule Module.Types.DescrTest do
       assert subtype?(range, Enum.reduce(entries, &union/2))
     end
   end
+
+  describe "recursive types" do
+    # Recursive types allow defining types that reference themselves.
+    # They are represented using recursion variables stored in a type environment.
+    #
+    # Recursion variables are represented as `{:rec_var, name}` tuples, which are
+    # clearly distinguishable from regular descrs.
+
+    test "create and lookup recursion variables" do
+      # Create an empty environment and add a recursion variable
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+
+      # The variable should be a tuple {:rec_var, name}
+      assert {:rec_var, :X} = x
+      assert is_rec_var?(x)
+
+      # Initially, the variable maps to none() (placeholder)
+      assert lookup_rec_var(env, :X) == none()
+
+      # Define the variable
+      env = def_rec_var(env, :X, integer())
+      assert lookup_rec_var(env, :X) == integer()
+    end
+
+    test "simple recursive type: integer list" do
+      # X = integer() or {integer(), X}
+      # This represents: integer | {integer, integer} | {integer, {integer, integer}} | ...
+      #
+      # Note: We build the tuple with the recursion variable inside. The recursion
+      # variable is stored as-is in the tuple structure. To use the type in operations,
+      # we must unfold it first.
+
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+
+      # Build the type structure with the recursion variable reference
+      # The tuple contains the recursion variable directly
+      tuple_with_var = %{tuple: {:closed, [integer(), x]}}
+      x_def = union(integer(), tuple_with_var)
+      env = def_rec_var(env, :X, x_def)
+
+      # The definition contains a recursion variable
+      assert has_rec_var?(x_def)
+
+      # Unfold once: replaces X with its definition
+      unfolded_once = unfold_rec(env, x)
+      assert unfolded_once == x_def
+
+      # Check structure still has recursion variable (because definition references itself)
+      assert has_rec_var?(unfolded_once)
+    end
+
+    test "unfold recursive type multiple times" do
+      # X = integer() or {integer(), X}
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+      tuple_with_var = %{tuple: {:closed, [integer(), x]}}
+      x_def = union(integer(), tuple_with_var)
+      env = def_rec_var(env, :X, x_def)
+
+      # Unfold to depth 0 (no unfolding)
+      assert unfold_rec(env, x, 0) == x
+
+      # Unfold to depth 1
+      unfolded_1 = unfold_rec(env, x, 1)
+      assert has_rec_var?(unfolded_1)
+
+      # Unfold to depth 2
+      unfolded_2 = unfold_rec(env, x, 2)
+      assert has_rec_var?(unfolded_2)
+
+      # Unfold to depth 3 - each level expands the nested tuples
+      unfolded_3 = unfold_rec(env, x, 3)
+      assert has_rec_var?(unfolded_3)
+    end
+
+    test "binary tree type" do
+      # Tree = :leaf or {:node, term(), Tree, Tree}
+      # Represents binary trees with values at internal nodes
+
+      env = %{}
+      {env, tree} = new_rec_var(env, :Tree)
+
+      # Build tuple with recursion variables for left and right children
+      node_tuple = %{tuple: {:closed, [atom([:node]), term(), tree, tree]}}
+      tree_def = union(atom([:leaf]), node_tuple)
+
+      env = def_rec_var(env, :Tree, tree_def)
+
+      # Check that the definition contains recursion variables
+      assert has_rec_var?(tree_def)
+
+      # Unfold and verify structure is preserved
+      unfolded = unfold_rec(env, tree)
+      assert has_rec_var?(unfolded)
+    end
+
+    test "list type using built-in list constructor" do
+      # IntList = [] or non_empty_list(integer(), IntList)
+      # This mimics Elixir's list type using the built-in list type
+
+      env = %{}
+      {env, int_list} = new_rec_var(env, :IntList)
+
+      # Build list where tail is the recursive reference
+      list_with_var = %{list: {integer(), int_list}}
+      list_def = union(empty_list(), list_with_var)
+      env = def_rec_var(env, :IntList, list_def)
+
+      assert has_rec_var?(list_def)
+
+      # Unfold once
+      unfolded = unfold_rec(env, int_list)
+      assert has_rec_var?(unfolded)
+    end
+
+    test "mutually recursive types" do
+      # Even = :zero or {:succ, Odd}
+      # Odd = {:succ, Even}
+
+      env = %{}
+      {env, even} = new_rec_var(env, :Even)
+      {env, odd} = new_rec_var(env, :Odd)
+
+      even_tuple = %{tuple: {:closed, [atom([:succ]), odd]}}
+      even_def = union(atom([:zero]), even_tuple)
+
+      odd_def = %{tuple: {:closed, [atom([:succ]), even]}}
+
+      env = def_rec_var(env, :Even, even_def)
+      env = def_rec_var(env, :Odd, odd_def)
+
+      # Both definitions contain recursion variables
+      assert has_rec_var?(even_def)
+      assert has_rec_var?(odd_def)
+
+      # Unfolding Even gives us the definition with Odd reference
+      unfolded_even = unfold_rec(env, even)
+      assert has_rec_var?(unfolded_even)
+
+      # Unfolding Odd gives us the definition with Even reference
+      unfolded_odd = unfold_rec(env, odd)
+      assert has_rec_var?(unfolded_odd)
+
+      # Unfold Even twice: should now have Even reference again
+      unfolded_even_2 = unfold_rec(env, even, 2)
+      assert has_rec_var?(unfolded_even_2)
+    end
+
+    test "recursive type in function" do
+      # F = (integer() -> F)
+      # A function that returns itself
+
+      env = %{}
+      {env, f} = new_rec_var(env, :F)
+
+      # Build function type with recursive return type
+      f_def = %{fun: {:union, %{1 => {[integer()], f}}}}
+      env = def_rec_var(env, :F, f_def)
+
+      assert has_rec_var?(f_def)
+      unfolded = unfold_rec(env, f)
+      assert has_rec_var?(unfolded)
+    end
+
+    test "rec_var/1 creates a reference without environment" do
+      # When you know the recursion variable exists
+      x_ref = rec_var(:X)
+      assert {:rec_var, :X} = x_ref
+      assert is_rec_var?(x_ref)
+
+      # Can be used with lookup
+      env = %{X: integer()}
+      assert lookup_rec_var(env, :X) == integer()
+      assert unfold_rec(env, x_ref) == integer()
+    end
+
+    test "nested recursive structures" do
+      # Stream = :done or {:yield, integer(), Stream}
+
+      env = %{}
+      {env, stream} = new_rec_var(env, :IntStream)
+
+      stream_tuple = %{tuple: {:closed, [atom([:yield]), integer(), stream]}}
+      stream_def = union(atom([:done]), stream_tuple)
+
+      env = def_rec_var(env, :IntStream, stream_def)
+
+      assert has_rec_var?(stream_def)
+
+      # Unfold multiple levels
+      unfolded_1 = unfold_rec(env, stream, 1)
+      assert has_rec_var?(unfolded_1)
+
+      unfolded_2 = unfold_rec(env, stream, 2)
+      assert has_rec_var?(unfolded_2)
+    end
+
+    test "recursive type with maps" do
+      # Expression = integer() | %{op: atom(), left: Expression, right: Expression}
+      # Represents an AST for arithmetic expressions
+
+      env = %{}
+      {env, expr} = new_rec_var(env, :Expr)
+
+      # Build map with recursive fields
+      expr_map = %{map: {:closed, %{op: atom(), left: expr, right: expr}}}
+      expr_def = union(integer(), expr_map)
+
+      env = def_rec_var(env, :Expr, expr_def)
+
+      assert has_rec_var?(expr_def)
+
+      unfolded = unfold_rec(env, expr)
+      assert has_rec_var?(unfolded)
+
+      # Unfold twice to get deeper nesting
+      unfolded_2 = unfold_rec(env, expr, 2)
+      assert has_rec_var?(unfolded_2)
+    end
+
+    test "unfold non-recursive type has no effect" do
+      # A type without recursion variables should be unchanged by unfolding
+      env = %{X: integer()}
+
+      simple_type = union(integer(), atom())
+      assert unfold_rec(env, simple_type) == simple_type
+      refute has_rec_var?(simple_type)
+    end
+
+    test "has_rec_var? on various structures" do
+      x = rec_var(:X)
+
+      # Direct recursion variable
+      assert has_rec_var?(x)
+
+      # Recursion variable in tuple
+      assert has_rec_var?(%{tuple: {:closed, [integer(), x]}})
+
+      # Recursion variable in list
+      assert has_rec_var?(%{list: {x, empty_list()}})
+
+      # Recursion variable in map
+      assert has_rec_var?(%{map: {:closed, %{a: x}}})
+
+      # No recursion variable
+      refute has_rec_var?(integer())
+      refute has_rec_var?(term())
+      refute has_rec_var?(union(integer(), atom()))
+    end
+
+    test "JSON-like type" do
+      # Json = nil | boolean | number | binary | list(Json) | %{binary => Json}
+      # A common recursive type for JSON values
+
+      env = %{}
+      {env, json} = new_rec_var(env, :Json)
+
+      # Build the recursive list and map types
+      json_list = %{list: {json, empty_list()}}
+      # Simplified - just open map for now
+      _json_map = %{map: {:open, %{}}}
+
+      json_def =
+        Enum.reduce(
+          [
+            atom([nil]),
+            boolean(),
+            integer(),
+            float(),
+            binary(),
+            json_list
+          ],
+          &union/2
+        )
+
+      env = def_rec_var(env, :Json, json_def)
+
+      assert has_rec_var?(json_def)
+      unfolded = unfold_rec(env, json)
+      assert has_rec_var?(unfolded)
+    end
+  end
 end

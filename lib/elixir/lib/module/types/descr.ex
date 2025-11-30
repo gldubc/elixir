@@ -114,6 +114,220 @@ defmodule Module.Types.Descr do
   @boolset :sets.from_list([true, false], version: 2)
   def boolean(), do: %{atom: {:union, @boolset}}
 
+  ## Recursive types
+  #
+  # Recursive types are represented using recursion variables that reference
+  # definitions stored in a type environment.
+  #
+  # Recursion variables are represented as `{:rec_var, name}` tuples, which is
+  # a structure that is clearly distinguishable from regular descrs. This
+  # ensures they don't interfere with normal type operations.
+  #
+  # For example, to represent `X = integer() or {integer(), X}`:
+  #
+  #     env = %{}
+  #     {env, x} = new_rec_var(env, :X)
+  #     env = def_rec_var(env, :X, union(integer(), tuple([integer(), x])))
+  #
+  # The type environment maps recursion variable names to their definitions.
+  # When performing type operations, variables can be unfolded on demand.
+  #
+  # IMPORTANT: Recursion variables should NOT be used directly in type operations
+  # like union/2, intersection/2, etc. They must be unfolded first using
+  # unfold_rec/2 or unfold_rec/3.
+
+  @doc """
+  Creates a new recursion variable in the environment.
+
+  Returns `{updated_env, rec_var}` where `rec_var` is a special marker
+  that represents a reference to the recursion variable.
+
+  Recursion variables are represented as `{:rec_var, name}` tuples.
+  """
+  def new_rec_var(env, name) do
+    var = {:rec_var, name}
+    # Initialize with none() as placeholder, will be defined later
+    {Map.put_new(env, name, none()), var}
+  end
+
+  @doc """
+  Creates a recursion variable reference without modifying the environment.
+
+  This is useful when you already know the variable exists in the environment.
+  """
+  def rec_var(name), do: {:rec_var, name}
+
+  @doc """
+  Defines a recursion variable in the environment.
+
+  The definition can reference other recursion variables, including itself
+  for recursive types.
+  """
+  def def_rec_var(env, name, definition) do
+    Map.put(env, name, definition)
+  end
+
+  @doc """
+  Looks up a recursion variable's definition in the environment.
+  """
+  def lookup_rec_var(env, name) do
+    Map.get(env, name, none())
+  end
+
+  @doc """
+  Checks if a value is a recursion variable reference.
+  """
+  def is_rec_var?({:rec_var, _}), do: true
+  def is_rec_var?(_), do: false
+
+  @doc """
+  Checks if a descr or type structure contains any recursion variables.
+  """
+  def has_rec_var?({:rec_var, _}), do: true
+  def has_rec_var?(:term), do: false
+  def has_rec_var?(:bdd_top), do: false
+  def has_rec_var?(:bdd_bot), do: false
+
+  def has_rec_var?(descr) when is_map(descr) do
+    Enum.any?(descr, fn
+      {:dynamic, inner} -> has_rec_var?(inner)
+      {:tuple, bdd} -> bdd_has_rec_var?(bdd, &tuple_elem_has_rec_var?/1)
+      {:list, bdd} -> bdd_has_rec_var?(bdd, &list_elem_has_rec_var?/1)
+      {:map, bdd} -> bdd_has_rec_var?(bdd, &map_elem_has_rec_var?/1)
+      {:fun, fun} -> fun_has_rec_var?(fun)
+      _ -> false
+    end)
+  end
+
+  def has_rec_var?(_), do: false
+
+  defp bdd_has_rec_var?(:bdd_top, _elem_checker), do: false
+  defp bdd_has_rec_var?(:bdd_bot, _elem_checker), do: false
+
+  defp bdd_has_rec_var?({lit, c, u, d}, elem_checker) do
+    elem_checker.(lit) or bdd_has_rec_var?(c, elem_checker) or
+      bdd_has_rec_var?(u, elem_checker) or bdd_has_rec_var?(d, elem_checker)
+  end
+
+  defp bdd_has_rec_var?(leaf, elem_checker), do: elem_checker.(leaf)
+
+  defp tuple_elem_has_rec_var?({:closed, elements}), do: Enum.any?(elements, &has_rec_var?/1)
+  defp tuple_elem_has_rec_var?({:open, elements}), do: Enum.any?(elements, &has_rec_var?/1)
+  defp tuple_elem_has_rec_var?(_), do: false
+
+  defp list_elem_has_rec_var?({list_type, tail_type}),
+    do: has_rec_var?(list_type) or has_rec_var?(tail_type)
+
+  defp list_elem_has_rec_var?(_), do: false
+
+  defp map_elem_has_rec_var?({_tag, fields}) when is_map(fields) do
+    Enum.any?(fields, fn {_k, v} -> has_rec_var?(v) end)
+  end
+
+  defp map_elem_has_rec_var?(_), do: false
+
+  defp fun_has_rec_var?({:negation, _}), do: false
+
+  defp fun_has_rec_var?({:union, bdds}) do
+    Enum.any?(bdds, fn {_arity, bdd} -> bdd_has_rec_var?(bdd, &fun_arrow_has_rec_var?/1) end)
+  end
+
+  defp fun_arrow_has_rec_var?({args, ret}),
+    do: Enum.any?(args, &has_rec_var?/1) or has_rec_var?(ret)
+
+  defp fun_arrow_has_rec_var?(_), do: false
+
+  @doc """
+  Unfolds recursion variables one level in a descr or type structure.
+
+  This replaces each recursion variable reference with its definition from the environment.
+  For recursive types, this performs one "unrolling" of the recursion.
+  """
+  def unfold_rec(env, {:rec_var, name}) do
+    lookup_rec_var(env, name)
+  end
+
+  def unfold_rec(_env, :term), do: :term
+
+  def unfold_rec(env, descr) when is_map(descr) do
+    if has_rec_var?(descr) do
+      Map.new(descr, fn
+        {:dynamic, inner} -> {:dynamic, unfold_rec(env, inner)}
+        {:tuple, bdd} -> {:tuple, unfold_bdd_rec(env, bdd, &unfold_tuple_elem_rec/2)}
+        {:list, bdd} -> {:list, unfold_bdd_rec(env, bdd, &unfold_list_elem_rec/2)}
+        {:map, bdd} -> {:map, unfold_bdd_rec(env, bdd, &unfold_map_elem_rec/2)}
+        {:fun, fun} -> {:fun, unfold_fun_rec(env, fun)}
+        other -> other
+      end)
+    else
+      descr
+    end
+  end
+
+  def unfold_rec(_env, other), do: other
+
+  defp unfold_bdd_rec(_env, :bdd_top, _unfold_elem), do: :bdd_top
+  defp unfold_bdd_rec(_env, :bdd_bot, _unfold_elem), do: :bdd_bot
+
+  defp unfold_bdd_rec(env, {lit, c, u, d}, unfold_elem) do
+    {unfold_elem.(env, lit), unfold_bdd_rec(env, c, unfold_elem),
+     unfold_bdd_rec(env, u, unfold_elem), unfold_bdd_rec(env, d, unfold_elem)}
+  end
+
+  defp unfold_bdd_rec(env, leaf, unfold_elem), do: unfold_elem.(env, leaf)
+
+  defp unfold_tuple_elem_rec(env, {:closed, elements}) do
+    {:closed, Enum.map(elements, &unfold_rec(env, &1))}
+  end
+
+  defp unfold_tuple_elem_rec(env, {:open, elements}) do
+    {:open, Enum.map(elements, &unfold_rec(env, &1))}
+  end
+
+  defp unfold_list_elem_rec(env, {list_type, tail_type}) do
+    {unfold_rec(env, list_type), unfold_rec(env, tail_type)}
+  end
+
+  defp unfold_map_elem_rec(env, {tag, fields}) when is_map(fields) do
+    {tag, Map.new(fields, fn {k, v} -> {k, unfold_rec(env, v)} end)}
+  end
+
+  defp unfold_fun_rec(_env, {:negation, map}), do: {:negation, map}
+
+  defp unfold_fun_rec(env, {:union, bdds}) do
+    {:union, Map.new(bdds, fn {arity, bdd} -> {arity, unfold_fun_bdd_rec(env, bdd)} end)}
+  end
+
+  defp unfold_fun_bdd_rec(_env, :bdd_top), do: :bdd_top
+  defp unfold_fun_bdd_rec(_env, :bdd_bot), do: :bdd_bot
+
+  defp unfold_fun_bdd_rec(env, {args, ret}) do
+    {Enum.map(args, &unfold_rec(env, &1)), unfold_rec(env, ret)}
+  end
+
+  defp unfold_fun_bdd_rec(env, {lit, c, u, d}) do
+    {unfold_fun_bdd_rec(env, lit), unfold_fun_bdd_rec(env, c), unfold_fun_bdd_rec(env, u),
+     unfold_fun_bdd_rec(env, d)}
+  end
+
+  @doc """
+  Unfolds recursion variables up to a maximum depth.
+
+  This is useful for operations that need to explore the structure
+  of recursive types to a certain depth.
+  """
+  def unfold_rec(_env, descr, 0), do: descr
+
+  def unfold_rec(env, descr, depth) when depth > 0 do
+    unfolded = unfold_rec(env, descr)
+
+    if has_rec_var?(unfolded) do
+      unfold_rec(env, unfolded, depth - 1)
+    else
+      unfolded
+    end
+  end
+
   ## Function constructors
 
   @doc """
