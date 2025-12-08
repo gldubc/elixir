@@ -168,6 +168,35 @@ defmodule Module.Types.Descr do
   end
 
   @doc """
+  Creates a new node (rec_var) with a fresh unique identifier and the given definition.
+
+  This corresponds to the `node(def)` function from the paper "Implementing Set-Theoretic Types"
+  (Section 4.6). In the paper, set-theoretic operations on nodes are defined as:
+
+      ¬N = node(¬(N.def))
+      N₁ ∧ N₂ = node(N₁.def ∧ N₂.def)
+      N₁ ∨ N₂ = node(N₁.def ∨ N₂.def)
+
+  Where `node(d)` creates a new node with a fresh identifier and definition `d`.
+
+  Returns `{updated_env, rec_var}` where the rec_var has a unique reference-based ID.
+
+  So if I have %{ty1, env: e1} and %{ty2, env: e2} 
+  then i create e = e1 + e2
+  compute t1 /\ t2
+  when encountering rec vars, unfold them using e, compute the intersection, and re-wrap them
+  in e (which becomes e').
+  return the final %{ty', env: e'}
+
+  i will do this everywere
+   """
+  def node(env, definition) do
+    id = make_ref()
+    var = {:rec_var, id}
+    {Map.put(env, id, definition), var}
+  end
+
+  @doc """
   Looks up a recursion variable's definition in the environment.
   """
   def lookup_rec_var(env, name) do
@@ -561,6 +590,7 @@ defmodule Module.Types.Descr do
   Returns true if the type has a gradual part.
   """
   def gradual?(:term), do: false
+  def gradual?({:rec_var, _}), do: false
   def gradual?(descr), do: is_map_key(descr, :dynamic)
 
   @doc """
@@ -629,6 +659,28 @@ defmodule Module.Types.Descr do
   defp union(:fun, v1, v2), do: fun_union(v1, v2)
 
   @doc """
+  Computes the union of two types, with support for recursive types.
+
+  This version accepts an environment mapping recursion variable names to their
+  definitions. Recursion variables are unfolded before computing the union.
+
+  Returns `{updated_env, rec_var}` where the result is a new node with a fresh ID.
+  This follows the paper's definition: N₁ ∨ N₂ = node(N₁.def ∨ N₂.def)
+  """
+  def union_rec(env, {:rec_var, _} = left, right),
+    do: union_rec(env, unfold_rec(env, left), right)
+
+  def union_rec(env, left, {:rec_var, _} = right),
+    do: union_rec(env, left, unfold_rec(env, right))
+
+  def union_rec(env, left, right) do
+    # Unfold any nested rec_vars before computing the union
+    left = unfold_rec(env, left)
+    right = unfold_rec(env, right)
+    node(env, union(left, right))
+  end
+
+  @doc """
   Computes the intersection of two descrs.
   """
   def intersection(:term, other), do: remove_optional(other)
@@ -693,6 +745,50 @@ defmodule Module.Types.Descr do
     else
       difference_static(left, right)
     end
+  end
+
+  @doc """
+  Computes the difference between two types, with support for recursive types.
+
+  This version accepts an environment mapping recursion variable names to their
+  definitions. Recursion variables are unfolded before computing the difference.
+
+  Returns `{updated_env, rec_var}` where the result is a new node with a fresh ID.
+  This follows the paper's definition for difference: t₁ \\ t₂ = t₁ ∧ ¬t₂
+  """
+  def difference_rec(env, {:rec_var, _} = left, right),
+    do: difference_rec(env, unfold_rec(env, left), right)
+
+  def difference_rec(env, left, {:rec_var, _} = right),
+    do: difference_rec(env, left, unfold_rec(env, right))
+
+  def difference_rec(env, left, right) do
+    # Unfold any nested rec_vars before computing the difference
+    left = unfold_rec(env, left)
+    right = unfold_rec(env, right)
+    node(env, difference(left, right))
+  end
+
+  @doc """
+  Computes the intersection between two types, with support for recursive types.
+
+  This version accepts an environment mapping recursion variable names to their
+  definitions. Recursion variables are unfolded before computing the intersection.
+
+  Returns `{updated_env, rec_var}` where the result is a new node with a fresh ID.
+  This follows the paper's definition: N₁ ∧ N₂ = node(N₁.def ∧ N₂.def)
+  """
+  def intersection_rec(env, {:rec_var, _} = left, right),
+    do: intersection_rec(env, unfold_rec(env, left), right)
+
+  def intersection_rec(env, left, {:rec_var, _} = right),
+    do: intersection_rec(env, left, unfold_rec(env, right))
+
+  def intersection_rec(env, left, right) do
+    # Unfold any nested rec_vars before computing the intersection
+    left = unfold_rec(env, left)
+    right = unfold_rec(env, right)
+    node(env, intersection(left, right))
   end
 
   # For static types, the difference is component-wise.
@@ -767,6 +863,24 @@ defmodule Module.Types.Descr do
   def negation(%{} = descr), do: difference(unfolded_term(), descr)
 
   @doc """
+  Computes the negation of a type, with support for recursive types.
+
+  This version accepts an environment mapping recursion variable names to their
+  definitions. Recursion variables are unfolded before computing the negation.
+
+  Returns `{updated_env, rec_var}` where the result is a new node with a fresh ID.
+  This follows the paper's definition: ¬N = node(¬(N.def))
+  """
+  def negation_rec(env, {:rec_var, _} = var),
+    do: negation_rec(env, unfold_rec(env, var))
+
+  def negation_rec(env, type) do
+    # Unfold any nested rec_vars before computing the negation
+    type = unfold_rec(env, type)
+    node(env, negation(type))
+  end
+
+  @doc """
   Check if a type is empty.
 
   For gradual types, check that the upper bound (the dynamic part) is empty.
@@ -792,6 +906,59 @@ defmodule Module.Types.Descr do
           (not Map.has_key?(descr, :map) or map_empty?(descr.map)) and
           (not Map.has_key?(descr, :list) or list_empty?(descr.list)) and
           (not Map.has_key?(descr, :fun) or fun_empty?(descr.fun))
+    end
+  end
+
+  @doc """
+  Check if a type is empty, with support for recursive types.
+
+  This version accepts an environment mapping recursion variable names to their
+  definitions. When checking emptiness of recursive types, it tracks which types
+  have been visited to handle cycles correctly.
+
+  According to the paper "Implementing Set-Theoretic Types", if we encounter a
+  type we've already seen during traversal (indicating a recursive cycle), we
+  consider that branch empty. This is because a recursive type whose emptiness
+  depends only on itself (e.g., μX.{X}) has no finite inhabitants.
+  """
+  def empty?(env, type), do: empty_rec?(env, type, MapSet.new())
+
+  # Handle recursion variables
+  defp empty_rec?(env, {:rec_var, name}, seen) do
+    if MapSet.member?(seen, name) do
+      # Recursive occurrence - consider this branch empty
+      # (a type that depends only on itself has no finite values)
+      true
+    else
+      # Look up the definition and check it with the variable added to seen set
+      definition = lookup_rec_var(env, name)
+      empty_rec?(env, definition, MapSet.put(seen, name))
+    end
+  end
+
+  defp empty_rec?(_env, :term, _seen), do: false
+
+  defp empty_rec?(env, %{} = descr, seen) do
+    case :maps.get(:dynamic, descr, descr) do
+      :term ->
+        false
+
+      value when value == @none ->
+        true
+
+      inner_descr ->
+        # Check each component, short-circuiting on the first non-empty one
+        # tuple_empty_rec? now returns {env, boolean} so we extract just the boolean
+        has_atom = Map.has_key?(inner_descr, :atom)
+        has_bitmap = Map.has_key?(inner_descr, :bitmap)
+        has_optional = Map.has_key?(inner_descr, :optional)
+
+        not has_atom and not has_bitmap and not has_optional and
+          (not Map.has_key?(inner_descr, :tuple) or
+             tuple_empty_rec?(env, inner_descr.tuple, seen) |> elem(1)) and
+          (not Map.has_key?(inner_descr, :map) or map_empty_rec?(env, inner_descr.map, seen)) and
+          (not Map.has_key?(inner_descr, :list) or list_empty_rec?(env, inner_descr.list, seen)) and
+          (not Map.has_key?(inner_descr, :fun) or fun_empty_rec?(env, inner_descr.fun, seen))
     end
   end
 
@@ -937,12 +1104,95 @@ defmodule Module.Types.Descr do
   defp subtype_static?(left, right), do: empty_difference_subtype?(left, right)
 
   @doc """
+  Check if a type is a subtype of another, with support for recursive types.
+
+  This version accepts an environment mapping recursion variable names to their
+  definitions.
+  """
+  def subtype?(env, left, right) do
+    subtype_rec?(env, left, right, MapSet.new())
+  end
+
+  # Both sides are rec_vars - track the pair for coinductive reasoning
+  defp subtype_rec?(env, {:rec_var, left_name}, {:rec_var, right_name}, seen) do
+    # pair = {left_name, right_name}
+
+    # if MapSet.member?(seen, {:pair, pair}) do
+    #   # Recursive occurrence of the same pair - assume true for coinductive check
+    #   true
+    # else
+    left_def = lookup_rec_var(env, left_name)
+    right_def = lookup_rec_var(env, right_name)
+    # seen = MapSet.put(seen, {:pair, pair})
+    subtype_rec?(env, left_def, right_def, seen)
+    # end
+  end
+
+  # Only left side is a rec_var
+  defp subtype_rec?(env, {:rec_var, name}, right, seen) do
+    definition = lookup_rec_var(env, name)
+    subtype_rec?(env, definition, unfold_rec_right(env, right, seen), seen)
+  end
+
+  # We just unfold and check.
+  defp subtype_rec?(env, left, {:rec_var, name}, seen) do
+    definition = lookup_rec_var(env, name)
+    subtype_rec?(env, unfold_rec_left(env, left, seen), definition, seen)
+  end
+
+  defp subtype_rec?(env, left, right, seen) do
+    # Unfold any recursion variables in the types before comparing
+    left = unfold_rec_left(env, left, seen)
+    right = unfold_rec_right(env, right, seen)
+
+    left = unfold(left)
+    right = unfold(right)
+    is_grad_left = gradual?(left)
+    is_grad_right = gradual?(right)
+
+    cond do
+      is_grad_left and not is_grad_right ->
+        left_dynamic = Map.get(left, :dynamic)
+        subtype_static_rec?(env, left_dynamic, right, seen)
+
+      is_grad_right and not is_grad_left ->
+        right_static = Map.delete(right, :dynamic)
+        subtype_static_rec?(env, left, right_static, seen)
+
+      true ->
+        subtype_static_rec?(env, left, right, seen)
+    end
+  end
+
+  defp subtype_static_rec?(_env, same, same, _seen), do: true
+
+  defp subtype_static_rec?(env, left, right, seen),
+    do: empty_rec?(env, difference(left, right), seen)
+
+  # Helper to unfold rec vars when on the left side of subtype
+  defp unfold_rec_left(env, {:rec_var, _} = var, _seen), do: unfold_rec(env, var)
+  defp unfold_rec_left(_env, other, _seen), do: other
+
+  # Helper to unfold rec vars when on the right side of subtype
+  defp unfold_rec_right(env, {:rec_var, _} = var, _seen), do: unfold_rec(env, var)
+  defp unfold_rec_right(_env, other, _seen), do: other
+
+  @doc """
   Check if a type is equal to another.
 
   It is currently not optimized. Only to be used in tests.
   """
   def equal?(left, right) do
     left == right or (subtype?(left, right) and subtype?(right, left))
+  end
+
+  @doc """
+  Check if a type is equal to another, with support for recursive types.
+
+  It is currently not optimized. Only to be used in tests.
+  """
+  def equal?(env, left, right) do
+    left == right or (subtype?(env, left, right) and subtype?(env, right, left))
   end
 
   @doc """
@@ -1602,6 +1852,106 @@ defmodule Module.Types.Descr do
     end)
   end
 
+  # Recursive versions of function emptiness checking (with env and seen set)
+  defp fun_empty_rec?(_env, {:negation, _}, _seen), do: false
+
+  defp fun_empty_rec?(env, {:union, repr}, seen) do
+    Enum.all?(repr, fn {_ar, bdd} ->
+      Enum.all?(bdd_to_dnf(bdd), fn {pos, neg} -> fun_line_empty_rec?(env, pos, neg, seen) end)
+    end)
+  end
+
+  defp fun_line_empty_rec?(_env, [], _, _seen), do: false
+
+  defp fun_line_empty_rec?(env, positives, negatives, seen) do
+    # A function type is empty only if some negative arrow negates
+    # the entire positive intersection.
+    # NOTE: Recursive return types (like F = (int -> F)) do NOT make the type empty.
+    Enum.any?(negatives, fn {neg_arguments, neg_return} ->
+      subtype_rec?(env, args_to_domain(neg_arguments), fetch_domain(positives), seen) and
+        phi_starter_rec(env, neg_arguments, neg_return, positives, seen)
+    end)
+  end
+
+  defp phi_starter_rec(env, arguments, return, positives, seen) do
+    case disjoint_non_empty_domains_rec?(env, {arguments, return}, positives, seen) do
+      :disjoint_non_empty ->
+        apply_disjoint(arguments, positives) |> subtype_rec?(env, return, seen)
+
+      :non_empty ->
+        fun_apply_static(arguments, [positives]) |> subtype_rec?(env, return, seen)
+
+      _ ->
+        arguments = Enum.map(arguments, &{false, &1})
+
+        {result, _cache} =
+          phi_rec(env, arguments, {false, negation(return)}, positives, %{}, seen)
+
+        result
+    end
+  end
+
+  defp phi_rec(env, args, {b, t}, [], cache, seen) do
+    result =
+      Enum.any?(args, fn {bool, typ} -> bool and empty_rec?(env, typ, seen) end) or
+        (b and empty_rec?(env, t, seen))
+
+    {result, Map.put(cache, {args, {b, t}, []}, result)}
+  end
+
+  defp phi_rec(env, args, {b, ret}, [{arguments, return} | rest_positive], cache, seen) do
+    cache_key = {args, {b, ret}, [{arguments, return} | rest_positive]}
+
+    case cache do
+      %{^cache_key => value} ->
+        {value, cache}
+
+      %{} ->
+        {result1, cache} =
+          phi_rec(env, args, {true, intersection(ret, return)}, rest_positive, cache, seen)
+
+        if not result1 do
+          cache = Map.put(cache, cache_key, false)
+          {false, cache}
+        else
+          {result, cache} =
+            Enum.zip(args, arguments)
+            |> Enum.reduce_while({true, cache}, fn {{bool, type}, _arg}, {_, cache} ->
+              new_args =
+                Enum.zip_with(args, arguments, fn {b, t}, argument ->
+                  if t == type, do: {true, difference(t, argument)}, else: {b, t}
+                end)
+
+              {result, cache} = phi_rec(env, new_args, {bool, ret}, rest_positive, cache, seen)
+              if result, do: {:cont, {true, cache}}, else: {:halt, {false, cache}}
+            end)
+
+          cache = Map.put(cache, cache_key, result)
+          {result and result1, cache}
+        end
+    end
+  end
+
+  defp disjoint_non_empty_domains_rec?(env, negative, positives, seen) do
+    case disjoint_non_empty_domains?(negative, positives) do
+      :disjoint_non_empty ->
+        # Verify using recursive emptiness checking
+        if Enum.all?(positives, fn {args, _} ->
+             not Enum.any?(args, &empty_rec?(env, &1, seen))
+           end) do
+          :disjoint_non_empty
+        else
+          :may_be_empty
+        end
+
+      :non_empty ->
+        :non_empty
+
+      other ->
+        other
+    end
+  end
+
   # A function type {positives, negatives} is empty if there exists a negative
   # function that negates the whole positive intersection
   #
@@ -2138,10 +2488,20 @@ defmodule Module.Types.Descr do
   # The result may be larger than the initial bdd1, which is maintained in the accumulator.
   defp list_difference(bdd_leaf(list1, last1) = bdd1, bdd_leaf(list2, last2) = bdd2) do
     cond do
-      disjoint?(list1, list2) or disjoint?(last1, last2) -> bdd_leaf(list1, last1)
-      subtype?(list1, list2) and subtype?(last1, last2) -> :bdd_bot
-      equal?(list1, list2) -> bdd_leaf(list1, difference(last1, last2))
-      true -> bdd_difference(bdd1, bdd2)
+      has_rec_var?(list1) or has_rec_var?(list2) or has_rec_var?(last1) or has_rec_var?(last2) ->
+        bdd_difference(bdd1, bdd2)
+
+      disjoint?(list1, list2) or disjoint?(last1, last2) ->
+        bdd_leaf(list1, last1)
+
+      subtype?(list1, list2) and subtype?(last1, last2) ->
+        :bdd_bot
+
+      equal?(list1, list2) ->
+        bdd_leaf(list1, difference(last1, last2))
+
+      true ->
+        bdd_difference(bdd1, bdd2)
     end
   end
 
@@ -2177,6 +2537,66 @@ defmodule Module.Types.Descr do
       end)
       |> is_nil()
   end
+
+  # Recursive versions of list emptiness checking (with env and seen set)
+
+  defp list_empty_rec?(_env, @non_empty_list_top, _seen), do: false
+
+  defp list_empty_rec?(env, bdd, seen) do
+    bdd_to_dnf(bdd)
+    |> Enum.all?(fn {pos, negs} ->
+      case non_empty_list_literals_intersection_rec(env, pos, seen) do
+        :empty -> true
+        {list, last} -> list_line_empty_rec?(env, list, last, negs, seen)
+      end
+    end)
+  end
+
+  # Non-empty list literals intersection with recursive type support
+  defp non_empty_list_literals_intersection_rec(env, lists, seen) do
+    result = non_empty_list_literals_intersection(lists)
+
+    case result do
+      :empty ->
+        :empty
+
+      {list_type, last_type} ->
+        # Check if either the list type or last type is empty due to recursion
+        if empty_rec?(env, list_type, seen) or empty_rec?(env, last_type, seen) do
+          :empty
+        else
+          {list_type, last_type}
+        end
+    end
+  end
+
+  defp list_line_empty_rec?(env, list_type, last_type, negs, seen) do
+    last_type = list_tail_unfold_rec(env, last_type, seen)
+
+    empty_rec?(env, list_type, seen) or empty_rec?(env, last_type, seen) or
+      Enum.reduce_while(negs, last_type, fn {neg_type, neg_last}, acc_last_type ->
+        if subtype_rec?(env, list_type, neg_type, seen) do
+          d = difference(acc_last_type, neg_last)
+          if empty_rec?(env, d, seen), do: {:halt, nil}, else: {:cont, d}
+        else
+          {:cont, acc_last_type}
+        end
+      end)
+      |> is_nil()
+  end
+
+  # Unfold list tail with recursive type support
+  defp list_tail_unfold_rec(env, {:rec_var, _name} = var, seen) do
+    # Unfold the recursion variable if we haven't seen it yet
+    if MapSet.member?(seen, elem(var, 1)) do
+      # Recursive occurrence - return none() to make this branch empty
+      none()
+    else
+      list_tail_unfold(unfold_rec(env, var))
+    end
+  end
+
+  defp list_tail_unfold_rec(_env, type, _seen), do: list_tail_unfold(type)
 
   defp non_empty_list_only?(descr), do: empty?(Map.delete(descr, :list))
 
@@ -2596,25 +3016,34 @@ defmodule Module.Types.Descr do
   defp map_union(bdd1, bdd2), do: bdd_union(bdd1, bdd2)
 
   defp maybe_optimize_map_union({tag1, pos1, []} = map1, {tag2, pos2, []} = map2) do
-    case map_union_optimization_strategy(tag1, pos1, tag2, pos2) do
-      :all_equal ->
-        map1
+    # Skip optimization if any field value is a rec_var - keep maps separate in BDD
+    has_rec_vars =
+      Enum.any?(pos1, fn {_k, v} -> is_rec_var?(v) end) or
+        Enum.any?(pos2, fn {_k, v} -> is_rec_var?(v) end)
 
-      :any_map ->
-        {:open, %{}, []}
+    if has_rec_vars do
+      nil
+    else
+      case map_union_optimization_strategy(tag1, pos1, tag2, pos2) do
+        :all_equal ->
+          map1
 
-      {:one_key_difference, key, v1, v2} ->
-        new_pos = Map.put(pos1, key, union(v1, v2))
-        {tag1, new_pos, []}
+        :any_map ->
+          {:open, %{}, []}
 
-      :left_subtype_of_right ->
-        map2
+        {:one_key_difference, key, v1, v2} ->
+          new_pos = Map.put(pos1, key, union(v1, v2))
+          {tag1, new_pos, []}
 
-      :right_subtype_of_left ->
-        map1
+        :left_subtype_of_right ->
+          map2
 
-      nil ->
-        nil
+        :right_subtype_of_left ->
+          map1
+
+        nil ->
+          nil
+      end
     end
   end
 
@@ -3618,6 +4047,107 @@ defmodule Module.Types.Descr do
     end)
   end
 
+  # Recursive versions of map emptiness checking (with env and seen set)
+  defp map_empty_rec?(env, bdd, seen) do
+    bdd_to_dnf(bdd)
+    |> Enum.all?(fn {pos, negs} ->
+      case non_empty_map_literals_intersection_rec(env, pos, seen) do
+        :empty ->
+          true
+
+        {tag, fields} when is_map(fields) ->
+          init_map_line_empty_rec?(env, tag, fields, negs, seen)
+      end
+    end)
+  end
+
+  defp non_empty_map_literals_intersection_rec(env, maps, seen) do
+    result = non_empty_map_literals_intersection(maps)
+
+    case result do
+      :empty ->
+        :empty
+
+      {tag, fields} when is_map(fields) ->
+        # Check if any field is empty due to recursion
+        if Enum.any?(fields, fn {_key, type} -> empty_rec?(env, type, seen) end) do
+          :empty
+        else
+          {tag, fields}
+        end
+    end
+  end
+
+  defp init_map_line_empty_rec?(env, tag, fields, negs, seen) do
+    Enum.any?(Map.to_list(fields), fn {_key, type} -> empty_rec?(env, type, seen) end) or
+      map_line_empty_rec?(env, tag, fields, negs, seen)
+  end
+
+  defp map_line_empty_rec?(_env, _, _pos, [], _seen), do: false
+
+  defp map_line_empty_rec?(_env, _, _, [{:open, neg_fields} | _], _seen) when neg_fields == %{},
+    do: true
+
+  defp map_line_empty_rec?(env, :open, fs, [{:closed, _} | negs], seen),
+    do: map_line_empty_rec?(env, :open, fs, negs, seen)
+
+  defp map_line_empty_rec?(env, tag, fields, [{neg_tag, neg_fields} | negs], seen) do
+    if map_check_domain_keys(tag, neg_tag) do
+      atom_default = map_key_tag_to_type(tag)
+      neg_atom_default = map_key_tag_to_type(neg_tag)
+
+      Enum.all?(Map.to_list(neg_fields), fn {neg_key, neg_type} ->
+        cond do
+          is_map_key(fields, neg_key) ->
+            true
+
+          tag == :closed ->
+            is_optional_static(neg_type) or throw(:closed)
+
+          tag == :open ->
+            diff = difference(term_or_optional(), neg_type)
+
+            empty_rec?(env, diff, seen) or
+              map_line_empty_rec?(env, tag, Map.put(fields, neg_key, diff), negs, seen)
+
+          true ->
+            diff = difference(atom_default, neg_type)
+
+            empty_rec?(env, diff, seen) or
+              map_line_empty_rec?(env, tag, Map.put(fields, neg_key, diff), negs, seen)
+        end
+      end) and
+        Enum.all?(Map.to_list(fields), fn {key, type} ->
+          case neg_fields do
+            %{^key => neg_type} ->
+              diff = difference(type, neg_type)
+
+              empty_rec?(env, diff, seen) or
+                map_line_empty_rec?(env, tag, Map.put(fields, key, diff), negs, seen)
+
+            %{} ->
+              cond do
+                neg_tag == :open ->
+                  true
+
+                neg_tag == :closed and not is_optional_static(type) ->
+                  throw(:closed)
+
+                true ->
+                  diff = difference(type, neg_atom_default)
+
+                  empty_rec?(env, diff, seen) or
+                    map_line_empty_rec?(env, tag, Map.put(fields, key, diff), negs, seen)
+              end
+          end
+        end)
+    else
+      map_line_empty_rec?(env, tag, fields, negs, seen)
+    end
+  catch
+    :closed -> map_line_empty_rec?(env, tag, fields, negs, seen)
+  end
+
   defp map_pop_key(tag, fields, key) do
     case :maps.take(key, fields) do
       {value, fields} -> {value, %{map: map_new(tag, fields)}}
@@ -4051,6 +4581,148 @@ defmodule Module.Types.Descr do
          (neg_tag == :open or tuple_line_empty?(:open, tuple_fill(elements, m + 1), negs)))
   end
 
+  # Recursive versions of tuple emptiness checking (with env and seen set)
+  # Returns {env, boolean} to properly thread the environment through.
+
+  defp tuple_empty_rec?(env, bdd, seen) do
+    dnf = bdd_to_dnf(bdd)
+
+    Enum.reduce_while(dnf, {env, true}, fn {pos, negs}, {env, _} ->
+      case non_empty_tuple_literals_intersection_rec(env, pos, seen) do
+        :empty ->
+          {:cont, {env, true}}
+
+        {tag, fields} ->
+          {env, empty?} = tuple_line_empty_rec?(env, tag, fields, negs, seen)
+          if empty?, do: {:cont, {env, true}}, else: {:halt, {env, false}}
+      end
+    end)
+  end
+
+  # Non-empty tuple literals intersection with recursive type support
+  # Checks if any element contains a recursion variable that makes it empty
+  defp non_empty_tuple_literals_intersection_rec(env, tuples, seen) do
+    try do
+      result =
+        Enum.reduce(tuples, {:open, []}, fn {next_tag, next_elements}, {tag, elements} ->
+          case tuple_literal_intersection(tag, elements, next_tag, next_elements) do
+            :empty -> throw(:empty)
+            next -> next
+          end
+        end)
+
+      # Check if any element in the result is empty due to recursive types
+      case result do
+        :empty ->
+          :empty
+
+        {tag, elements} ->
+          if Enum.any?(elements, fn elem -> empty_rec?(env, elem, seen) end) do
+            :empty
+          else
+            {tag, elements}
+          end
+      end
+    catch
+      :empty -> :empty
+    end
+  end
+
+  defp tuple_line_empty_rec?(env, _, _, [], _seen), do: {env, false}
+  defp tuple_line_empty_rec?(env, _, _, [{:open, []} | _], _seen), do: {env, true}
+  defp tuple_line_empty_rec?(env, :open, _pos, [{:closed, _}], _seen), do: {env, false}
+
+  defp tuple_line_empty_rec?(env, tag, elements, [{neg_tag, neg_elements} | negs], seen) do
+    n = length(elements)
+    m = length(neg_elements)
+
+    if (tag == :closed and n < m) or (neg_tag == :closed and n > m) do
+      tuple_line_empty_rec?(env, tag, elements, negs, seen)
+    else
+      {env, elems_empty?} =
+        tuple_elements_empty_rec?(env, [], tag, elements, neg_elements, negs, seen)
+
+      if elems_empty? do
+        {env, arity_empty?} =
+          tuple_empty_arity_rec?(env, n, m, tag, elements, neg_tag, negs, seen)
+
+        {env, arity_empty?}
+      else
+        {env, false}
+      end
+    end
+  end
+
+  defp tuple_elements_empty_rec?(env, _, _, _, [], _, _seen), do: {env, true}
+
+  defp tuple_elements_empty_rec?(
+         env,
+         acc_meet,
+         tag,
+         elements,
+         [neg_type | neg_elements],
+         negs,
+         seen
+       ) do
+    {ty, elements} = List.pop_at(elements, 0, term())
+    # Create nodes for the difference and intersection, threading env through
+    {env, diff} = difference_rec(env, ty, neg_type)
+    {env, meet} = intersection_rec(env, ty, neg_type)
+
+    # Check first branch: diff is empty OR tuple_line_empty with diff
+    diff_empty? = empty_rec?(env, diff, seen)
+
+    {env, first_branch} =
+      if diff_empty? do
+        {env, true}
+      else
+        tuple_line_empty_rec?(env, tag, Enum.reverse(acc_meet, [diff | elements]), negs, seen)
+      end
+
+    if first_branch do
+      # Check second branch: meet is empty OR recurse with meet
+      meet_empty? = empty_rec?(env, meet, seen)
+
+      if meet_empty? do
+        {env, true}
+      else
+        tuple_elements_empty_rec?(
+          env,
+          [meet | acc_meet],
+          tag,
+          elements,
+          neg_elements,
+          negs,
+          seen
+        )
+      end
+    else
+      {env, false}
+    end
+  end
+
+  defp tuple_empty_arity_rec?(env, n, m, tag, elements, neg_tag, negs, seen) do
+    if tag == :closed do
+      {env, true}
+    else
+      {env, all_empty?} =
+        Enum.reduce_while(n..(m - 1)//1, {env, true}, fn i, {env, _} ->
+          {env, empty?} = tuple_line_empty_rec?(env, :closed, tuple_fill(elements, i), negs, seen)
+          if empty?, do: {:cont, {env, true}}, else: {:halt, {env, false}}
+        end)
+
+      if all_empty? do
+        if neg_tag == :open do
+          {env, true}
+        else
+          tuple_line_empty_rec?(env, :open, tuple_fill(elements, m + 1), negs, seen)
+        end
+      else
+        {env, false}
+      end
+    end
+  end
+
   defp tuple_eliminate_negations(tag, elements, negs) do
     Enum.reduce(negs, [{tag, elements}], fn {neg_tag, neg_elements}, acc ->
       Enum.flat_map(acc, fn {tag, elements} ->
@@ -4179,22 +4851,27 @@ defmodule Module.Types.Descr do
   defp tuple_union(bdd1, bdd2), do: bdd_union(bdd1, bdd2)
 
   defp maybe_optimize_tuple_union({tag1, pos1} = tuple1, {tag2, pos2} = tuple2) do
-    case tuple_union_optimization_strategy(tag1, pos1, tag2, pos2) do
-      :all_equal ->
-        tuple1
+    # Skip optimization if any element is a rec_var - keep tuples separate in BDD
+    if Enum.any?(pos1, &is_rec_var?/1) or Enum.any?(pos2, &is_rec_var?/1) do
+      nil
+    else
+      case tuple_union_optimization_strategy(tag1, pos1, tag2, pos2) do
+        :all_equal ->
+          tuple1
 
-      {:one_index_difference, index, v1, v2} ->
-        new_pos = List.replace_at(pos1, index, union(v1, v2))
-        {tag1, new_pos}
+        {:one_index_difference, index, v1, v2} ->
+          new_pos = List.replace_at(pos1, index, union(v1, v2))
+          {tag1, new_pos}
 
-      :left_subtype_of_right ->
-        tuple2
+        :left_subtype_of_right ->
+          tuple2
 
-      :right_subtype_of_left ->
-        tuple1
+        :right_subtype_of_left ->
+          tuple1
 
-      nil ->
-        nil
+        nil ->
+          nil
+      end
     end
   end
 

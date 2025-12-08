@@ -2899,4 +2899,370 @@ defmodule Module.Types.DescrTest do
       assert has_rec_var?(unfolded)
     end
   end
+
+  describe "recursive type emptiness and subtyping" do
+    # These tests verify emptiness and subtyping for recursive types.
+    # According to the paper "Implementing Set-Theoretic Types", recursive types
+    # require special handling: when checking emptiness, if we encounter a type
+    # we've already seen during traversal, we consider that branch empty.
+
+    test "purely recursive type is empty (μX.X)" do
+      # X = X (a type that equals itself with no base case)
+      # This should be considered empty because there's no way to construct a value
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+      # X is defined as just itself (no base case)
+      # We can't directly define X = X, but we can define X = {X} which is similar
+      # A tuple containing only a recursive reference with no base case
+      x_def = %{tuple: {:closed, [x]}}
+      env = def_rec_var(env, :X, x_def)
+
+      # This type should be empty because you can never construct a finite value
+      # The type is μX.{X} - infinitely nested tuples
+      assert empty?(env, rec_var(:X))
+    end
+
+    test "recursive type with base case is not empty (μX.(int | {int, X}))" do
+      # X = integer() | {integer(), X}
+      # This is NOT empty because integer() provides a base case
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+      x_def = union(integer(), %{tuple: {:closed, [integer(), x]}})
+      env = def_rec_var(env, :X, x_def)
+
+      # This should NOT be empty - integers are valid values of this type
+      refute empty?(env, rec_var(:X))
+    end
+
+    test "recursive list type is not empty (μX.([] | [int | X]))" do
+      # IntList = [] | [integer() | IntList]
+      # This represents lists of integers - not empty
+      env = %{}
+      {env, int_list} = new_rec_var(env, :IntList)
+
+      # Empty list is the base case
+      list_with_var = %{list: {integer(), int_list}}
+      list_def = union(empty_list(), list_with_var)
+      env = def_rec_var(env, :IntList, list_def)
+
+      refute empty?(env, rec_var(:IntList))
+    end
+
+    test "deeply nested recursive type without base case is empty" do
+      # X = {{X}}
+      # Infinitely nested without base case - should be empty
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+      inner_tuple = %{tuple: {:closed, [x]}}
+      x_def = %{tuple: {:closed, [inner_tuple]}}
+      env = def_rec_var(env, :X, x_def)
+
+      assert empty?(env, rec_var(:X))
+    end
+
+    test "mutually recursive types - one empty, one not" do
+      # Even = :zero | {:succ, Odd}
+      # Odd = {:succ, Even}
+      # Both should be non-empty because Even has base case :zero
+      env = %{}
+      {env, even} = new_rec_var(env, :Even)
+      {env, odd} = new_rec_var(env, :Odd)
+
+      even_tuple = %{tuple: {:closed, [atom([:succ]), odd]}}
+      even_def = union(atom([:zero]), even_tuple)
+
+      odd_def = %{tuple: {:closed, [atom([:succ]), even]}}
+
+      env = def_rec_var(env, :Even, even_def)
+      env = def_rec_var(env, :Odd, odd_def)
+
+      # Even has base case :zero, so not empty
+      refute empty?(env, rec_var(:Even))
+      # Odd depends on Even which has a base case, so not empty
+      refute empty?(env, rec_var(:Odd))
+
+      # Compute the actual union of Even and Odd
+      # union_rec returns {updated_env, rec_var} per the paper's node(def) pattern
+      {env, even_odd_union} = union_rec(env, even, odd)
+
+      # The union should not be empty (Even has base case :zero)
+      refute empty?(env, even_odd_union)
+
+      # Both Even and Odd should be subtypes of (Even ∪ Odd)
+      assert subtype?(env, rec_var(:Even), even_odd_union)
+      assert subtype?(env, rec_var(:Odd), even_odd_union)
+    end
+
+    test "mutually recursive types without base case are empty" do
+      # A = {B}
+      # B = {A}
+      # Neither has a base case, so both should be empty
+      env = %{}
+      {env, a} = new_rec_var(env, :A)
+      {env, b} = new_rec_var(env, :B)
+
+      a_def = %{tuple: {:closed, [b]}}
+      b_def = %{tuple: {:closed, [a]}}
+
+      env = def_rec_var(env, :A, a_def)
+      env = def_rec_var(env, :B, b_def)
+
+      assert empty?(env, rec_var(:A))
+      assert empty?(env, rec_var(:B))
+    end
+
+    test "subtype? with recursive types - same structure" do
+      # IntList = [] | [integer() | IntList]
+      # IntList should be subtype of itself
+      env = %{}
+      {env, int_list} = new_rec_var(env, :IntList)
+      list_def = union(empty_list(), %{list: {integer(), int_list}})
+      env = def_rec_var(env, :IntList, list_def)
+
+      assert subtype?(env, rec_var(:IntList), rec_var(:IntList))
+    end
+
+    # NOTE: These tests require more sophisticated subtyping handling for
+    # comparing different recursive types. The paper describes this using
+    # coinductive reasoning. For now, they are marked as skip.
+    @tag :skip
+    test "subtype? - integer list is subtype of term list" do
+      # IntList = [] | [integer() | IntList]
+      # TermList = [] | [term() | TermList]
+      # IntList should be subtype of TermList
+      env = %{}
+      {env, int_list} = new_rec_var(env, :IntList)
+      {env, term_list} = new_rec_var(env, :TermList)
+
+      int_list_def = union(empty_list(), %{list: {integer(), int_list}})
+      term_list_def = union(empty_list(), %{list: {term(), term_list}})
+
+      env = def_rec_var(env, :IntList, int_list_def)
+      env = def_rec_var(env, :TermList, term_list_def)
+
+      assert subtype?(env, rec_var(:IntList), rec_var(:TermList))
+      refute subtype?(env, rec_var(:TermList), rec_var(:IntList))
+    end
+
+    @tag :skip
+    test "subtype? - recursive tuple type" do
+      # X = int | {int, X}
+      # Y = number | {number, Y}
+      # X should be subtype of Y
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+      {env, y} = new_rec_var(env, :Y)
+
+      x_def = union(integer(), %{tuple: {:closed, [integer(), x]}})
+      y_def = union(number(), %{tuple: {:closed, [number(), y]}})
+
+      env = def_rec_var(env, :X, x_def)
+      env = def_rec_var(env, :Y, y_def)
+
+      assert subtype?(env, rec_var(:X), rec_var(:Y))
+      refute subtype?(env, rec_var(:Y), rec_var(:X))
+    end
+
+    test "empty type with recursive reference" do
+      # X = integer() and X  -- intersection with itself is fine
+      # But X = none() and {X} would be problematic
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+
+      # X is intersection of none() and a tuple containing X
+      # Since none() is empty, the whole thing should be empty
+      x_def = intersection(none(), %{tuple: {:closed, [x]}})
+      env = def_rec_var(env, :X, x_def)
+
+      assert empty?(env, rec_var(:X))
+    end
+
+    test "recursive type in map values is not empty" do
+      # Expr = int | %{op: atom, left: Expr, right: Expr}
+      # This should not be empty because int is a base case
+      env = %{}
+      {env, expr} = new_rec_var(env, :Expr)
+
+      expr_map = %{map: {:closed, %{op: atom(), left: expr, right: expr}}}
+      expr_def = union(integer(), expr_map)
+      env = def_rec_var(env, :Expr, expr_def)
+
+      refute empty?(env, rec_var(:Expr))
+    end
+
+    test "recursive function type is not empty" do
+      # F = (int -> F)
+      # A function that returns itself - should not be empty
+      # Functions are never empty in set-theoretic types unless explicitly constrained
+      env = %{}
+      {env, f} = new_rec_var(env, :F)
+
+      # Build function type: integer() -> F
+      f_def = %{fun: {:union, %{1 => {[integer()], f}}}}
+      env = def_rec_var(env, :F, f_def)
+
+      # Function types are generally not empty
+      refute empty?(env, rec_var(:F))
+
+      # (integer() -> none()) is a subtype of F (contravariance of the return type)
+      assert subtype?(env, fun([integer()], none()), rec_var(:F))
+
+      # and also, (integer() -> (integer() -> none()))
+      assert subtype?(env, fun([integer()], fun([integer()], none())), rec_var(:F))
+    end
+
+    test "the recursive tree type" do
+      env = %{}
+      {env, tree} = new_rec_var(env, :Tree)
+
+      tree_def = union(integer(), union(empty_list(), %{list: {tree, empty_list()}}))
+      env = def_rec_var(env, :Tree, tree_def)
+
+      tree_type = rec_var(:Tree)
+
+      refute empty?(env, tree_type)
+
+      assert subtype?(env, non_empty_list(integer()), tree_type)
+      assert subtype?(env, integer(), tree_type)
+      assert subtype?(env, list(integer()), tree_type)
+      refute subtype?(env, list(atom()), tree_type)
+      assert subtype?(env, list(integer() |> union(list(integer()))), tree_type)
+    end
+
+    test "difference with recursive types" do
+      # X = int | {int, X}
+      # X \ int should still contain {int, X}
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+      x_def = union(integer(), %{tuple: {:closed, [integer(), x]}})
+      env = def_rec_var(env, :X, x_def)
+
+      x_type = rec_var(:X)
+      # difference_rec returns {updated_env, rec_var} per the paper's node(def) pattern
+      {env, diff} = difference_rec(env, x_type, integer())
+
+      # The difference should not be empty - it still has tuples
+      refute empty?(env, diff)
+      assert subtype?(env, tuple([integer(), integer()]), diff)
+      assert subtype?(env, tuple([integer(), tuple([integer(), integer()])]), diff)
+      refute subtype?(env, tuple([atom(), integer()]), diff)
+    end
+
+    test "intersection of recursive types" do
+      # X = int | {int, X}
+      # X ∩ tuple() should be {int, X}
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+      x_def = union(integer(), %{tuple: {:closed, [integer(), x]}})
+      env = def_rec_var(env, :X, x_def)
+
+      x_type = rec_var(:X)
+      # intersection_rec returns {updated_env, rec_var} per the paper's node(def) pattern
+      {env, inter} = intersection_rec(env, x_type, tuple())
+
+      # The intersection should not be empty - it contains {int, X}
+      refute empty?(env, inter)
+    end
+
+    test "union of recursive and non-recursive types" do
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+      # Empty type (no base case)
+      x_def = %{tuple: {:closed, [x]}}
+      env = def_rec_var(env, :X, x_def)
+
+      x_type = rec_var(:X)
+      # union_rec returns {updated_env, rec_var} per the paper's node(def) pattern
+      {env, combined} = union_rec(env, x_type, integer())
+
+      # Even though X is empty, union with integer() should not be empty
+      refute empty?(env, combined)
+    end
+
+    test "recursive type equal to itself" do
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+      x_def = union(integer(), %{tuple: {:closed, [integer(), x]}})
+      env = def_rec_var(env, :X, x_def)
+
+      # A recursive type should be equal to itself
+      assert equal?(env, rec_var(:X), rec_var(:X))
+    end
+
+    test "tree type is not empty" do
+      # Tree = :leaf | {:node, term(), Tree, Tree}
+      env = %{}
+      {env, tree} = new_rec_var(env, :Tree)
+      node_tuple = %{tuple: {:closed, [atom([:node]), term(), tree, tree]}}
+      tree_def = union(atom([:leaf]), node_tuple)
+      env = def_rec_var(env, :Tree, tree_def)
+
+      refute empty?(env, rec_var(:Tree))
+    end
+
+    test "node/2 creates a fresh rec_var with unique ID" do
+      # The node/2 function corresponds to node(def) from the paper
+      # It creates a new rec_var with a fresh unique ID (using make_ref)
+      env = %{}
+
+      # Create two nodes with the same definition
+      {env, node1} = node(env, integer())
+      {env, node2} = node(env, integer())
+
+      # They should have different IDs (refs)
+      {:rec_var, id1} = node1
+      {:rec_var, id2} = node2
+      assert id1 != id2
+      assert is_reference(id1)
+      assert is_reference(id2)
+
+      # Both should resolve to integer()
+      assert unfold_rec(env, node1) == integer()
+      assert unfold_rec(env, node2) == integer()
+
+      # Both should not be empty
+      refute empty?(env, node1)
+      refute empty?(env, node2)
+    end
+
+    test "negation_rec with recursive types" do
+      # X = int | {int, X}
+      # ¬X should be term() \ X
+      env = %{}
+      {env, x} = new_rec_var(env, :X)
+      x_def = union(integer(), %{tuple: {:closed, [integer(), x]}})
+      env = def_rec_var(env, :X, x_def)
+
+      x_type = rec_var(:X)
+      # negation_rec returns {updated_env, rec_var} per the paper's ¬N = node(¬(N.def))
+      {env, neg_x} = negation_rec(env, x_type)
+
+      # The negation should not be empty - it contains everything except int and {int, X}
+      refute empty?(env, neg_x)
+
+      # X and ¬X should be disjoint
+      {env, inter} = intersection_rec(env, x_type, neg_x)
+      assert empty?(env, inter)
+
+      # X ∪ ¬X should be term
+      {env, union_result} = union_rec(env, x_type, neg_x)
+      # The union of a type and its negation equals term
+      assert subtype?(env, term(), union_result)
+    end
+
+    test "chained operations preserve node structure" do
+      # Test that multiple operations maintain proper env threading
+      env = %{}
+      {env, _x} = new_rec_var(env, :X)
+      x_def = union(integer(), atom())
+      env = def_rec_var(env, :X, x_def)
+
+      # Chain: (X ∪ float()) ∩ number()
+      {env, step1} = union_rec(env, rec_var(:X), float())
+      {env, step2} = intersection_rec(env, step1, number())
+
+      # Should contain integer() and float() (from X ∪ float() ∩ number())
+      refute empty?(env, step2)
+    end
+  end
 end
