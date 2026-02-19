@@ -110,6 +110,22 @@ defmodule Module.Types.Descr do
   @boolset :sets.from_list([true, false], version: 2)
   def boolean(), do: %{atom: {:union, @boolset}}
 
+  ## Nodes
+
+  # @spec descr() :: map() | :term
+  # @spec state() :: map()
+  # @spec node() :: {id :: reference(), state :: map(), generator :: (state() -> node())}
+  def make_node(state, generator), do: {make_ref(), state, generator}
+
+  # @spec to_node(descr :: descr() | node()) :: node()
+  def to_node(:term), do: make_node(:term, fn _state -> :term end)
+  def to_node(descr = %{}), do: make_node(%{}, fn _state -> descr end)
+  def to_node(node) when is_tuple(node), do: node
+
+  def to_descr(:term), do: :term
+  def to_descr(descr = %{}), do: descr
+  def to_descr({_id, state, generator}), do: generator.(state)
+
   @doc """
   Gets the upper bound of a gradual type.
 
@@ -1942,8 +1958,11 @@ defmodule Module.Types.Descr do
   #
   # none() types can be given and, while stored, it means the list type is empty.
   defp list_descr(list_type, last_type, empty?) do
-    {list_dynamic?, list_type} = list_pop_dynamic(list_type)
-    {last_dynamic?, last_type} = list_pop_dynamic(last_type)
+    list_type_descr = to_descr(list_type)
+    last_type_descr = to_descr(last_type)
+
+    {list_dynamic?, list_type} = list_pop_dynamic(list_type_descr)
+    {last_dynamic?, last_type} = list_pop_dynamic(last_type_descr)
 
     list_part =
       if last_type == :term do
@@ -2612,8 +2631,10 @@ defmodule Module.Types.Descr do
   end
 
   defp map_descr_pairs([{key, value} | rest], fields, domain, dynamic?) do
+    value_descr = to_descr(value)
+
     {value, dynamic?} =
-      case :maps.take(:dynamic, value) do
+      case :maps.take(:dynamic, value_descr) do
         :error -> {value, dynamic?}
         {dynamic, _static} -> {dynamic, true}
       end
@@ -4311,18 +4332,20 @@ defmodule Module.Types.Descr do
   end
 
   defp tuple_descr([value | rest], acc, dynamic?) do
+    value_descr = to_descr(value)
+
     # Check if the static part is empty
     static_empty? =
-      case value do
+      case value_descr do
         # Has dynamic component, check static separately
         %{dynamic: _} -> false
-        _ -> empty?(value)
+        _ -> empty?(value_descr)
       end
 
     if static_empty? do
       :empty
     else
-      case :maps.take(:dynamic, value) do
+      case :maps.take(:dynamic, value_descr) do
         :error ->
           tuple_descr(rest, [value | acc], dynamic?)
 
