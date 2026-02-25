@@ -1214,6 +1214,24 @@ defmodule Module.Types.DescrTest do
         )
 
       assert fun_apply(fun3, [atom([:ok])]) == {:ok, dynamic(none())}
+
+      # Testing the special case of uplifiting both the function and argument
+      # when the function is purely dynamic
+      tau =
+        intersection(
+          dynamic_fun([integer()], integer()),
+          dynamic_fun([boolean()], boolean())
+        )
+
+      tau_p = dynamic(integer())
+      # dynamic(int->int and bool->bool) applied to dynamic(int)
+      assert fun_apply(tau, [tau_p]) == {:ok, dynamic(integer())}
+
+      tau_p2 = dynamic(union(integer(), float()))
+      assert fun_apply(tau, [tau_p2]) == {:ok, dynamic()}
+
+      assert fun_apply(dynamic(), [integer()]) == {:ok, dynamic()}
+      assert fun_apply(union(integer(), dynamic()), [integer()]) == :badfun
     end
 
     test "static and dynamic" do
@@ -1255,6 +1273,132 @@ defmodule Module.Types.DescrTest do
                dynamic_fun([integer()], binary())
              )
              |> fun_apply([integer()]) == {:ok, dynamic(binary())}
+    end
+  end
+
+  describe "function domain" do
+    defp dynamic_fun_domain(args, return), do: dynamic(fun(args, return))
+
+    test "non funs" do
+      assert fun_domain(term()) == :badfun
+      assert fun_domain(integer()) == :badfun
+      assert fun_domain(union(integer(), fun([integer()], atom()))) == :badfun
+    end
+
+    test "static" do
+      assert {:ok, domain} = fun_domain(fun([integer()], atom()))
+      assert equal?(domain, tuple([integer()]))
+
+      assert {:ok, domain} = fun_domain(fun([union(integer(), float())], atom()))
+      assert equal?(domain, tuple([union(integer(), float())]))
+
+      assert {:ok, domain} = fun_domain(fun([integer(), atom()], binary()))
+      assert equal?(domain, tuple([integer(), atom()]))
+
+      fun0 = intersection(fun([integer()], atom()), fun([float()], binary()))
+      assert {:ok, domain} = fun_domain(fun0)
+      assert subtype?(tuple([integer()]), domain)
+      assert subtype?(tuple([float()]), domain)
+    end
+
+    test "arity errors" do
+      # fun() is {:negation, %{}}, no specific arity
+      assert {:badarity, _} = fun_domain(fun())
+
+      # Multiple arities
+      assert {:badarity, _} =
+               fun_domain(union(fun([integer()], integer()), fun([integer(), atom()], boolean())))
+    end
+
+    # gdom(?) = dom(term ∧ funTop) ∨ ? ∧ dom(none)
+    #         = dom(funTop) ∨ ? = none ∨ ? = ?
+    test "gdom(?) = ? (Example 6.1)" do
+      assert fun_domain(dynamic()) == {:ok, dynamic()}
+    end
+
+    # gdom(? ∧ (int → int)) = dom((int → int) ∧ funTop) ∨ ? ∧ dom(none)
+    #                        = dom(int → int) ∨ ? = int ∨ ?
+    test "gdom(? ∧ (int → int)) = int ∨ ? (Example 6.1)" do
+      assert {:ok, domain} = fun_domain(dynamic_fun_domain([integer()], integer()))
+      assert subtype?(tuple([integer()]), domain)
+      assert match?(%{dynamic: _}, domain)
+    end
+
+    # gdom((bool→bool) ∨ (? ∧ (int → int)))
+    #   = dom((bool→bool) ∨ (int → int)) ∨ ? ∧ dom(bool → bool)
+    #   = none ∨ (? ∧ bool) = ? ∧ bool
+    test "gdom((bool→bool) ∨ (? ∧ (int → int))) = ? ∧ bool (Example 6.1)" do
+      fun_type =
+        union(
+          fun([boolean()], boolean()),
+          dynamic_fun_domain([integer()], integer())
+        )
+
+      assert {:ok, domain} = fun_domain(fun_type)
+      assert subtype?(dynamic(tuple([boolean()])), domain)
+      assert match?(%{dynamic: _}, domain)
+    end
+
+    test "dynamic" do
+      assert fun_domain(dynamic()) == {:ok, dynamic()}
+
+      assert {:ok, domain} = fun_domain(dynamic_fun_domain([integer()], atom()))
+      assert subtype?(tuple([integer()]), domain)
+
+      fun0 =
+        intersection(
+          dynamic_fun_domain([integer()], atom()),
+          dynamic_fun_domain([float()], binary())
+        )
+
+      assert {:ok, domain} = fun_domain(fun0)
+      assert subtype?(tuple([integer()]), domain)
+      assert subtype?(tuple([float()]), domain)
+
+      # Arity mismatches
+      assert {:badarity, _} =
+               fun_domain(
+                 union(
+                   dynamic_fun_domain([integer()], integer()),
+                   dynamic_fun_domain([integer(), atom()], boolean())
+                 )
+               )
+    end
+
+    test "static and dynamic" do
+      # (atom -> int) \/ (dyn /\ (int -> binary))
+      # dom = 0 \/ (dyn /\ atom)
+      fun_mix =
+        union(
+          fun([atom()], integer()),
+          dynamic_fun_domain([integer()], binary())
+        )
+
+      assert {:ok, domain} = fun_domain(fun_mix)
+      assert subtype?(dynamic(tuple([atom()])), domain)
+      assert match?(%{dynamic: _}, domain)
+    end
+
+    # Applying (? ∨ int) → bool to ? ∧ float.
+    # The domain is gdom((? ∨ int) → bool) = dom(int → bool) ∨ ? ∧ dom(term → bool)
+    #                                       = int ∨ ? ∧ term = int ∨ ?
+    # The domain check ? ∧ float ≤ int ∨ ? succeeds.
+    # The static application (term → bool) ◦ float = bool is well-defined.
+    # The dynamic application (int → bool) ◦ float is not well-defined (float ⊄ int),
+    # so it returns term, wrapped in ?: ? ∧ term = ?.
+    # Result: bool ∨ ?.
+    test "applying (? ∨ int) → bool to ? ∧ float yields bool ∨ ?" do
+      fun_type = fun([union(dynamic(), integer())], boolean())
+      arg = dynamic(float())
+
+      # Domain check passes
+      assert {:ok, domain} = fun_domain(fun_type)
+      assert subtype?(tuple([arg]), domain)
+
+      # Application yields bool ∨ ?
+      assert {:ok, result} = fun_apply(fun_type, [arg])
+      assert equal?(union(boolean(), dynamic()), result)
+      assert match?(%{dynamic: _}, result)
     end
   end
 

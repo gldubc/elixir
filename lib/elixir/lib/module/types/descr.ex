@@ -1294,7 +1294,7 @@ defmodule Module.Types.Descr do
 
   ## Function application formula for dynamic types
 
-      τ◦τ′ = (lower_bound(τ) ◦ upper_bound(τ′)) ∨ (dynamic(upper_bound(τ) ◦ lower_bound(τ′)))
+      τ◦τ′ = (lower_bound(τ) ◦ upper_bound(τ′)) ∨ (dynamic(upper_bound(τ) ◦ upper_bound(τ′)))
 
   Where:
 
@@ -1302,7 +1302,8 @@ defmodule Module.Types.Descr do
   - τ′ are the arguments
   - ◦ is function application
 
-  For more details, see Definition 6.15 in https://vlanvin.fr/papers/thesis.pdf
+  For more details, see Section 13.2 of
+  https://gldubc.github.io/assets/duboc-phd-thesis-typing-elixir.pdf
 
   ## Examples
 
@@ -1340,11 +1341,81 @@ defmodule Module.Types.Descr do
     end
   end
 
+  def fun_domain(:term), do: :badfun
+
+  def fun_domain(fun) do
+    case :maps.take(:dynamic, fun) do
+      :error ->
+        if fun_only?(fun) do
+          with {:ok, arity} <- fun_single_arity(fun) do
+            case fun_normalize(fun, arity) do
+              {:ok, domain, _arrows} -> {:ok, domain}
+              error -> error
+            end
+          end
+        else
+          :badfun
+        end
+
+      {fun_dynamic, fun_static} ->
+        cond do
+          fun_static == %{} and dynamic_fun_top?(fun_dynamic) ->
+            {:ok, dynamic()}
+
+          fun_only?(fun_static) ->
+            with {:ok, arity} <- fun_single_arity_pair(fun_static, fun_dynamic) do
+              case fun_normalize_both(fun_static, fun_dynamic, arity) do
+                {:ok, domain, _static_arrows, _dynamic_arrows} -> {:ok, domain}
+                error -> error
+              end
+            end
+
+          true ->
+            :badfun
+        end
+    end
+  end
+
+  defp fun_single_arity(%{fun: {:union, bdds}}) do
+    case :maps.keys(bdds) do
+      [arity] -> {:ok, arity}
+      arities -> {:badarity, arities}
+    end
+  end
+
+  defp fun_single_arity(_), do: {:badarity, []}
+
+  defp fun_single_arity_pair(fun_static, fun_dynamic) do
+    arities = Enum.uniq(fun_arities_of(fun_static) ++ fun_arities_of(fun_dynamic))
+
+    case arities do
+      [arity] -> {:ok, arity}
+      [] -> {:badarity, []}
+      arities -> {:badarity, arities}
+    end
+  end
+
+  defp fun_arities_of(%{fun: {:union, bdds}}), do: :maps.keys(bdds)
+  defp fun_arities_of(_), do: []
+
   defp fun_only?(descr), do: empty?(Map.delete(descr, :fun))
   defp dynamic_fun_top?(:term), do: true
   defp dynamic_fun_top?(%{fun: {:negation, map}}), do: map == %{}
   defp dynamic_fun_top?(_), do: false
 
+  # Gradual function application algorithm.
+  #
+  # 1. Domain check against the extended gradual domain (see fun_normalize_both/3):
+  #    - If the argument is a subtype of the domain, proceed to application.
+  #    - Otherwise, in gradual mode, check compatibility (see below). If
+  #      compatible, the application may succeed at runtime but we have no
+  #      static information about the result, so we return dynamic().
+  #    - Otherwise, error.
+  # 2. Compute the application result in three cases:
+  #    - Fully static: apply static arrows to the arguments directly.
+  #    - Purely dynamic function (no static arrows): wrap the result of
+  #      applying dynamic arrows to upper-bounded arguments in dynamic().
+  #    - Mixed: union the static result with the dynamic-wrapped dynamic result.
   defp fun_apply_with_strategy(fun_static, fun_dynamic, arguments) do
     args_domain = args_to_domain(arguments)
     static? = fun_dynamic == nil and Enum.all?(arguments, fn arg -> not gradual?(arg) end)
@@ -1356,6 +1427,18 @@ defmodule Module.Types.Descr do
         Enum.any?(arguments, &empty?/1) ->
           {:badarg, domain_to_flat_args(domain, arity)}
 
+        # The domain here is the extended gradual domain computed by
+        # fun_normalize_both/3. If the argument does not satisfy it, we
+        # check compatibility before rejecting.
+        #
+        # Compatibility has two cases to avoid a degenerate situation.
+        # If the argument is purely dynamic (e.g. dynamic() and bool()),
+        # its static part (lower bound) is none(). We do not want
+        # none() <= domain to trivially succeed, because that would mean
+        # "a diverging argument is accepted by any function", which is true but
+        # useless. So when the static part is empty, we instead check
+        # that the upper bound overlaps with the domain. When the static
+        # part is non-empty, we check it is a subtype of the domain.
         not subtype?(args_domain, domain) ->
           if static? or not compatible?(args_domain, domain),
             do: {:badarg, domain_to_flat_args(domain, arity)},
@@ -1365,12 +1448,27 @@ defmodule Module.Types.Descr do
           {:ok, fun_apply_static(arguments, static_arrows)}
 
         static_arrows == [] ->
-          # TODO: We need to validate this within the theory
+          # Purely dynamic function (e.g. dynamic() and (integer() -> integer())).
+          # There are no static arrows, so the general mixed formula simplifies:
+          # applying none() to anything yields none(), so the static branch
+          # vanishes and only the dynamic branch remains.
+          # The result is wrapped in dynamic(), so it is safe regardless of argument precision.
+          # If the upper-bounded arguments escape the domain, fun_apply_static returns term(),
+          # and dynamic(term()) = dynamic(), which brings back to the compatible case.
           arguments = Enum.map(arguments, &upper_bound/1)
           {:ok, dynamic(fun_apply_static(arguments, dynamic_arrows))}
 
         true ->
-          # For dynamic cases, combine static and dynamic results
+          # Mixed case: union of the static and dynamic results.
+          # static_arrows (lower materialization) contain only arrows that are
+          # guaranteed to exist at runtime. Static guarantees about the result
+          # come from these alone.
+          # dynamic_arrows (upper materialization) include dynamically uncertain
+          # arrows, so their result is wrapped in dynamic().
+          # We use upper_bound on the arguments for both branches. This is sound
+          # because the dynamic branch wraps its result in dynamic().
+          # It is more strict and informative than using lower_bound in the static part,
+          # as it amounts to assuming the worst case of using the statically present arrows.
           arguments = Enum.map(arguments, &upper_bound/1)
 
           {:ok,
@@ -1382,6 +1480,28 @@ defmodule Module.Types.Descr do
     end
   end
 
+  # Normalizes a gradual function type into static and dynamic arrow
+  # components, and computes the extended gradual domain.
+  #
+  # The extended gradual domain is:
+  #   dom(upper_bound and fun_top) or dynamic(dom(lower_bound))
+  #
+  # fun_normalize/3 implicitly performs the "and fun_top" projection
+  # because it only looks at the :fun component, so any non-function
+  # parts of the type are automatically discarded.
+  #
+  # Fallback cases:
+  #
+  # - Static normalization succeeds but dynamic fails (e.g. the dynamic
+  #   part has no arrows at the given arity): we discard the dynamic
+  #   arrows and use the static arrows for both branches, degenerating
+  #   to the fully static case. This is sound because ignoring unusable
+  #   dynamic information cannot produce incorrect static results.
+  #
+  # - Static normalization fails (:badfun): only the dynamic arrows
+  #   contribute. The domain becomes dom(upper_bound) or dynamic(),
+  #   reflecting that the lower bound has no function type at this arity.
+  #   The application proceeds as purely dynamic (static_arrows = []).
   defp fun_normalize_both(fun_static, fun_dynamic, arity) do
     case fun_normalize(fun_static, arity) do
       {:ok, static_domain, static_arrows} when fun_dynamic == nil ->
@@ -1394,6 +1514,7 @@ defmodule Module.Types.Descr do
             {:ok, domain, static_arrows, dynamic_arrows}
 
           _ ->
+            # Dynamic normalization failed: fall back to static-only.
             {:ok, static_domain, static_arrows, static_arrows}
         end
 
@@ -1456,6 +1577,13 @@ defmodule Module.Types.Descr do
 
   defp fun_normalize(%{}, _arity), do: :badfun
 
+  # Applies a static function type to arguments by reducing over the
+  # function's DNF clauses. Each clause is an intersection of arrows,
+  # processed by aux_apply/4 with rets_reached initialized to term().
+  #
+  # When the arguments are within the domain, this is the standard
+  # application operator. When the arguments escape the domain, the
+  # result is term() (see aux_apply/4).
   defp fun_apply_static(arguments, arrows) do
     type_args = args_to_domain(arguments)
 
@@ -1476,50 +1604,40 @@ defmodule Module.Types.Descr do
     end)
   end
 
-  # Helper function for function application that handles the application of
-  # function arrows to input types.
-
-  # This function recursively processes a list of function arrows (an intersection),
-  # applying each arrow to the input type and accumulating the result.
-
-  # ## Parameters
-
-  # - result: The accumulated result type so far
-  # - input: The input type being applied to the function
-  # - rets_reached: The intersection of return types reached so far
-  # - arrow_intersections: The list of function arrows to process
-
-  # For more details, see Definitions 2.20 or 6.11 in https://vlanvin.fr/papers/thesis.pdf
+  # Applies one clause (an intersection of arrows) to an input type.
+  # Processes arrows one at a time, splitting into two recursive branches.
+  #
+  # Domain escape: if the input is not covered by the union of all the
+  # arrow domains in the clause, the result is term(). This is because
+  # rets_reached starts at term() and is only refined (intersected) when
+  # an arrow's domain covers the input, which is check by dom_subtract.
+  # Along a path where no arrow covers the input, rets_reached stays
+  # term() and gets unioned into the result at the base case. Since
+  # term() is maximal, the overall result for that clause is term().
   defp aux_apply(result, _input, rets_reached, []) do
     if subtype?(rets_reached, result), do: result, else: union(result, rets_reached)
   end
 
   defp aux_apply(result, input, returns_reached, [{args, ret} | arrow_intersections]) do
-    # Calculate the part of the input not covered by this arrow's domain
     dom_subtract = difference(input, args_to_domain(args))
-
-    # Refine the return type by intersecting with this arrow's return type
     ret_refine = intersection(returns_reached, ret)
 
-    # Phase 1: Domain partitioning
-    # If the input is not fully covered by the arrow's domain, then the result type should be
-    # _augmented_ with the outputs obtained by applying the remaining arrows to the non-covered
-    # parts of the domain.
-    #
-    # e.g. (integer()->atom()) and (float()->pid()) when applied to number() should unite
-    # both atoms and pids in the result.
+    # Phase 1 -- the part of the input not covered by this arrow's domain.
+    # We recurse on that escaped part with rets_reached unchanged (this
+    # arrow does not contribute its return type for inputs outside its domain).
+    # e.g. (integer()->atom()) and (float()->pid()) applied to number():
+    # the float part escapes integer()'s domain, so both return types
+    # contribute to the result.
     result =
       if empty?(dom_subtract),
         do: result,
         else: aux_apply(result, dom_subtract, returns_reached, arrow_intersections)
 
-    # 2. Return type refinement
-    # The result type is also refined (intersected) in the sense that, if several arrows match
-    # the same part of the input, then the result type is an intersection of the return types of
-    # those arrows.
-
-    # e.g. (integer()->atom()) and (integer()->pid()) when applied to integer()
-    # should result in (atom() ∩ pid()), which is none().
+    # Phase 2 -- the part of the input covered by this arrow's domain.
+    # We recurse on the full input with rets_reached refined (intersected)
+    # by this arrow's return type.
+    # e.g. (integer()->atom()) and (integer()->pid()) applied to integer()
+    # yields atom() and pid() (i.e., none()).
     aux_apply(result, input, ret_refine, arrow_intersections)
   end
 
