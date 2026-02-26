@@ -1,0 +1,14 @@
+## Notes for Block B - Graham 26/02/2026
+
+- B.1 - Update internal representations to hold nodes rather than descrs: I'm actually not sure if anything has to be done here. In an object-oriented language, we would be changing field types, however here where we simply process structures as given, it should only matter whether the functions doing such processing can handle such field shapes. This describes exactly the next task.
+- B.2 - Update type constructors to accept nodes as arguments: This was already done as part of Block A. For example, in tuple_descr/3, the first line is `value_descr = to_descr(value)`, to handle the case where `value` is a node, rather than a descr as it previously would have been.
+- B.3 - Update kind-level set operations to handle nodes in sub-type positions:
+    * **Question:** Looking at the implemention of `union` for example, we see `union/3` which calls code such as `tuple_union/2`. I don't think I understand how, for example, a union between a tuple and an atom is created.
+    * Maybe answer: the key isn't necessarily saying "this is a union between two maps" for example; it is rather saying "the first things is a map, give me the union between that and whatever the second value is on the BDD level"
+    * Hint for myself to properly interpret code: a descr is a collection of disjoint BDDs. So each value of a key in a descr is a BDD in itself.
+
+- Overall, it appears what needs to be ensured **is that BDDs can contain nodes, and not just descrs**.
+    * Doing a quick skim of the set operations, it doesn't seem like any of them explicitly assume sub-components of a BDD to be a descr rather than a node. They end up returning sub-components directly, or re-passing sub-components to other BDD operations with the same characteristics. I believe that overall this is a good sign.
+    * I think the easiest way to see what actually has to be changed is to create some test cases. Or at least, create some literal creation/literal operation cases that can be run in the REPL to demonstrate whatever the behavior at the time (during incremental code changes) is.
+    * With all that being said, it feels like right now, normal operations *should* more or less work with stateless (non-recursive) nodes. And if they don't, it's jsut a matter of tracking down trivial signature changes. I'm really not sure Block B has that much work as long as functions are dynamic. It seems to me like the next real work is Block C where nodes will have to be unrolled one level before having the Block B set operations applied to them.
+    * I might hypothesize that the LLM is imagining the evaluation of set operations in a recursive expression manner because that's what it looks like for a programming language implementation for example, but for better or worse, within this set-theoretic types framework we somehow end up doing fewer "unwrap"-recursive calls than expected. That, or I'm just totally missing them.
