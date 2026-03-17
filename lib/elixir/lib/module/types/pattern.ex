@@ -15,6 +15,11 @@ defmodule Module.Types.Pattern do
     {[], none()}
   end
 
+  @doc false
+  def add_previous(types, previous) do
+    concat_previous(types, previous)
+  end
+
   defp empty_previous?({[], _}), do: true
   defp empty_previous?({[_ | _], _}), do: false
 

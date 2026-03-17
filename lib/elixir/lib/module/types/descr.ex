@@ -185,6 +185,23 @@ defmodule Module.Types.Descr do
     end)
   end
 
+  @doc false
+  def asserted_function_clauses(%{fun: {:union, bdds}} = descr, arity) do
+    if Map.drop(descr, [:fun]) == %{} do
+      case :maps.take(arity, bdds) do
+        {bdd, rest} when map_size(rest) == 0 ->
+          asserted_fun_bdd_clauses(fun_bdd_to_pos_dnf(arity, bdd))
+
+        _ ->
+          :error
+      end
+    else
+      :error
+    end
+  end
+
+  def asserted_function_clauses(_, _arity), do: :error
+
   @doc """
   Creates a function from overlapping function clauses.
   """
@@ -241,6 +258,30 @@ defmodule Module.Types.Descr do
 
   defp pivot_overlapping_clause(domain, return, union, []) do
     [{domain, return, union}]
+  end
+
+  defp asserted_fun_bdd_clauses(clauses) do
+    Enum.reduce_while(clauses, {:ok, []}, fn
+      arrows, {:ok, acc} ->
+        {:cont, add_asserted_fun_bdd_arrows(arrows, acc)}
+
+      _intersection, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, asserted_clauses} -> {:ok, Enum.reverse(asserted_clauses)}
+      :error -> :error
+    end
+  end
+
+  defp add_asserted_fun_bdd_arrows(arrows, acc) do
+    Enum.reduce_while(arrows, {:ok, acc}, fn
+      {args, return}, {:ok, acc} ->
+        {:cont, {:ok, [{args, return} | acc]}}
+
+      _other, _acc ->
+        {:halt, :error}
+    end)
   end
 
   @doc """

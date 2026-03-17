@@ -800,6 +800,10 @@ defmodule Module do
       deprecated: %{
         doc: "Provides the deprecation reason for a function."
       },
+      assert_type: %{
+        doc:
+          "Provides an asserted type for the next function or macro head as a {args, return} tuple or function descriptor."
+      },
       moduledoc: %{
         doc: "Provides documentation for the current module."
       },
@@ -1860,6 +1864,7 @@ defmodule Module do
 
     {line, doc} = get_doc_info(set, env)
     compile_doc(set, context, line, kind, name, arity, args, body, doc, doc_meta, env, impl)
+    compile_assert_type(set, bag, name, arity)
 
     :ok
   end
@@ -1953,6 +1958,32 @@ defmodule Module do
 
   defp deprecated_reason(name, arity, reason),
     do: {:deprecated, {{name, arity}, reason}}
+
+  defp compile_assert_type(set, bag, name, arity) do
+    case :ets.take(set, :assert_type) do
+      [{:assert_type, {args_types, return_type} = assert_type, _, _}]
+      when is_list(args_types) and length(args_types) == arity ->
+        _ = return_type
+        index = next_assert_type_index(set)
+        :ets.insert(bag, {{:assert_type, {name, arity}}, {index, assert_type}})
+
+      [{:assert_type, {args_types, _return_type}, _, _}] when is_list(args_types) ->
+        raise ArgumentError,
+              "@assert_type for #{name}/#{arity} expects #{arity} argument types, got: #{length(args_types)}"
+
+      [{:assert_type, assert_type, _, _}] ->
+        index = next_assert_type_index(set)
+        :ets.insert(bag, {{:assert_type, {name, arity}}, {index, assert_type}})
+
+      [] ->
+        :ok
+    end
+  end
+
+  defp next_assert_type_index(set) do
+    :ets.insert_new(set, {{:assert_type, :counter}, 0})
+    :ets.update_counter(set, {:assert_type, :counter}, 1)
+  end
 
   defp compile_impl(set, bag, context, name, env, kind, arity, defaults) do
     %{line: line, file: file} = env
@@ -2183,7 +2214,7 @@ defmodule Module do
   # Optimize some attributes by avoiding writing to the attributes key
   # in the bag table since we handle them internally.
   defp put_attribute(module, key, value, warn_line, traces, set, _bag)
-       when key in [:doc, :typedoc, :moduledoc, :impl, :deprecated] do
+       when key in [:doc, :typedoc, :moduledoc, :impl, :deprecated, :assert_type] do
     value = preprocess_attribute(key, value)
 
     try do
@@ -2297,6 +2328,28 @@ defmodule Module do
     raise ArgumentError,
           "@deprecated is a built-in module attribute that annotates a definition as deprecated. " <>
             "It should be a string with the reason for the deprecation, got: #{inspect(value)}"
+  end
+
+  defp preprocess_attribute(:assert_type, value) do
+    case value do
+      {args_types, return_type}
+      when is_list(args_types) and (is_map(return_type) or return_type == :term) ->
+        if Enum.all?(args_types, &(is_map(&1) or &1 == :term)) do
+          value
+        else
+          raise ArgumentError,
+                "@assert_type expects all argument types to be internal type descriptors, got: #{inspect(value)}"
+        end
+
+      %{fun: _} ->
+        value
+
+      _ ->
+        raise ArgumentError,
+              "@assert_type is a built-in module attribute that annotates the next function head. " <>
+                "It should evaluate to a {args, return} tuple of internal type descriptors " <>
+                "or a function descriptor such as fun([integer()], integer()), got: #{inspect(value)}"
+    end
   end
 
   defp preprocess_attribute(:file, value) do

@@ -100,11 +100,12 @@ fetch_definitions(Module, E) ->
   fetch_definition(Entries, E, Module, Set, Bag, []).
 
 fetch_definition([Tuple | T], E, Module, Set, Bag, All) ->
-  [{_, Kind, Meta, _, _, {MaxDefaults, _, _}}] = ets:lookup(Set, {def, Tuple}),
+  [{_, Kind, Meta0, _, _, {MaxDefaults, _, _}}] = ets:lookup(Set, {def, Tuple}),
+  Meta = add_assert_types_to_meta(Tuple, add_defaults_to_meta(MaxDefaults, Meta0), Bag),
 
   try ets:lookup_element(Bag, {clauses, Tuple}, 2) of
     Clauses ->
-      NewAll = [{Tuple, Kind, add_defaults_to_meta(MaxDefaults, Meta), Clauses} | All],
+      NewAll = [{Tuple, Kind, Meta, Clauses} | All],
       fetch_definition(T, E, Module, Set, Bag, NewAll)
   catch
     error:badarg ->
@@ -117,6 +118,17 @@ fetch_definition([], _E, _Module, _Set, _Bag, All) ->
 
 add_defaults_to_meta(0, Meta) -> Meta;
 add_defaults_to_meta(Defaults, Meta) -> [{defaults, Defaults} | Meta].
+
+add_assert_types_to_meta(Tuple, Meta, Bag) ->
+  try ets:lookup_element(Bag, {assert_type, Tuple}, 2) of
+    AssertTypes ->
+      Ordered =
+        lists:map(fun({_Index, AssertType}) -> AssertType end, lists:keysort(1, AssertTypes)),
+      [{assert_type, Ordered} | Meta]
+  catch
+    error:badarg ->
+      Meta
+  end.
 
 %% Section for storing definitions
 

@@ -260,7 +260,7 @@ defmodule Module.Types do
               else
                 {[clause_index | used_indexes], unused_indexes}
               end
-            end)
+          end)
 
           unused_indexes = Enum.uniq(unused_indexes) -- used_indexes
 
@@ -328,15 +328,27 @@ defmodule Module.Types do
 
   defp local_handler(mode, fun_arity, kind, meta, clauses, expected, stack, context) do
     {fun, _arity} = fun_arity
+    asserted_clauses = asserted_clauses(meta, fun_arity, clauses)
+    asserted? = asserted_clauses != []
     stack = stack |> fresh_stack(mode, fun_arity) |> with_file_meta(meta)
     base_info = {:def, kind, fun, expected}
 
     case clauses do
-      [{meta, args, [], {:super, _, [_ | _]} = body}] ->
+      [{meta, args, [], {:super, _, [_ | _]} = body}] when not asserted? ->
         default_local_handler(meta, args, body, base_info, kind, fun, expected, stack, context)
 
       _ ->
-        infer_local_handler(clauses, base_info, kind, fun, expected, stack, context)
+        infer_local_handler(
+          clauses,
+          base_info,
+          kind,
+          fun,
+          expected,
+          asserted_clauses,
+          asserted?,
+          stack,
+          context
+        )
     end
   end
 
@@ -395,42 +407,93 @@ defmodule Module.Types do
     end
   end
 
-  defp infer_local_handler(clauses, base_info, kind, fun, expected, stack, context) do
+  defp infer_local_handler(
+         clauses,
+         base_info,
+         kind,
+         fun,
+         expected,
+         asserted_clauses,
+         asserted?,
+         stack,
+         context
+       ) do
     {_, _, _, domain, mapping, clauses_types, clauses_context} =
       Enum.reduce(clauses, {0, 0, Pattern.init_previous(), [], [], [], context}, fn
         {meta, args, guards, body},
         {index, total, previous, domain, mapping, inferred, acc_context} ->
           fresh_context = fresh_context(acc_context)
-          info = {base_info, args, guards}
 
           try do
-            {trees, _precise?, head_no_previous_args_types, previous, head_context} =
-              Pattern.of_head(args, guards, expected, previous, info, meta, stack, fresh_context)
-
-            {return_type, context} =
-              Expr.of_expr(body, Descr.term(), body, stack, head_context)
-
-            args_types = Pattern.of_domain(trees, stack, context)
-
-            {type_index, inferred} =
-              add_inferred(inferred, args_types, return_type, total - 1, [])
-
-            domain =
-              case domain do
-                [] ->
-                  args_types
-
-                _ ->
-                  head_args_types = Pattern.of_domain(trees, stack, head_context)
-                  compute_domain(args_types, head_args_types, head_no_previous_args_types, domain)
+            clause_assertions =
+              case asserted_clauses do
+                [] -> [{expected, Descr.term()}]
+                _ -> Enum.fetch!(asserted_clauses, index)
               end
 
-            if type_index == -1 do
-              mapping = [{index, total} | mapping]
-              {index + 1, total + 1, previous, domain, mapping, inferred, context}
+            if asserted? do
+              {clause_types, previous, context} =
+                asserted_clause_types(
+                  clause_assertions,
+                  args,
+                  guards,
+                  body,
+                  kind,
+                  fun,
+                  meta,
+                  previous,
+                  stack,
+                  fresh_context
+                )
+
+              count = length(clause_types)
+              type_indexes = Enum.to_list(total..(total + count - 1))
+              mapping = Enum.reduce(type_indexes, mapping, &[{index, &1} | &2])
+
+              {index + 1, total + count, previous, domain, mapping,
+               Enum.reverse(clause_types, inferred),
+               context}
             else
-              mapping = [{index, type_index} | mapping]
-              {index + 1, total, previous, domain, mapping, inferred, context}
+              [{expected_args, _expected_return}] = clause_assertions
+              info = {base_info, args, guards}
+
+              {trees, _precise?, head_no_previous_args_types, previous, head_context} =
+                Pattern.of_head(
+                  args,
+                  guards,
+                  expected_args,
+                  previous,
+                  info,
+                  meta,
+                  stack,
+                  fresh_context
+                )
+
+              {return_type, context} =
+                Expr.of_expr(body, Descr.term(), body, stack, head_context)
+
+              args_types = Pattern.of_domain(trees, stack, context)
+
+              {type_index, inferred} =
+                add_inferred(inferred, args_types, return_type, total - 1, [])
+
+              domain =
+                case domain do
+                  [] ->
+                    args_types
+
+                  _ ->
+                    head_args_types = Pattern.of_domain(trees, stack, head_context)
+                    compute_domain(args_types, head_args_types, head_no_previous_args_types, domain)
+                end
+
+              if type_index == -1 do
+                mapping = [{index, total} | mapping]
+                {index + 1, total + 1, previous, domain, mapping, inferred, context}
+              else
+                mapping = [{index, type_index} | mapping]
+                {index + 1, total, previous, domain, mapping, inferred, context}
+              end
             end
           rescue
             e ->
@@ -440,11 +503,25 @@ defmodule Module.Types do
 
     domain =
       case clauses_types do
-        [_] -> nil
-        _ -> domain
+        [_] ->
+          nil
+
+        _ when asserted? ->
+          clauses_types
+          |> Enum.map(fn {args, _} -> args end)
+          |> Enum.zip_with(fn types -> Enum.reduce(types, &Descr.union/2) end)
+
+        _ ->
+          domain
       end
 
-    inferred = {:infer, domain, Enum.reverse(clauses_types)}
+    inferred =
+      if asserted? do
+        {:strong, domain, Enum.reverse(clauses_types)}
+      else
+        {:infer, domain, Enum.reverse(clauses_types)}
+      end
+
     {inferred, mapping, restore_context(clauses_context, context)}
   end
 
@@ -502,6 +579,147 @@ defmodule Module.Types do
   end
 
   defp compute_domain([], [], [], []), do: []
+
+  defp asserted_clauses(meta, {fun, arity}, clauses) do
+    case Keyword.get(meta, :assert_type, []) do
+      [] ->
+        []
+
+      assert_types when is_list(assert_types) and length(assert_types) == length(clauses) ->
+        Enum.map(assert_types, &normalize_asserted_clause(&1, fun, arity))
+
+      assert_types when is_list(assert_types) ->
+        raise ArgumentError,
+              "@assert_type for #{fun}/#{arity} must be declared once per clause or omitted entirely"
+    end
+  end
+
+  defp normalize_asserted_clause(
+         {args_types, return_type},
+         _fun,
+         arity
+       )
+       when is_list(args_types) and length(args_types) == arity do
+    [{args_types, return_type}]
+  end
+
+  defp normalize_asserted_clause({args_types, _return_type}, fun, arity)
+       when is_list(args_types) do
+    raise ArgumentError,
+          "@assert_type for #{fun}/#{arity} expects #{arity} argument types, got: #{length(args_types)}"
+  end
+
+  defp normalize_asserted_clause(%{fun: _} = assert_type, fun, arity) do
+    case Descr.asserted_function_clauses(assert_type, arity) do
+      {:ok, clauses} ->
+        clauses
+
+      :error ->
+        raise ArgumentError,
+              "@assert_type for #{fun}/#{arity} must evaluate to {args, return} or " <>
+                "a function descriptor such as fun([integer()], integer()) or " <>
+                "fun([integer()], integer()) |> intersection(fun([boolean()], boolean())), " <>
+                "got: #{inspect(assert_type)}"
+    end
+  end
+
+  defp normalize_asserted_clause(other, fun, arity) do
+    raise ArgumentError,
+          "@assert_type for #{fun}/#{arity} must evaluate to {args, return} or " <>
+            "a function descriptor such as fun([integer()], integer()) or " <>
+            "fun([integer()], integer()) |> intersection(fun([boolean()], boolean())), " <>
+            "got: #{inspect(other)}"
+  end
+
+  defp asserted_clause_types(
+         clause_assertions,
+         args,
+         guards,
+         body,
+         kind,
+         fun,
+         meta,
+         previous,
+         stack,
+         context
+       ) do
+    {clause_types, domains, context} =
+      Enum.reduce(clause_assertions, {[], [], context}, fn {expected_args, expected_return}, acc ->
+        asserted_clause_type(
+          expected_args,
+          expected_return,
+          args,
+          guards,
+          body,
+          kind,
+          fun,
+          meta,
+          previous,
+          stack,
+          context,
+          acc
+        )
+      end)
+
+    previous = Enum.reduce(domains, previous, &Pattern.add_previous(&1, &2))
+    {Enum.reverse(clause_types), previous, context}
+  end
+
+  defp asserted_clause_type(
+         expected_args,
+         expected_return,
+         args,
+         guards,
+         body,
+         kind,
+         fun,
+         meta,
+         previous,
+         stack,
+         _context,
+         {clause_types, domains, context}
+       ) do
+    context = fresh_context(context)
+    info = {{:def, kind, fun, expected_args}, args, guards}
+
+    {trees, _precise?, _head_no_previous_args_types, _previous, context} =
+      Pattern.of_head(
+        args,
+        guards,
+        expected_args,
+        previous,
+        info,
+        meta,
+        stack,
+        context
+      )
+
+    {return_type, context} =
+      Expr.of_expr(body, expected_return, body, stack, context)
+
+    {_return_type, context} =
+      validate_asserted_return(
+        return_type,
+        expected_return,
+        body,
+        meta,
+        stack,
+        context
+      )
+
+    domain = Pattern.of_domain(trees, stack, context)
+
+    {[{expected_args, expected_return} | clause_types], [domain | domains], context}
+  end
+
+  defp validate_asserted_return(actual, expected, body, meta, stack, context) do
+    if Descr.compatible?(actual, expected) do
+      {actual, context}
+    else
+      warning = {:badassertreturn, expected, actual, body, context}
+      {Helpers.error_type(), Helpers.error(__MODULE__, warning, meta, stack, context)}
+    end
+  end
 
   # We check for term equality of types as an optimization
   # to reduce the amount of check we do at runtime.
@@ -679,6 +897,31 @@ defmodule Module.Types do
     %{
       message:
         "this clause of #{kind} #{fun}/#{arity} is never used (or it will always fail/warn when invoked)"
+    }
+  end
+
+  def format_diagnostic({:badassertreturn, expected, actual, body, context}) do
+    traces = Helpers.collect_traces(body, context)
+
+    %{
+      details: %{typing_traces: traces},
+      message:
+        IO.iodata_to_binary([
+          """
+          asserted return type does not match the function body:
+
+              #{Helpers.expr_to_string(body) |> Helpers.indent(4)}
+
+          the inferred return type is:
+
+              #{Descr.to_quoted_string(actual) |> Helpers.indent(4)}
+
+          but @assert_type expects:
+
+              #{Descr.to_quoted_string(expected) |> Helpers.indent(4)}
+          """,
+          Helpers.format_traces(traces)
+        ])
     }
   end
 
