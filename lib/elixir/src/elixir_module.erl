@@ -558,7 +558,7 @@ warn_unused_attributes(DataSet, DataBag, PersistedAttrs, E) ->
   StoredAttrs = bag_lookup_element(DataBag, warn_attributes, 2),
   %% This is the same list as in Module.put_attribute
   %% without moduledoc which are never warned on.
-  Attrs = [doc, typedoc, impl, deprecated, assert_type | StoredAttrs -- PersistedAttrs],
+  Attrs = [doc, typedoc, impl, deprecated, assert_type, assert_type_form | StoredAttrs -- PersistedAttrs],
   Query = [{{Attr, '_', '$1', '_'}, [{is_integer, '$1'}], [[Attr, '$1']]} || Attr <- Attrs],
   [elixir_errors:file_warn([{line, Line}], E, ?MODULE, {unused_attribute, Key})
    || [Key, Line] <- ets:select(DataSet, Query)].

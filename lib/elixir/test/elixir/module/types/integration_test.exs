@@ -281,6 +281,53 @@ defmodule Module.Types.IntegrationTest do
                )
     end
 
+    test "writes exports with asserted type-form functions" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @assert_type_form (integer() -> integer()) and (boolean() -> boolean())
+          def typed(x), do: x
+        end
+        """
+      }
+
+      modules = compile_modules(files)
+      exports = read_chunk(modules[A]).exports |> Map.new()
+
+      assert %{{:typed, 1} => %{sig: {:strong, [domain], clauses}}} = exports
+      assert equal?(domain, union(integer(), boolean()))
+
+      assert Enum.sort_by(clauses, fn {args, return} ->
+               {to_quoted_string(hd(args)), to_quoted_string(return)}
+             end) ==
+               Enum.sort_by(
+                 [
+                   {[integer()], integer()},
+                   {[boolean()], boolean()}
+                 ],
+                 fn {args, return} ->
+                   {to_quoted_string(hd(args)), to_quoted_string(return)}
+                 end
+               )
+    end
+
+    test "writes exports with asserted type-form negations" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @assert_type_form ((not atom()) -> integer())
+          def typed(_x), do: 1
+        end
+        """
+      }
+
+      modules = compile_modules(files)
+      exports = read_chunk(modules[A]).exports |> Map.new()
+
+      assert %{{:typed, 1} => %{sig: {:strong, nil, clauses}}} = exports
+      assert clauses == [{[negation(atom())], integer()}]
+    end
+
     test "writes exports for implementations" do
       files = %{
         "pi.ex" => """
@@ -502,6 +549,26 @@ defmodule Module.Types.IntegrationTest do
         "but @assert_type expects:",
         "the inferred return type is:",
         "integer()"
+      ]
+
+      assert_warnings(files, warnings)
+    end
+
+    test "asserted type-form returns" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @assert_type_form (integer() -> integer()) and (atom() -> float())
+          def typed(x), do: x
+        end
+        """
+      }
+
+      warnings = [
+        "asserted return type does not match the function body",
+        "but @assert_type expects:",
+        "float()",
+        "atom()"
       ]
 
       assert_warnings(files, warnings)

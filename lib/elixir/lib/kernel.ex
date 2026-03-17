@@ -3737,6 +3737,19 @@ defmodule Kernel do
                   @foo :value
               """
 
+      is_list(args) and assert_type_form?(name) ->
+        line = __CALLER__.line
+
+        quote do
+          Module.__put_attribute__(
+            __MODULE__,
+            unquote(name),
+            unquote(Macro.escape(hd(args), unquote: true)),
+            unquote(line),
+            []
+          )
+        end
+
       # Typespecs attributes are currently special cased by the compiler
       is_list(args) and typespec?(name) ->
         case bootstrapped?(Kernel.Typespec) do
@@ -3916,6 +3929,9 @@ defmodule Kernel do
   defp typespec?(:callback), do: true
   defp typespec?(:macrocallback), do: true
   defp typespec?(_), do: false
+
+  defp assert_type_form?(:assert_type_form), do: true
+  defp assert_type_form?(_), do: false
 
   @doc """
   Returns the binding for the given context as a keyword list.

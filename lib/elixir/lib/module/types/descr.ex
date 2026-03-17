@@ -121,6 +121,75 @@ defmodule Module.Types.Descr do
   @boolset :sets.from_list([true, false], version: 2)
   def boolean(), do: %{atom: {:union, @boolset}}
 
+  @doc false
+  def assert_type_form(ast) do
+    assert_type_form(ast, :root)
+  end
+
+  defp assert_type_form({:__block__, _, [expr]}, _context) do
+    assert_type_form(expr, :root)
+  end
+
+  defp assert_type_form({:and, _, [left, right]}, _context) do
+    intersection(assert_type_form(left, :root), assert_type_form(right, :root))
+  end
+
+  defp assert_type_form({:or, _, [left, right]}, _context) do
+    union(assert_type_form(left, :root), assert_type_form(right, :root))
+  end
+
+  defp assert_type_form({:not, _, [expr]}, _context) do
+    negation(assert_type_form(expr, :root))
+  end
+
+  defp assert_type_form([{:->, _, [args, return]}], _context) when is_list(args) do
+    fun(Enum.map(args, &assert_type_form(&1, :root)), assert_type_form(return, :root))
+  end
+
+  defp assert_type_form([], _context), do: empty_list()
+
+  defp assert_type_form([type], _context) do
+    list(assert_type_form(type, :root))
+  end
+
+  defp assert_type_form([type, {:..., _, _}], _context) do
+    non_empty_list(assert_type_form(type, :root))
+  end
+
+  defp assert_type_form({:{}, _, elements}, _context) when is_list(elements) do
+    tuple(Enum.map(elements, &assert_type_form(&1, :root)))
+  end
+
+  defp assert_type_form(atom, _context) when is_atom(atom) do
+    atom([atom])
+  end
+
+  defp assert_type_form({name, _, args}, _context) when is_atom(name) and is_list(args) do
+    args = Enum.map(args, &assert_type_form(&1, :root))
+
+    if function_exported?(__MODULE__, name, length(args)) do
+      apply(__MODULE__, name, args)
+    else
+      raise ArgumentError,
+            "expected a supported type-form constructor, got: #{Macro.to_string({name, [], args})}"
+    end
+  end
+
+  defp assert_type_form({name, _, context} = var, _where) when is_atom(name) and is_atom(context) do
+    raise ArgumentError,
+          "type variables are not supported in @assert_type_form, got: #{Macro.to_string(var)}"
+  end
+
+  defp assert_type_form(other, _context) when is_integer(other) or is_float(other) or is_binary(other) do
+    raise ArgumentError,
+          "literal #{inspect(other)} is not supported in @assert_type_form; use a descriptor constructor instead"
+  end
+
+  defp assert_type_form(other, _context) do
+    raise ArgumentError,
+          "expected a type-form expression such as (integer() -> integer()) and (boolean() -> boolean()), got: #{Macro.to_string(other)}"
+  end
+
   @doc """
   Gets the upper bound of a gradual type.
 

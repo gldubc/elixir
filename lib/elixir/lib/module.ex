@@ -804,6 +804,10 @@ defmodule Module do
         doc:
           "Provides an asserted type for the next function or macro head as a {args, return} tuple or function descriptor."
       },
+      assert_type_form: %{
+        doc:
+          "Provides an asserted type for the next function or macro head using type-form syntax such as (integer() -> integer()) and (boolean() -> boolean())."
+      },
       moduledoc: %{
         doc: "Provides documentation for the current module."
       },
@@ -1864,7 +1868,7 @@ defmodule Module do
 
     {line, doc} = get_doc_info(set, env)
     compile_doc(set, context, line, kind, name, arity, args, body, doc, doc_meta, env, impl)
-    compile_assert_type(set, bag, name, arity)
+    compile_assert_types(set, bag, name, arity)
 
     :ok
   end
@@ -1959,24 +1963,49 @@ defmodule Module do
   defp deprecated_reason(name, arity, reason),
     do: {:deprecated, {{name, arity}, reason}}
 
-  defp compile_assert_type(set, bag, name, arity) do
-    case :ets.take(set, :assert_type) do
-      [{:assert_type, {args_types, return_type} = assert_type, _, _}]
+  defp compile_assert_types(set, bag, name, arity) do
+    assert_type = take_assert_type(set, :assert_type)
+    assert_type_form = take_assert_type(set, :assert_type_form)
+
+    case {assert_type, assert_type_form} do
+      {[assert_type], []} ->
+        store_assert_type(set, bag, name, arity, :assert_type, assert_type)
+
+      {[], [assert_type_form]} ->
+        store_assert_type(set, bag, name, arity, :assert_type_form, assert_type_form)
+
+      {[], []} ->
+        :ok
+
+      {[assert_type], [assert_type_form]} ->
+        raise ArgumentError,
+              "cannot use both @assert_type and @assert_type_form for #{name}/#{arity}: " <>
+                "got #{inspect(assert_type)} and #{inspect(assert_type_form)}"
+    end
+  end
+
+  defp take_assert_type(set, key) do
+    case :ets.take(set, key) do
+      [] -> []
+      [{^key, value, _, _}] -> [value]
+    end
+  end
+
+  defp store_assert_type(set, bag, name, arity, source_attr, value) do
+    case value do
+      {args_types, return_type} = assert_type
       when is_list(args_types) and length(args_types) == arity ->
         _ = return_type
         index = next_assert_type_index(set)
         :ets.insert(bag, {{:assert_type, {name, arity}}, {index, assert_type}})
 
-      [{:assert_type, {args_types, _return_type}, _, _}] when is_list(args_types) ->
+      {args_types, _return_type} when is_list(args_types) ->
         raise ArgumentError,
-              "@assert_type for #{name}/#{arity} expects #{arity} argument types, got: #{length(args_types)}"
+              "@#{source_attr} for #{name}/#{arity} expects #{arity} argument types, got: #{length(args_types)}"
 
-      [{:assert_type, assert_type, _, _}] ->
+      assert_type ->
         index = next_assert_type_index(set)
         :ets.insert(bag, {{:assert_type, {name, arity}}, {index, assert_type}})
-
-      [] ->
-        :ok
     end
   end
 
@@ -2214,7 +2243,7 @@ defmodule Module do
   # Optimize some attributes by avoiding writing to the attributes key
   # in the bag table since we handle them internally.
   defp put_attribute(module, key, value, warn_line, traces, set, _bag)
-       when key in [:doc, :typedoc, :moduledoc, :impl, :deprecated, :assert_type] do
+      when key in [:doc, :typedoc, :moduledoc, :impl, :deprecated, :assert_type, :assert_type_form] do
     value = preprocess_attribute(key, value)
 
     try do
@@ -2349,6 +2378,17 @@ defmodule Module do
               "@assert_type is a built-in module attribute that annotates the next function head. " <>
                 "It should evaluate to a {args, return} tuple of internal type descriptors " <>
                 "or a function descriptor such as fun([integer()], integer()), got: #{inspect(value)}"
+    end
+  end
+
+  defp preprocess_attribute(:assert_type_form, value) do
+    try do
+      Module.Types.Descr.assert_type_form(value)
+    rescue
+      e in ArgumentError ->
+        raise ArgumentError,
+              "@assert_type_form is a built-in module attribute that annotates the next function head. " <>
+                Exception.message(e)
     end
   end
 
