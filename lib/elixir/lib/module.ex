@@ -2243,7 +2243,15 @@ defmodule Module do
   # Optimize some attributes by avoiding writing to the attributes key
   # in the bag table since we handle them internally.
   defp put_attribute(module, key, value, warn_line, traces, set, _bag)
-      when key in [:doc, :typedoc, :moduledoc, :impl, :deprecated, :assert_type, :assert_type_form] do
+       when key in [
+              :doc,
+              :typedoc,
+              :moduledoc,
+              :impl,
+              :deprecated,
+              :assert_type,
+              :assert_type_form
+            ] do
     value = preprocess_attribute(key, value)
 
     try do

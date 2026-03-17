@@ -644,7 +644,8 @@ defmodule Module.Types do
          context
        ) do
     {clause_types, domains, context} =
-      Enum.reduce(clause_assertions, {[], [], context}, fn {expected_args, expected_return}, acc ->
+      Enum.reduce(clause_assertions, {[], [], context}, fn {expected_args, expected_return},
+                                                           acc ->
         asserted_clause_type(
           expected_args,
           expected_return,

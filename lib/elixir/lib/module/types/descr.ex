@@ -175,12 +175,14 @@ defmodule Module.Types.Descr do
     end
   end
 
-  defp assert_type_form({name, _, context} = var, _where) when is_atom(name) and is_atom(context) do
+  defp assert_type_form({name, _, context} = var, _where)
+       when is_atom(name) and is_atom(context) do
     raise ArgumentError,
           "type variables are not supported in @assert_type_form, got: #{Macro.to_string(var)}"
   end
 
-  defp assert_type_form(other, _context) when is_integer(other) or is_float(other) or is_binary(other) do
+  defp assert_type_form(other, _context)
+       when is_integer(other) or is_float(other) or is_binary(other) do
     raise ArgumentError,
           "literal #{inspect(other)} is not supported in @assert_type_form; use a descriptor constructor instead"
   end
