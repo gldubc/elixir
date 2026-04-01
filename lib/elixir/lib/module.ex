@@ -2369,6 +2369,9 @@ defmodule Module do
 
   defp preprocess_attribute(:assert_type, value) do
     case value do
+      {:assert_type_clauses, clauses} when is_list(clauses) ->
+        value
+
       {args_types, return_type}
       when is_list(args_types) and (is_map(return_type) or return_type == :term) ->
         if Enum.all?(args_types, &(is_map(&1) or &1 == :term)) do
@@ -2391,7 +2394,10 @@ defmodule Module do
 
   defp preprocess_attribute(:assert_type_form, value) do
     try do
-      Module.Types.Descr.assert_type_form(value)
+      case Module.Types.Descr.assert_type_form_clauses(value) do
+        {:ok, clauses} -> {:assert_type_clauses, clauses}
+        :error -> Module.Types.Descr.assert_type_form(value)
+      end
     rescue
       e in ArgumentError ->
         raise ArgumentError,

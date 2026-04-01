@@ -630,6 +630,11 @@ defmodule Module.Types do
           "@assert_type for #{fun}/#{arity} expects #{arity} argument types, got: #{length(args_types)}"
   end
 
+  defp normalize_asserted_clause({:assert_type_clauses, clauses}, fun, arity)
+       when is_list(clauses) do
+    Enum.flat_map(clauses, &normalize_asserted_clause(&1, fun, arity))
+  end
+
   defp normalize_asserted_clause(%{fun: _} = assert_type, fun, arity) do
     case Descr.asserted_function_clauses(assert_type, arity) do
       {:ok, clauses} ->

@@ -126,6 +126,28 @@ defmodule Module.Types.Descr do
     assert_type_form(ast, :root)
   end
 
+  @doc false
+  def assert_type_form_clauses(ast) do
+    assert_type_form_clauses(ast, :root)
+  end
+
+  defp assert_type_form_clauses({:__block__, _, [expr]}, _context) do
+    assert_type_form_clauses(expr, :root)
+  end
+
+  defp assert_type_form_clauses({:and, _, [left, right]}, _context) do
+    with {:ok, left_clauses} <- assert_type_form_clauses(left, :root),
+         {:ok, right_clauses} <- assert_type_form_clauses(right, :root) do
+      {:ok, left_clauses ++ right_clauses}
+    end
+  end
+
+  defp assert_type_form_clauses([{:->, _, [args, return]}], _context) when is_list(args) do
+    {:ok, [{Enum.map(args, &assert_type_form(&1, :root)), assert_type_form(return, :root)}]}
+  end
+
+  defp assert_type_form_clauses(_other, _context), do: :error
+
   defp assert_type_form({:__block__, _, [expr]}, _context) do
     assert_type_form(expr, :root)
   end

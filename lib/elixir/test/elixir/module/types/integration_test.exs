@@ -362,6 +362,24 @@ defmodule Module.Types.IntegrationTest do
       assert clauses == [{[integer()], integer()}]
     end
 
+    test "writes exports with shared asserted dynamic type-form across multiple clauses" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @assert_type_form (dynamic() -> dynamic())
+          def typed(x) when is_integer(x), do: -x
+          def typed(x) when is_boolean(x), do: not x
+        end
+        """
+      }
+
+      modules = compile_modules(files)
+      exports = read_chunk(modules[A]).exports |> Map.new()
+
+      assert %{{:typed, 1} => %{sig: {:strong, nil, clauses}}} = exports
+      assert clauses == [{[dynamic()], dynamic()}]
+    end
+
     test "writes exports with asserted type-form negations" do
       files = %{
         "a.ex" => """
