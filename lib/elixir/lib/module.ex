@@ -808,6 +808,10 @@ defmodule Module do
         doc:
           "Provides an asserted type for the next function or macro head using type-form syntax such as (integer() -> integer()) and (boolean() -> boolean())."
       },
+      define_type_form: %{
+        doc:
+          "Defines a zero-arity local type alias for later use in @assert_type_form using syntax such as t: (integer() -> float()) or m: %{..., a: pid()}."
+      },
       moduledoc: %{
         doc: "Provides documentation for the current module."
       },
@@ -2242,6 +2246,16 @@ defmodule Module do
 
   # Optimize some attributes by avoiding writing to the attributes key
   # in the bag table since we handle them internally.
+  defp put_attribute(module, :define_type_form, value, _warn_line, _traces, set, _bag) do
+    {name, expanded} = preprocess_attribute(module, :define_type_form, value, set)
+    key = {:define_type_form, name}
+
+    case :ets.insert_new(set, {key, expanded}) do
+      true -> :ok
+      false -> raise ArgumentError, "cannot redefine @define_type_form #{name}"
+    end
+  end
+
   defp put_attribute(module, key, value, warn_line, traces, set, _bag)
        when key in [
               :doc,
@@ -2252,7 +2266,11 @@ defmodule Module do
               :assert_type,
               :assert_type_form
             ] do
-    value = preprocess_attribute(key, value)
+    value =
+      case key do
+        :assert_type_form -> preprocess_attribute(module, key, value, set)
+        _ -> preprocess_attribute(key, value)
+      end
 
     try do
       :ets.lookup_element(set, key, 3)
@@ -2448,6 +2466,48 @@ defmodule Module do
 
   defp preprocess_attribute(_key, value) do
     value
+  end
+
+  defp preprocess_attribute(_module, :assert_type_form, value, set) do
+    aliases = define_type_form_aliases(set)
+    expanded = Module.Types.Descr.expand_type_form(value, aliases)
+    preprocess_attribute(:assert_type_form, expanded)
+  end
+
+  defp preprocess_attribute(_module, :define_type_form, value, set) do
+    aliases = define_type_form_aliases(set)
+
+    case value do
+      [{name, rhs}] when is_atom(name) ->
+        expanded = Module.Types.Descr.expand_type_form(rhs, aliases)
+
+        try do
+          _ =
+            case Module.Types.Descr.assert_type_form_clauses(expanded) do
+              {:ok, _clauses} -> :ok
+              :error -> Module.Types.Descr.assert_type_form(expanded)
+            end
+
+          {name, expanded}
+        rescue
+          e in ArgumentError ->
+            raise ArgumentError,
+                  "@define_type_form is a built-in module attribute for defining local type aliases. " <>
+                    Exception.message(e)
+        end
+
+      _ ->
+        raise ArgumentError,
+              "@define_type_form expects syntax like t: (integer() -> float()) or m: %{..., a: pid()}, got: #{Macro.to_string(value)}"
+    end
+  end
+
+  defp define_type_form_aliases(set) do
+    query = [{{{:define_type_form, :"$1"}, :"$2"}, [], [{{:"$1", :"$2"}}]}]
+
+    for {name, value} <- :ets.select(set, query), into: %{} do
+      {name, value}
+    end
   end
 
   defp function_arity_list?(fun_arities) do

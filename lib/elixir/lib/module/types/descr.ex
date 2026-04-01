@@ -127,6 +127,60 @@ defmodule Module.Types.Descr do
   end
 
   @doc false
+  def expand_type_form(ast, aliases) when is_map(aliases) do
+    expand_type_form(ast, aliases, :root)
+  end
+
+  defp expand_type_form({:__block__, meta, [expr]}, aliases, _context) do
+    {:__block__, meta, [expand_type_form(expr, aliases, :root)]}
+  end
+
+  defp expand_type_form({:%{}, meta, fields}, aliases, _context) when is_list(fields) do
+    fields =
+      Enum.map(fields, fn
+        {:..., _, _} = spread ->
+          spread
+
+        {key, value} when is_atom(key) ->
+          {key, expand_type_form(value, aliases, :root)}
+
+        {:"=>", map_meta, [key, value]} ->
+          {:"=>", map_meta,
+           [expand_type_form(key, aliases, :root), expand_type_form(value, aliases, :root)]}
+
+        other ->
+          other
+      end)
+
+    {:%{}, meta, fields}
+  end
+
+  defp expand_type_form({name, _meta, context} = var, aliases, _where)
+       when is_atom(name) and is_atom(context) do
+    Map.get(aliases, name, var)
+  end
+
+  defp expand_type_form({name, meta, args}, aliases, _context)
+       when is_atom(name) and is_list(args) do
+    cond do
+      function_exported?(__MODULE__, name, length(args)) ->
+        {name, meta, Enum.map(args, &expand_type_form(&1, aliases, :root))}
+
+      args == [] and is_map_key(aliases, name) ->
+        Map.fetch!(aliases, name)
+
+      true ->
+        {name, meta, Enum.map(args, &expand_type_form(&1, aliases, :root))}
+    end
+  end
+
+  defp expand_type_form(list, aliases, _context) when is_list(list) do
+    Enum.map(list, &expand_type_form(&1, aliases, :root))
+  end
+
+  defp expand_type_form(other, _aliases, _context), do: other
+
+  @doc false
   def assert_type_form_clauses(ast) do
     assert_type_form_clauses(ast, :root)
   end
@@ -178,6 +232,27 @@ defmodule Module.Types.Descr do
     non_empty_list(assert_type_form(type, :root))
   end
 
+  defp assert_type_form({:%{}, _meta, fields}, _context) when is_list(fields) do
+    {open?, fields} =
+      case fields do
+        [{:..., _, _} | rest] -> {true, rest}
+        _ -> {false, fields}
+      end
+
+    pairs =
+      Enum.map(fields, fn
+        {key, value} ->
+          key = if is_atom(key), do: key, else: assert_type_form_map_key(key)
+          {key, assert_type_form(value, :root)}
+
+        other ->
+          raise ArgumentError,
+                "expected map fields in @assert_type_form to use atom keys or domain key types, got: #{Macro.to_string(other)}"
+      end)
+
+    if open?, do: open_map(pairs), else: closed_map(pairs)
+  end
+
   defp assert_type_form({:{}, _, elements}, _context) when is_list(elements) do
     tuple(Enum.map(elements, &assert_type_form(&1, :root)))
   end
@@ -212,6 +287,22 @@ defmodule Module.Types.Descr do
   defp assert_type_form(other, _context) do
     raise ArgumentError,
           "expected a type-form expression such as (integer() -> integer()) and (boolean() -> boolean()), got: #{Macro.to_string(other)}"
+  end
+
+  defp assert_type_form_map_key(key) when is_atom(key), do: key
+
+  defp assert_type_form_map_key(other) do
+    domain_keys =
+      other
+      |> assert_type_form(:root)
+      |> to_domain_keys()
+
+    if domain_keys != [] do
+      domain_keys
+    else
+      raise ArgumentError,
+            "expected map keys in @assert_type_form to be atoms or domain key types, got: #{Macro.to_string(other)}"
+    end
   end
 
   @doc """

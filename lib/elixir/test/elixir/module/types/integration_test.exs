@@ -380,6 +380,60 @@ defmodule Module.Types.IntegrationTest do
       assert clauses == [{[dynamic()], dynamic()}]
     end
 
+    test "expands @define_type_form aliases in @assert_type_form" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @define_type_form t: (dynamic() -> dynamic())
+          @assert_type_form t()
+          def typed(x) when is_integer(x), do: -x
+          def typed(x) when is_boolean(x), do: not x
+        end
+        """
+      }
+
+      modules = compile_modules(files)
+      exports = read_chunk(modules[A]).exports |> Map.new()
+
+      assert %{{:typed, 1} => %{sig: {:strong, nil, clauses}}} = exports
+      assert clauses == [{[dynamic()], dynamic()}]
+    end
+
+    test "supports map literals in @define_type_form" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @define_type_form m: %{..., a: pid()}
+          @assert_type_form (m() -> dynamic())
+          def typed(x), do: x
+        end
+        """
+      }
+
+      modules = compile_modules(files)
+      exports = read_chunk(modules[A]).exports |> Map.new()
+
+      assert %{{:typed, 1} => %{sig: {:strong, nil, clauses}}} = exports
+      assert clauses == [{[open_map(a: pid())], dynamic()}]
+    end
+
+    test "supports domain key map literals in @assert_type_form" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @assert_type_form (dynamic() -> %{..., integer() => float(), a: integer()})
+          def typed(x), do: x
+        end
+        """
+      }
+
+      modules = compile_modules(files)
+      exports = read_chunk(modules[A]).exports |> Map.new()
+
+      assert %{{:typed, 1} => %{sig: {:strong, nil, clauses}}} = exports
+      assert clauses == [{[dynamic()], open_map([{:a, integer()}, {[:integer], float()}])}]
+    end
+
     test "writes exports with asserted type-form negations" do
       files = %{
         "a.ex" => """
