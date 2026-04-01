@@ -311,6 +311,57 @@ defmodule Module.Types.IntegrationTest do
                )
     end
 
+    test "writes exports with asserted type-form functions across multiple clauses" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @assert_type_form (integer() -> integer()) and (boolean() -> boolean())
+          def typed(x) when is_integer(x), do: -x
+          def typed(x) when is_boolean(x), do: not x
+        end
+        """
+      }
+
+      modules = compile_modules(files)
+      exports = read_chunk(modules[A]).exports |> Map.new()
+
+      assert %{{:typed, 1} => %{sig: {:strong, [domain], clauses}}} = exports
+      assert equal?(domain, union(integer(), boolean()))
+
+      assert Enum.sort_by(clauses, fn {args, return} ->
+               {to_quoted_string(hd(args)), to_quoted_string(return)}
+             end) ==
+               Enum.sort_by(
+                 [
+                   {[integer()], integer()},
+                   {[boolean()], boolean()}
+                 ],
+                 fn {args, return} ->
+                   {to_quoted_string(hd(args)), to_quoted_string(return)}
+                 end
+               )
+    end
+
+    test "writes exports with a shared asserted function type across multiple clauses" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          import Module.Types.Descr
+
+          @assert_type fun([integer()], integer())
+          def typed(x) when is_integer(x), do: -x
+          def typed(x) when is_boolean(x), do: not x
+        end
+        """
+      }
+
+      modules = compile_modules(files)
+      exports = read_chunk(modules[A]).exports |> Map.new()
+
+      assert %{{:typed, 1} => %{sig: {:strong, nil, clauses}}} = exports
+      assert clauses == [{[integer()], integer()}]
+    end
+
     test "writes exports with asserted type-form negations" do
       files = %{
         "a.ex" => """

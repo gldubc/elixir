@@ -418,88 +418,105 @@ defmodule Module.Types do
          stack,
          context
        ) do
-    {_, _, _, domain, mapping, clauses_types, clauses_context} =
-      Enum.reduce(clauses, {0, 0, Pattern.init_previous(), [], [], [], context}, fn
-        {meta, args, guards, body},
-        {index, total, previous, domain, mapping, inferred, acc_context} ->
-          fresh_context = fresh_context(acc_context)
+    {domain, mapping, clauses_types, clauses_context} =
+      case asserted_clauses do
+        {:shared, clause_assertions} ->
+          {mapping, clauses_types, clauses_context} =
+            asserted_function_types(clause_assertions, clauses, kind, fun, stack, context)
 
-          try do
-            clause_assertions =
-              case asserted_clauses do
-                [] -> [{expected, Descr.term()}]
-                _ -> Enum.fetch!(asserted_clauses, index)
-              end
+          {nil, mapping, clauses_types, clauses_context}
 
-            if asserted? do
-              {clause_types, previous, context} =
-                asserted_clause_types(
-                  clause_assertions,
-                  args,
-                  guards,
-                  body,
-                  kind,
-                  fun,
-                  meta,
-                  previous,
-                  stack,
-                  fresh_context
-                )
+        _ ->
+          {_, _, _, domain, mapping, clauses_types, clauses_context} =
+            Enum.reduce(clauses, {0, 0, Pattern.init_previous(), [], [], [], context}, fn
+              {meta, args, guards, body},
+              {index, total, previous, domain, mapping, inferred, acc_context} ->
+                fresh_context = fresh_context(acc_context)
 
-              count = length(clause_types)
-              type_indexes = Enum.to_list(total..(total + count - 1))
-              mapping = Enum.reduce(type_indexes, mapping, &[{index, &1} | &2])
+                try do
+                  clause_assertions =
+                    case asserted_clauses do
+                      [] -> [{expected, Descr.term()}]
+                      {:per_clause, clause_assertions} -> Enum.fetch!(clause_assertions, index)
+                    end
 
-              {index + 1, total + count, previous, domain, mapping,
-               Enum.reverse(clause_types, inferred),
-               context}
-            else
-              [{expected_args, _expected_return}] = clause_assertions
-              info = {base_info, args, guards}
+                  if asserted? do
+                    {clause_types, previous, context} =
+                      asserted_clause_types(
+                        clause_assertions,
+                        args,
+                        guards,
+                        body,
+                        kind,
+                        fun,
+                        meta,
+                        previous,
+                        stack,
+                        fresh_context
+                      )
 
-              {trees, _precise?, head_no_previous_args_types, previous, head_context} =
-                Pattern.of_head(
-                  args,
-                  guards,
-                  expected_args,
-                  previous,
-                  info,
-                  meta,
-                  stack,
-                  fresh_context
-                )
+                    count = length(clause_types)
+                    type_indexes = Enum.to_list(total..(total + count - 1))
+                    mapping = Enum.reduce(type_indexes, mapping, &[{index, &1} | &2])
 
-              {return_type, context} =
-                Expr.of_expr(body, Descr.term(), body, stack, head_context)
+                    {index + 1, total + count, previous, domain, mapping,
+                     Enum.reverse(clause_types, inferred), context}
+                  else
+                    [{expected_args, _expected_return}] = clause_assertions
+                    info = {base_info, args, guards}
 
-              args_types = Pattern.of_domain(trees, stack, context)
+                    {trees, _precise?, head_no_previous_args_types, previous, head_context} =
+                      Pattern.of_head(
+                        args,
+                        guards,
+                        expected_args,
+                        previous,
+                        info,
+                        meta,
+                        stack,
+                        fresh_context
+                      )
 
-              {type_index, inferred} =
-                add_inferred(inferred, args_types, return_type, total - 1, [])
+                    {return_type, context} =
+                      Expr.of_expr(body, Descr.term(), body, stack, head_context)
 
-              domain =
-                case domain do
-                  [] ->
-                    args_types
+                    args_types = Pattern.of_domain(trees, stack, context)
 
-                  _ ->
-                    head_args_types = Pattern.of_domain(trees, stack, head_context)
-                    compute_domain(args_types, head_args_types, head_no_previous_args_types, domain)
+                    {type_index, inferred} =
+                      add_inferred(inferred, args_types, return_type, total - 1, [])
+
+                    domain =
+                      case domain do
+                        [] ->
+                          args_types
+
+                        _ ->
+                          head_args_types = Pattern.of_domain(trees, stack, head_context)
+
+                          compute_domain(
+                            args_types,
+                            head_args_types,
+                            head_no_previous_args_types,
+                            domain
+                          )
+                      end
+
+                    if type_index == -1 do
+                      {index + 1, total + 1, previous, domain, [{index, total} | mapping],
+                       inferred, context}
+                    else
+                      {index + 1, total, previous, domain, [{index, type_index} | mapping],
+                       inferred, context}
+                    end
+                  end
+                rescue
+                  e ->
+                    internal_error!(e, __STACKTRACE__, kind, meta, fun, args, guards, body, stack)
                 end
+            end)
 
-              if type_index == -1 do
-                mapping = [{index, total} | mapping]
-                {index + 1, total + 1, previous, domain, mapping, inferred, context}
-              else
-                mapping = [{index, type_index} | mapping]
-                {index + 1, total, previous, domain, mapping, inferred, context}
-              end
-            end
-          rescue
-            e ->
-              internal_error!(e, __STACKTRACE__, kind, meta, fun, args, guards, body, stack)
-          end
-      end)
+          {domain, mapping, clauses_types, clauses_context}
+      end
 
     domain =
       case clauses_types do
@@ -585,12 +602,16 @@ defmodule Module.Types do
       [] ->
         []
 
+      [assert_type] ->
+        {:shared, normalize_asserted_clause(assert_type, fun, arity)}
+
       assert_types when is_list(assert_types) and length(assert_types) == length(clauses) ->
-        Enum.map(assert_types, &normalize_asserted_clause(&1, fun, arity))
+        {:per_clause, Enum.map(assert_types, &normalize_asserted_clause(&1, fun, arity))}
 
       assert_types when is_list(assert_types) ->
         raise ArgumentError,
-              "@assert_type for #{fun}/#{arity} must be declared once per clause or omitted entirely"
+              "@assert_type for #{fun}/#{arity} must be declared once per clause or " <>
+                "expand to exactly one asserted clause per function clause"
     end
   end
 
@@ -664,6 +685,88 @@ defmodule Module.Types do
 
     previous = Enum.reduce(domains, previous, &Pattern.add_previous(&1, &2))
     {Enum.reverse(clause_types), previous, context}
+  end
+
+  defp asserted_function_types(clause_assertions, clauses, kind, fun, stack, context) do
+    {clause_types, mapping, context} =
+      Enum.reduce(Enum.with_index(clause_assertions), {[], [], context}, fn
+        {{expected_args, expected_return} = clause_type, type_index},
+        {types, _mapping, context} ->
+          {mapping, context} =
+            asserted_function_clause_mapping(
+              type_index,
+              expected_args,
+              expected_return,
+              clauses,
+              kind,
+              fun,
+              stack,
+              context
+            )
+
+          {[clause_type | types], mapping, context}
+      end)
+
+    {Enum.reverse(mapping), Enum.reverse(clause_types), context}
+  end
+
+  defp asserted_function_clause_mapping(
+         type_index,
+         expected_args,
+         expected_return,
+         clauses,
+         kind,
+         fun,
+         stack,
+         context
+       ) do
+    {mapping, _previous, context} =
+      Enum.reduce(
+        Enum.with_index(clauses),
+        {[], Pattern.init_previous(), context},
+        fn {{meta, args, guards, body}, clause_index}, {mapping, previous, acc_context} ->
+          fresh_context = fresh_context(acc_context)
+          info = {{:def, kind, fun, expected_args}, args, guards}
+
+          try do
+            {_trees, _precise?, _head_no_previous_args_types, previous, context} =
+              Pattern.of_head(
+                args,
+                guards,
+                expected_args,
+                previous,
+                info,
+                meta,
+                stack,
+                fresh_context
+              )
+
+            {return_type, context} =
+              Expr.of_expr(body, expected_return, body, stack, context)
+
+            {_return_type, context} =
+              validate_asserted_return(
+                return_type,
+                expected_return,
+                body,
+                meta,
+                stack,
+                context
+              )
+
+            if context.failed do
+              {mapping, previous, context}
+            else
+              {[{clause_index, type_index} | mapping], previous, context}
+            end
+          rescue
+            e ->
+              internal_error!(e, __STACKTRACE__, kind, meta, fun, args, guards, body, stack)
+          end
+        end
+      )
+
+    {mapping, context}
   end
 
   defp asserted_clause_type(

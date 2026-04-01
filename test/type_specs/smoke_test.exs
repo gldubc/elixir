@@ -1,9 +1,7 @@
 defmodule TypeSpecs.SmokeTest do
   import Module.Types.Descr
 
-  @assert_type_form (integer() -> integer()) and (atom() -> float())
-  def h(x), do: x
-
-  @assert_type_form (integer() -> integer()) or ([atom()] -> boolean())
-  def i(x), do: x
+  @assert_type fun([integer()], integer()) |> intersection(fun([boolean()], boolean()))
+  def negate(x) when is_integer(x), do: -x
+  def negate(x) when is_boolean(x), do: not x
 end
