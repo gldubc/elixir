@@ -417,6 +417,24 @@ defmodule Module.Types.IntegrationTest do
       assert clauses == [{[open_map(a: pid())], dynamic()}]
     end
 
+    test "supports tuple literals in @define_type_form" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @define_type_form t: {atom(), integer()}
+          @assert_type_form (t() -> dynamic())
+          def typed(x), do: x
+        end
+        """
+      }
+
+      modules = compile_modules(files)
+      exports = read_chunk(modules[A]).exports |> Map.new()
+
+      assert %{{:typed, 1} => %{sig: {:strong, nil, clauses}}} = exports
+      assert clauses == [{[tuple([atom(), integer()])], dynamic()}]
+    end
+
     test "supports domain key map literals in @assert_type_form" do
       files = %{
         "a.ex" => """

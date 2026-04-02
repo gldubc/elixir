@@ -174,6 +174,10 @@ defmodule Module.Types.Descr do
     end
   end
 
+  defp expand_type_form({left, right}, aliases, _context) do
+    {expand_type_form(left, aliases, :root), expand_type_form(right, aliases, :root)}
+  end
+
   defp expand_type_form(list, aliases, _context) when is_list(list) do
     Enum.map(list, &expand_type_form(&1, aliases, :root))
   end
@@ -251,6 +255,10 @@ defmodule Module.Types.Descr do
       end)
 
     if open?, do: open_map(pairs), else: closed_map(pairs)
+  end
+
+  defp assert_type_form({left, right}, _context) do
+    tuple([assert_type_form(left, :root), assert_type_form(right, :root)])
   end
 
   defp assert_type_form({:{}, _, elements}, _context) when is_list(elements) do
