@@ -153,6 +153,11 @@ defmodule Module.Types.DescrTest do
 
       assert union(difference(list(term()), list(integer())), list(integer()))
              |> equal?(list(term()))
+
+      t1 = non_empty_list(integer())
+      t2 = non_empty_list(number())
+
+      assert union(difference(t2, t1), t1) == union(t1, t2)
     end
 
     test "fun" do
@@ -627,7 +632,7 @@ defmodule Module.Types.DescrTest do
                closed_map(__struct__: difference(atom(), atom_bar))
 
       # Explicitly assert we keep it as cascading differences
-      assert %{map: {{:closed, _}, :bdd_bot, :bdd_bot, _}} =
+      assert %{map: {{:closed, _, _}, :bdd_bot, :bdd_bot, _, _}} =
                difference(
                  difference(
                    open_map(value: term()),
