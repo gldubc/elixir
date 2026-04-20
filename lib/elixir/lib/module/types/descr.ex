@@ -5828,17 +5828,17 @@ defmodule Module.Types.Descr do
 
     case Process.get(key) do
       nil ->
-        Process.put(key, [leaf])
+        Process.put(key, %{leaf => leaf})
         leaf
 
       leaves ->
-        case Enum.find(leaves, &bdd_equal?(&1, leaf)) do
-          nil ->
-            Process.put(key, [leaf | leaves])
-            leaf
-
-          existing ->
+        case leaves do
+          %{^leaf => existing} ->
             existing
+
+          %{} ->
+            Process.put(key, Map.put(leaves, leaf, leaf))
+            leaf
         end
     end
   end
@@ -5848,17 +5848,17 @@ defmodule Module.Types.Descr do
 
     case Process.get(key) do
       nil ->
-        Process.put(key, [node])
+        Process.put(key, %{node => node})
         node
 
       nodes ->
-        case Enum.find(nodes, &bdd_equal?(&1, node)) do
-          nil ->
-            Process.put(key, [node | nodes])
-            node
-
-          existing ->
+        case nodes do
+          %{^node => existing} ->
             existing
+
+          %{} ->
+            Process.put(key, Map.put(nodes, node, node))
+            node
         end
     end
   end
@@ -6012,15 +6012,17 @@ defmodule Module.Types.Descr do
   defp verify_bdd_literal_order!(_value, nil, _label), do: :ok
 
   defp verify_bdd_literal_order!(value, lower, label) do
-    if bdd_less?(lower, value) do
-      :ok
-    else
-      raise """
-      BDD order invariant failed for #{inspect(label)}
-      expected descendant literal to be greater than ancestor literal
-      descendant: #{inspect(value, limit: 10)}
-      ancestor: #{inspect(lower, limit: 10)}
-      """
+    case bdd_literal_order(lower, value) do
+      :lt ->
+        :ok
+
+      _ ->
+        raise """
+        BDD order invariant failed for #{inspect(label)}
+        expected descendant literal to be greater than ancestor literal
+        descendant: #{inspect(value, limit: 10)}
+        ancestor: #{inspect(lower, limit: 10)}
+        """
     end
   end
 
@@ -6592,14 +6594,14 @@ defmodule Module.Types.Descr do
     node_lit = bdd_leaf_value(node_lit)
     lit = bdd_leaf_value(lit)
 
-    cond do
-      bdd_less?(node_lit, lit) ->
+    case bdd_literal_order(node_lit, lit) do
+      :lt ->
         bdd_covers?(u, lit) or (bdd_covers?(c, lit) and bdd_covers?(d, lit))
 
-      bdd_less?(lit, node_lit) ->
+      :gt ->
         false
 
-      true ->
+      :eq ->
         c == :bdd_top or bdd_covers?(u, lit)
     end
   end
@@ -6607,7 +6609,7 @@ defmodule Module.Types.Descr do
   defp bdd_simplify(:bdd_bot, _assumptions), do: :bdd_bot
 
   defp bdd_simplify(:bdd_top, assumptions) do
-    if :bdd_top in assumptions, do: :bdd_bot, else: :bdd_top
+    if bdd_has_top?(assumptions), do: :bdd_bot, else: :bdd_top
   end
 
   defp bdd_simplify({_, _} = leaf, assumptions) do
@@ -6623,7 +6625,7 @@ defmodule Module.Types.Descr do
   end
 
   defp bdd_simplify({lit, c, u, d, _} = bdd, assumptions) do
-    if :bdd_top in assumptions or bdd_has_same?(bdd, assumptions) do
+    if bdd_has_top?(assumptions) or bdd_has_same?(bdd, assumptions) do
       :bdd_bot
     else
       bdd_simplify(bdd, lit, c, u, d, [], [], [], assumptions)
@@ -6686,10 +6688,10 @@ defmodule Module.Types.Descr do
       bdd_equal?(bdd, assumption) ->
         :bdd_bot
 
-      bdd_less?(assumption_lit, lit) ->
+      bdd_literal_order(assumption_lit, lit) == :lt ->
         bdd_simplify(bdd, lit, c, u, d, pos, union, neg, [assumption_union | assumptions])
 
-      bdd_less?(lit, assumption_lit) ->
+      bdd_literal_order(assumption_lit, lit) == :gt ->
         bdd_simplify(
           bdd,
           lit,
@@ -6717,7 +6719,21 @@ defmodule Module.Types.Descr do
     end
   end
 
-  defp bdd_has_same?(bdd, assumptions), do: Enum.any?(assumptions, &bdd_equal?(bdd, &1))
+  defp bdd_has_same?(bdd, assumptions) do
+    hash = bdd_hash(bdd)
+    bdd_has_same?(bdd, hash, assumptions)
+  end
+
+  defp bdd_has_same?(_bdd, _hash, []), do: false
+
+  defp bdd_has_same?(bdd, hash, [assumption | assumptions]) do
+    (bdd_hash(assumption) == hash and bdd_equal?(bdd, assumption)) or
+      bdd_has_same?(bdd, hash, assumptions)
+  end
+
+  defp bdd_has_top?([]), do: false
+  defp bdd_has_top?([:bdd_top | _]), do: true
+  defp bdd_has_top?([_ | assumptions]), do: bdd_has_top?(assumptions)
 
   def bdd_to_dnf(bdd), do: bdd_to_dnf([], [], [], bdd)
 
@@ -6751,51 +6767,34 @@ defmodule Module.Types.Descr do
   defp bdd_compare(bdd1, bdd2) do
     case {bdd_head(bdd1), bdd_head(bdd2)} do
       {lit1, lit2} ->
-        cond do
-          bdd_less?(lit1, lit2) -> {:lt, bdd_expand(bdd1), bdd2}
-          bdd_less?(lit2, lit1) -> {:gt, bdd1, bdd_expand(bdd2)}
-          true -> {:eq, bdd1, bdd2}
+        case bdd_literal_order(lit1, lit2) do
+          :lt -> {:lt, bdd_expand(bdd1), bdd2}
+          :gt -> {:gt, bdd1, bdd_expand(bdd2)}
+          :eq -> {:eq, bdd1, bdd2}
         end
     end
   end
 
-  defp bdd_less?(left, right), do: bdd_order_key(left) < bdd_order_key(right)
-
-  defp bdd_order_key(value) do
-    hash = :erlang.phash2(value)
-    key = {__MODULE__, :bdd_order, hash}
-
-    case Process.get(key) do
-      nil ->
-        order = bdd_order_key_uncached(value)
-        Process.put(key, [{value, order}])
-        order
-
-      entries ->
-        case :lists.keyfind(value, 1, entries) do
-          {^value, order} ->
-            order
-
-          false ->
-            order = bdd_order_key_uncached(value)
-            Process.put(key, [{value, order} | entries])
-            order
+  defp bdd_literal_order(left, right) do
+    case {bdd_map_literal(left), bdd_map_literal(right)} do
+      {{tag1, fields1}, {tag2, fields2}} ->
+        case bdd_compare_map_fields(fields1, fields2) do
+          :eq -> bdd_compare_field(tag1, tag2)
+          order -> order
         end
+
+      {nil, nil} ->
+        bdd_compare_field(left, right)
+
+      {{tag, fields}, nil} ->
+        bdd_compare_field({:map, maybe_swap_two_field_map(fields), tag}, right)
+
+      {nil, {tag, fields}} ->
+        bdd_compare_field(left, {:map, maybe_swap_two_field_map(fields), tag})
     end
   end
 
-  # BDD size is sensitive to variable order. Map fields are stored in ascending
-  # key order for map operations, but BDD ordering uses the reverse field order
-  # so shared low-name keys do not dominate all map-literal comparisons.
-  defp bdd_order_key_uncached({tag, fields}) when is_list(fields) do
-    if map_literal_fields?(fields) do
-      {:map, Enum.reverse(fields), tag}
-    else
-      {tag, fields}
-    end
-  end
-
-  defp bdd_order_key_uncached(value), do: value
+  defp bdd_less?(left, right), do: bdd_literal_order(left, right) == :lt
 
   defp map_literal_fields?([]), do: true
 
@@ -6804,6 +6803,38 @@ defmodule Module.Types.Descr do
   end
 
   defp map_literal_fields?(_), do: false
+
+  defp bdd_map_literal({tag, fields}) when is_list(fields) do
+    if map_literal_fields?(fields), do: {tag, fields}, else: nil
+  end
+
+  defp bdd_map_literal(_), do: nil
+
+  defp bdd_compare_map_fields([field1_a, field1_b], [field2_a, field2_b]) do
+    case bdd_compare_field(field1_b, field2_b) do
+      :eq -> bdd_compare_field(field1_a, field2_a)
+      order -> order
+    end
+  end
+
+  defp bdd_compare_map_fields(fields1, fields2) do
+    cond do
+      fields1 < fields2 -> :lt
+      fields1 > fields2 -> :gt
+      true -> :eq
+    end
+  end
+
+  defp bdd_compare_field(field1, field2) do
+    cond do
+      field1 < field2 -> :lt
+      field1 > field2 -> :gt
+      true -> :eq
+    end
+  end
+
+  defp maybe_swap_two_field_map([field1, field2]), do: [field2, field1]
+  defp maybe_swap_two_field_map(fields), do: fields
 
   defp bdd_map(bdd, fun) do
     case bdd do

@@ -124,6 +124,8 @@ defmodule Module.Types.Of do
             {none(), %{context | vars: %{vars | version => data}}}
 
           false when new_type != old_type ->
+            maybe_verify_absinthe_meta!(data, new_type, expr, stack)
+
             data = %{
               data
               | type: new_type,
