@@ -6866,8 +6866,6 @@ defmodule Module.Types.Descr do
     end
   end
 
-  defp bdd_less?(left, right), do: bdd_literal_order(left, right) == :lt
-
   defp map_literal_fields?([]), do: true
 
   defp map_literal_fields?([{_key, value} | fields]) when is_descr(value) do
