@@ -139,6 +139,8 @@ defmodule Module.Types.Of do
       _ ->
         case gradual?(old_type) and compatible_intersection(old_type, type) do
           {:ok, new_type} when new_type != old_type ->
+            maybe_verify_absinthe_meta!(data, new_type, expr, stack)
+
             data = %{
               data
               | type: new_type,
@@ -152,6 +154,37 @@ defmodule Module.Types.Of do
         end
     end
   end
+
+  defp maybe_verify_absinthe_meta!(
+         %{name: :meta},
+         type,
+         expr,
+         %{
+           module: Absinthe.Federation.Schema.Phase.AddFederatedDirectives,
+           function: {:maybe_add_directives, 2}
+         }
+       ) do
+    if System.get_env("BDD_VERIFY_ABSINTHE") == "1" do
+      stats = Module.Types.Descr.verify_bdd_invariants!(type, {:absinthe_meta, call_label(expr)})
+
+      IO.puts(
+        :stderr,
+        "BDD_VERIFY absinthe meta #{call_label(expr)} words=#{:erts_debug.size(type)} " <>
+          "bdds=#{stats.bdds} nodes=#{stats.nodes} leaves=#{stats.leaves} " <>
+          "unique_nodes=#{stats.unique_nodes} unique_leaves=#{stats.unique_leaves} " <>
+          "max_depth=#{stats.max_depth} ok"
+      )
+    end
+  end
+
+  defp maybe_verify_absinthe_meta!(_data, _type, _expr, _stack), do: :ok
+
+  defp call_label({fun, meta, args}) when is_atom(fun) and is_list(args) do
+    line = Keyword.get(meta, :line)
+    "#{fun}/#{length(args)}:#{line}"
+  end
+
+  defp call_label(_expr), do: "unknown"
 
   @doc """
   Refines the type of a variable.

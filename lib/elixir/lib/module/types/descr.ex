@@ -5811,10 +5811,57 @@ defmodule Module.Types.Descr do
             bdd_compute_hash: 4,
             bdd_leaf_value: 1,
             bdd_equal?: 2}
-  defp bdd_leaf_new(arg1, arg2), do: {arg1, arg2, :erlang.phash2({arg1, arg2})}
+  defp bdd_leaf_new(arg1, arg2) do
+    leaf = {arg1, arg2, :erlang.phash2({arg1, arg2})}
+    bdd_hash_cons_leaf(leaf)
+  end
 
-  defp bdd_node_new(lit, c, u, d),
-    do: {lit, c, u, d, bdd_compute_hash(lit, c, u, d)}
+  defp bdd_node_new(lit, c, u, d) do
+    node = {lit, c, u, d, bdd_compute_hash(lit, c, u, d)}
+    bdd_hash_cons_node(node)
+  end
+
+  # Keep BDDs as DAGs in the current checker process. Without this, repeated
+  # equivalent tails are rebuilt as distinct terms and term size grows quickly.
+  defp bdd_hash_cons_leaf({_, _, hash} = leaf) do
+    key = {__MODULE__, :bdd_leaf, hash}
+
+    case Process.get(key) do
+      nil ->
+        Process.put(key, [leaf])
+        leaf
+
+      leaves ->
+        case Enum.find(leaves, &bdd_equal?(&1, leaf)) do
+          nil ->
+            Process.put(key, [leaf | leaves])
+            leaf
+
+          existing ->
+            existing
+        end
+    end
+  end
+
+  defp bdd_hash_cons_node({_, _, _, _, hash} = node) do
+    key = {__MODULE__, :bdd_node, hash}
+
+    case Process.get(key) do
+      nil ->
+        Process.put(key, [node])
+        node
+
+      nodes ->
+        case Enum.find(nodes, &bdd_equal?(&1, node)) do
+          nil ->
+            Process.put(key, [node | nodes])
+            node
+
+          existing ->
+            existing
+        end
+    end
+  end
 
   defp bdd_compute_hash(lit, c, u, d),
     do: :erlang.phash2({bdd_hash(lit), bdd_hash(c), bdd_hash(u), bdd_hash(d)})
@@ -5854,6 +5901,156 @@ defmodule Module.Types.Descr do
   end
 
   defp bdd_equal?(_, _), do: false
+
+  @doc false
+  def verify_bdd_invariants!(descr, label \\ nil) do
+    stats =
+      verify_descr_bdd_invariants!(descr, label, %{
+        bdds: 0,
+        nodes: 0,
+        leaves: 0,
+        max_depth: 0,
+        node_hashes: MapSet.new(),
+        leaf_hashes: MapSet.new()
+      })
+
+    %{
+      bdds: stats.bdds,
+      nodes: stats.nodes,
+      leaves: stats.leaves,
+      max_depth: stats.max_depth,
+      unique_nodes: MapSet.size(stats.node_hashes),
+      unique_leaves: MapSet.size(stats.leaf_hashes)
+    }
+  end
+
+  defp verify_descr_bdd_invariants!(:term, _label, stats), do: stats
+  defp verify_descr_bdd_invariants!(descr, _label, stats) when descr == @none, do: stats
+
+  defp verify_descr_bdd_invariants!(%{} = descr, label, stats) do
+    Enum.reduce(descr, stats, fn
+      {:dynamic, dynamic}, stats ->
+        verify_descr_bdd_invariants!(dynamic, [label, :dynamic], stats)
+
+      {:map, bdd}, stats ->
+        verify_bdd_invariants!(bdd, :map, [label, :map], nil, 0, stats)
+
+      {:list, bdd}, stats ->
+        verify_bdd_invariants!(bdd, :list, [label, :list], nil, 0, stats)
+
+      {:tuple, bdd}, stats ->
+        verify_bdd_invariants!(bdd, :tuple, [label, :tuple], nil, 0, stats)
+
+      {:fun, {:union, bdds}}, stats ->
+        verify_fun_bdds_invariants!(bdds, [label, :fun, :union], stats)
+
+      {:fun, {:negation, bdds}}, stats ->
+        verify_fun_bdds_invariants!(bdds, [label, :fun, :negation], stats)
+
+      _, stats ->
+        stats
+    end)
+  end
+
+  defp verify_descr_bdd_invariants!(_descr, _label, stats), do: stats
+
+  defp verify_fun_bdds_invariants!(bdds, label, stats) do
+    Enum.reduce(bdds, stats, fn {arity, bdd}, stats ->
+      verify_bdd_invariants!(bdd, {:fun, arity}, [label, arity], nil, 0, stats)
+    end)
+  end
+
+  defp verify_bdd_invariants!(:bdd_top, _kind, _label, _lower, depth, stats),
+    do: %{stats | bdds: stats.bdds + 1, max_depth: max(stats.max_depth, depth)}
+
+  defp verify_bdd_invariants!(:bdd_bot, _kind, _label, _lower, depth, stats),
+    do: %{stats | bdds: stats.bdds + 1, max_depth: max(stats.max_depth, depth)}
+
+  defp verify_bdd_invariants!({_, _} = leaf, kind, label, lower, depth, stats) do
+    verify_bdd_invariants!(bdd_normalize(leaf), kind, label, lower, depth, stats)
+  end
+
+  defp verify_bdd_invariants!({_, _, _} = leaf, kind, label, lower, depth, stats) do
+    value = bdd_leaf_value(leaf)
+    verify_bdd_literal_order!(value, lower, label)
+
+    stats = %{
+      stats
+      | bdds: stats.bdds + 1,
+        leaves: stats.leaves + 1,
+        leaf_hashes: MapSet.put(stats.leaf_hashes, bdd_hash(leaf)),
+        max_depth: max(stats.max_depth, depth + 1)
+    }
+
+    verify_bdd_literal_children!(kind, value, label, stats)
+  end
+
+  defp verify_bdd_invariants!({lit, c, u, d, hash}, kind, label, lower, depth, stats) do
+    value = bdd_leaf_value(lit)
+    verify_bdd_literal_order!(value, lower, label)
+
+    expected_hash = bdd_compute_hash(lit, c, u, d)
+
+    if expected_hash != hash do
+      raise "BDD hash invariant failed for #{inspect(label)}"
+    end
+
+    stats = %{
+      stats
+      | bdds: stats.bdds + 1,
+        nodes: stats.nodes + 1,
+        node_hashes: MapSet.put(stats.node_hashes, hash),
+        max_depth: max(stats.max_depth, depth + 1)
+    }
+
+    stats = verify_bdd_literal_children!(kind, value, [label, :lit], stats)
+    stats = verify_bdd_invariants!(c, kind, [label, :constrained], value, depth + 1, stats)
+    stats = verify_bdd_invariants!(u, kind, [label, :union], value, depth + 1, stats)
+    verify_bdd_invariants!(d, kind, [label, :dual], value, depth + 1, stats)
+  end
+
+  defp verify_bdd_literal_order!(_value, nil, _label), do: :ok
+
+  defp verify_bdd_literal_order!(value, lower, label) do
+    if bdd_less?(lower, value) do
+      :ok
+    else
+      raise """
+      BDD order invariant failed for #{inspect(label)}
+      expected descendant literal to be greater than ancestor literal
+      descendant: #{inspect(value, limit: 10)}
+      ancestor: #{inspect(lower, limit: 10)}
+      """
+    end
+  end
+
+  defp verify_bdd_literal_children!(:map, {_tag, fields}, label, stats) do
+    Enum.reduce(fields, stats, fn {key, type}, stats ->
+      verify_descr_bdd_invariants!(type, [label, key], stats)
+    end)
+  end
+
+  defp verify_bdd_literal_children!(:list, {type, last}, label, stats) do
+    stats = verify_descr_bdd_invariants!(type, [label, :type], stats)
+    verify_descr_bdd_invariants!(last, [label, :last], stats)
+  end
+
+  defp verify_bdd_literal_children!(:tuple, {_tag, elements}, label, stats) do
+    Enum.reduce(elements, stats, fn type, stats ->
+      verify_descr_bdd_invariants!(type, [label, :element], stats)
+    end)
+  end
+
+  defp verify_bdd_literal_children!({:fun, _arity}, {inputs, output}, label, stats) do
+    stats =
+      Enum.reduce(inputs, stats, fn type, stats ->
+        verify_descr_bdd_invariants!(type, [label, :input], stats)
+      end)
+
+    verify_descr_bdd_invariants!(output, [label, :output], stats)
+  end
+
+  defp verify_bdd_literal_children!(_kind, _value, _label, stats), do: stats
 
   def bdd_union(bdd, bdd), do: bdd
 
@@ -6396,10 +6593,10 @@ defmodule Module.Types.Descr do
     lit = bdd_leaf_value(lit)
 
     cond do
-      node_lit < lit ->
+      bdd_less?(node_lit, lit) ->
         bdd_covers?(u, lit) or (bdd_covers?(c, lit) and bdd_covers?(d, lit))
 
-      node_lit > lit ->
+      bdd_less?(lit, node_lit) ->
         false
 
       true ->
@@ -6489,10 +6686,10 @@ defmodule Module.Types.Descr do
       bdd_equal?(bdd, assumption) ->
         :bdd_bot
 
-      assumption_lit < lit ->
+      bdd_less?(assumption_lit, lit) ->
         bdd_simplify(bdd, lit, c, u, d, pos, union, neg, [assumption_union | assumptions])
 
-      assumption_lit > lit ->
+      bdd_less?(lit, assumption_lit) ->
         bdd_simplify(
           bdd,
           lit,
@@ -6553,11 +6750,60 @@ defmodule Module.Types.Descr do
 
   defp bdd_compare(bdd1, bdd2) do
     case {bdd_head(bdd1), bdd_head(bdd2)} do
-      {lit1, lit2} when lit1 < lit2 -> {:lt, bdd_expand(bdd1), bdd2}
-      {lit1, lit2} when lit1 > lit2 -> {:gt, bdd1, bdd_expand(bdd2)}
-      _ -> {:eq, bdd1, bdd2}
+      {lit1, lit2} ->
+        cond do
+          bdd_less?(lit1, lit2) -> {:lt, bdd_expand(bdd1), bdd2}
+          bdd_less?(lit2, lit1) -> {:gt, bdd1, bdd_expand(bdd2)}
+          true -> {:eq, bdd1, bdd2}
+        end
     end
   end
+
+  defp bdd_less?(left, right), do: bdd_order_key(left) < bdd_order_key(right)
+
+  defp bdd_order_key(value) do
+    hash = :erlang.phash2(value)
+    key = {__MODULE__, :bdd_order, hash}
+
+    case Process.get(key) do
+      nil ->
+        order = bdd_order_key_uncached(value)
+        Process.put(key, [{value, order}])
+        order
+
+      entries ->
+        case :lists.keyfind(value, 1, entries) do
+          {^value, order} ->
+            order
+
+          false ->
+            order = bdd_order_key_uncached(value)
+            Process.put(key, [{value, order} | entries])
+            order
+        end
+    end
+  end
+
+  # BDD size is sensitive to variable order. Map fields are stored in ascending
+  # key order for map operations, but BDD ordering uses the reverse field order
+  # so shared low-name keys do not dominate all map-literal comparisons.
+  defp bdd_order_key_uncached({tag, fields}) when is_list(fields) do
+    if map_literal_fields?(fields) do
+      {:map, Enum.reverse(fields), tag}
+    else
+      {tag, fields}
+    end
+  end
+
+  defp bdd_order_key_uncached(value), do: value
+
+  defp map_literal_fields?([]), do: true
+
+  defp map_literal_fields?([{_key, value} | fields]) when is_descr(value) do
+    map_literal_fields?(fields)
+  end
+
+  defp map_literal_fields?(_), do: false
 
   defp bdd_map(bdd, fun) do
     case bdd do
