@@ -5803,69 +5803,18 @@ defmodule Module.Types.Descr do
 
   ## BDD helpers
 
-  @compile {:inline,
-            bdd_leaf_new: 2,
-            bdd_node_new: 4,
-            bdd_normalize: 1,
-            bdd_hash: 1,
-            bdd_compute_hash: 4,
-            bdd_leaf_value: 1,
-            bdd_equal?: 2}
   defp bdd_leaf_new(arg1, arg2) do
-    leaf = {arg1, arg2, :erlang.phash2({arg1, arg2})}
-    bdd_hash_cons_leaf(leaf)
+    {arg1, arg2, :erlang.phash2({arg1, arg2})}
   end
 
   defp bdd_node_new(lit, c, u, d) do
-    node = {lit, c, u, d, bdd_compute_hash(lit, c, u, d)}
-    bdd_hash_cons_node(node)
-  end
-
-  # Keep BDDs as DAGs in the current checker process. Without this, repeated
-  # equivalent tails are rebuilt as distinct terms and term size grows quickly.
-  defp bdd_hash_cons_leaf({_, _, hash} = leaf) do
-    key = {__MODULE__, :bdd_leaf, hash}
-
-    case Process.get(key) do
-      nil ->
-        Process.put(key, %{leaf => leaf})
-        leaf
-
-      leaves ->
-        case leaves do
-          %{^leaf => existing} ->
-            existing
-
-          %{} ->
-            Process.put(key, Map.put(leaves, leaf, leaf))
-            leaf
-        end
-    end
-  end
-
-  defp bdd_hash_cons_node({_, _, _, _, hash} = node) do
-    key = {__MODULE__, :bdd_node, hash}
-
-    case Process.get(key) do
-      nil ->
-        Process.put(key, %{node => node})
-        node
-
-      nodes ->
-        case nodes do
-          %{^node => existing} ->
-            existing
-
-          %{} ->
-            Process.put(key, Map.put(nodes, node, node))
-            node
-        end
-    end
+    {lit, c, u, d, bdd_compute_hash(lit, c, u, d)}
   end
 
   defp bdd_compute_hash(lit, c, u, d),
     do: :erlang.phash2({bdd_hash(lit), bdd_hash(c), bdd_hash(u), bdd_hash(d)})
 
+  # Canonicalize commutative operands so {a, b} and {b, a} share one memo entry.
   defp bdd_memoized_commutative(op, bdd1, bdd2, fun) do
     {bdd1, bdd2} = bdd_commutative_key_order(bdd1, bdd2)
     bdd_memoized(op, bdd1, bdd2, fun)
@@ -5877,10 +5826,10 @@ defmodule Module.Types.Descr do
     key = {__MODULE__, :bdd_apply, op, hash1, hash2}
     pair = {bdd1, bdd2}
 
-    case Process.get(key) do
+    case bdd_process_cache_get(key) do
       nil ->
         result = fun.()
-        Process.put(key, %{pair => result})
+        :erlang.put(key, %{pair => result})
         result
 
       entries ->
@@ -5890,7 +5839,7 @@ defmodule Module.Types.Descr do
 
           %{} ->
             result = fun.()
-            Process.put(key, Map.put(entries, pair, result))
+            :erlang.put(key, Map.put(entries, pair, result))
             result
         end
     end
@@ -5921,10 +5870,10 @@ defmodule Module.Types.Descr do
     key = {__MODULE__, :bdd_simplify, hash, assumptions_hash}
     pair = {bdd, assumptions}
 
-    case Process.get(key) do
+    case bdd_process_cache_get(key) do
       nil ->
         result = fun.()
-        Process.put(key, %{pair => result})
+        :erlang.put(key, %{pair => result})
         result
 
       entries ->
@@ -5934,9 +5883,16 @@ defmodule Module.Types.Descr do
 
           %{} ->
             result = fun.()
-            Process.put(key, Map.put(entries, pair, result))
+            :erlang.put(key, Map.put(entries, pair, result))
             result
         end
+    end
+  end
+
+  defp bdd_process_cache_get(key) do
+    case :erlang.apply(:erlang, :get, [key]) do
+      :undefined -> nil
+      value -> value
     end
   end
 
