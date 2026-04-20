@@ -5866,6 +5866,86 @@ defmodule Module.Types.Descr do
   defp bdd_compute_hash(lit, c, u, d),
     do: :erlang.phash2({bdd_hash(lit), bdd_hash(c), bdd_hash(u), bdd_hash(d)})
 
+  defp bdd_memoized_commutative(op, bdd1, bdd2, fun) do
+    {bdd1, bdd2} = bdd_commutative_key_order(bdd1, bdd2)
+    bdd_memoized(op, bdd1, bdd2, fun)
+  end
+
+  defp bdd_memoized(op, bdd1, bdd2, fun) do
+    hash1 = bdd_hash(bdd1)
+    hash2 = bdd_hash(bdd2)
+    key = {__MODULE__, :bdd_apply, op, hash1, hash2}
+    pair = {bdd1, bdd2}
+
+    case Process.get(key) do
+      nil ->
+        result = fun.()
+        Process.put(key, %{pair => result})
+        result
+
+      entries ->
+        case entries do
+          %{^pair => result} ->
+            result
+
+          %{} ->
+            result = fun.()
+            Process.put(key, Map.put(entries, pair, result))
+            result
+        end
+    end
+  end
+
+  defp bdd_commutative_key_order(bdd1, bdd2) do
+    hash1 = bdd_hash(bdd1)
+    hash2 = bdd_hash(bdd2)
+
+    cond do
+      hash1 < hash2 ->
+        {bdd1, bdd2}
+
+      hash1 > hash2 ->
+        {bdd2, bdd1}
+
+      bdd1 <= bdd2 ->
+        {bdd1, bdd2}
+
+      true ->
+        {bdd2, bdd1}
+    end
+  end
+
+  defp bdd_simplify_memoized(bdd, assumptions, fun) do
+    hash = bdd_hash(bdd)
+    assumptions_hash = bdd_assumptions_hash(assumptions)
+    key = {__MODULE__, :bdd_simplify, hash, assumptions_hash}
+    pair = {bdd, assumptions}
+
+    case Process.get(key) do
+      nil ->
+        result = fun.()
+        Process.put(key, %{pair => result})
+        result
+
+      entries ->
+        case entries do
+          %{^pair => result} ->
+            result
+
+          %{} ->
+            result = fun.()
+            Process.put(key, Map.put(entries, pair, result))
+            result
+        end
+    end
+  end
+
+  defp bdd_assumptions_hash([]), do: 0
+
+  defp bdd_assumptions_hash([assumption | assumptions]) do
+    :erlang.phash2({bdd_hash(assumption), bdd_assumptions_hash(assumptions)})
+  end
+
   defp bdd_normalize({arg1, arg2}), do: bdd_leaf_new(arg1, arg2)
 
   defp bdd_normalize({lit, c, u, d}),
@@ -6060,40 +6140,42 @@ defmodule Module.Types.Descr do
     bdd1 = bdd_normalize(bdd1)
     bdd2 = bdd_normalize(bdd2)
 
-    case {bdd1, bdd2} do
-      {:bdd_top, _bdd} ->
-        :bdd_top
+    bdd_memoized_commutative(:union, bdd1, bdd2, fn ->
+      case {bdd1, bdd2} do
+        {:bdd_top, _bdd} ->
+          :bdd_top
 
-      {_bdd, :bdd_top} ->
-        :bdd_top
+        {_bdd, :bdd_top} ->
+          :bdd_top
 
-      {:bdd_bot, bdd} ->
-        bdd
+        {:bdd_bot, bdd} ->
+          bdd
 
-      {bdd, :bdd_bot} ->
-        bdd
+        {bdd, :bdd_bot} ->
+          bdd
 
-      _ ->
-        case bdd_compare(bdd1, bdd2) do
-          {:lt, {lit1, c1, u1, d1, _}, bdd2} ->
-            bdd_split(lit1, c1, bdd_union(u1, bdd2), d1)
+        _ ->
+          case bdd_compare(bdd1, bdd2) do
+            {:lt, {lit1, c1, u1, d1, _}, bdd2} ->
+              bdd_split(lit1, c1, bdd_union(u1, bdd2), d1)
 
-          {:gt, bdd1, {lit2, c2, u2, d2, _}} ->
-            bdd_split(lit2, c2, bdd_union(bdd1, u2), d2)
+            {:gt, bdd1, {lit2, c2, u2, d2, _}} ->
+              bdd_split(lit2, c2, bdd_union(bdd1, u2), d2)
 
-          {:eq, {lit, c1, u1, d1, _}, {_, c2, u2, d2, _}} ->
-            bdd_split(lit, bdd_union(c1, c2), bdd_union(u1, u2), bdd_union(d1, d2))
+            {:eq, {lit, c1, u1, d1, _}, {_, c2, u2, d2, _}} ->
+              bdd_split(lit, bdd_union(c1, c2), bdd_union(u1, u2), bdd_union(d1, d2))
 
-          {:eq, {lit, _, u1, d1, _}, _} ->
-            bdd_union(d1, bdd_union(u1, lit))
+            {:eq, {lit, _, u1, d1, _}, _} ->
+              bdd_union(d1, bdd_union(u1, lit))
 
-          {:eq, _, {lit, _, u2, d2, _}} ->
-            bdd_union(d2, bdd_union(u2, lit))
+            {:eq, _, {lit, _, u2, d2, _}} ->
+              bdd_union(d2, bdd_union(u2, lit))
 
-          {:eq, _, _} ->
-            bdd1
-        end
-    end
+            {:eq, _, _} ->
+              bdd1
+          end
+      end
+    end)
   end
 
   def bdd_difference(bdd, bdd), do: :bdd_bot
@@ -6337,75 +6419,61 @@ defmodule Module.Types.Descr do
     bdd1 = bdd_normalize(bdd1)
     bdd2 = bdd_normalize(bdd2)
 
-    if bdd_equal?(bdd1, bdd2) do
-      bdd1
-    else
-      case {bdd1, bdd2} do
-        {:bdd_top, bdd} ->
-          bdd
+    bdd_memoized_commutative(:intersection, bdd1, bdd2, fn ->
+      if bdd_equal?(bdd1, bdd2) do
+        bdd1
+      else
+        case {bdd1, bdd2} do
+          {:bdd_top, bdd} ->
+            bdd
 
-        {bdd, :bdd_top} ->
-          bdd
+          {bdd, :bdd_top} ->
+            bdd
 
-        {:bdd_bot, _bdd} ->
-          :bdd_bot
+          {:bdd_bot, _bdd} ->
+            :bdd_bot
 
-        {_, :bdd_bot} ->
-          :bdd_bot
+          {_, :bdd_bot} ->
+            :bdd_bot
 
-        _ ->
-          case bdd_compare(bdd1, bdd2) do
-            {:lt, {lit1, c1, u1, d1, _}, bdd2} ->
-              bdd_split(
-                lit1,
-                bdd_intersection(c1, bdd2),
-                bdd_intersection(u1, bdd2),
-                bdd_intersection(d1, bdd2)
-              )
+          _ ->
+            case bdd_compare(bdd1, bdd2) do
+              {:lt, {lit1, c1, u1, d1, _}, bdd2} ->
+                bdd_split(
+                  lit1,
+                  bdd_intersection(c1, bdd2),
+                  bdd_intersection(u1, bdd2),
+                  bdd_intersection(d1, bdd2)
+                )
 
-            {:gt, bdd1, {lit2, c2, u2, d2, _}} ->
-              bdd_split(
-                lit2,
-                bdd_intersection(bdd1, c2),
-                bdd_intersection(bdd1, u2),
-                bdd_intersection(bdd1, d2)
-              )
+              {:gt, bdd1, {lit2, c2, u2, d2, _}} ->
+                bdd_split(
+                  lit2,
+                  bdd_intersection(bdd1, c2),
+                  bdd_intersection(bdd1, u2),
+                  bdd_intersection(bdd1, d2)
+                )
 
-            # Notice that (a, c1, u1, d1) and (a, c2, u2, d2) is described as:
-            #
-            #     {a, (C1 or U1) and (C2 or U2), :bdd_bot, (D1 or U1) and (D2 or U2)}
-            #
-            # However, if we distribute the intersection over the unions, we find a
-            # common term, U1 and U2, leading to:
-            #
-            #     {a1,
-            #      (C1 and (C2 or U2)) or (U1 and C2),
-            #      (U1 and U2),
-            #      (D1 and (D2 or U2)) or (U1 and D2)}
-            #
-            # This formula is longer, meaning more operations, but it does preserve
-            # unions in place whenever possible. This change has reduced the algorithmic
-            # complexity in the past, but perhaps it is rendered less useful now due to
-            # the eager literal intersections.
-            {:eq, {lit, c1, u1, d1, _}, {_, c2, u2, d2, _}} ->
-              bdd_split(
-                lit,
-                bdd_intersection_eq(c1, c2, u1, u2),
-                bdd_intersection(u1, u2),
-                bdd_intersection_eq(d1, d2, u1, u2)
-              )
+              {:eq, {lit, c1, u1, d1, _}, {_, c2, u2, d2, _}} ->
+                bdd_split(
+                  lit,
+                  bdd_intersection_eq(c1, c2, u1, u2),
+                  bdd_intersection(u1, u2),
+                  bdd_intersection_eq(d1, d2, u1, u2)
+                )
 
-            {:eq, {lit, c1, u1, _, _}, _} ->
-              bdd_split(lit, bdd_union(c1, u1), :bdd_bot, :bdd_bot)
+              {:eq, {lit, c1, u1, _, _}, _} ->
+                bdd_split(lit, bdd_union(c1, u1), :bdd_bot, :bdd_bot)
 
-            {:eq, _, {lit, c2, u2, _, _}} ->
-              bdd_split(lit, bdd_union(c2, u2), :bdd_bot, :bdd_bot)
+              {:eq, _, {lit, c2, u2, _, _}} ->
+                bdd_split(lit, bdd_union(c2, u2), :bdd_bot, :bdd_bot)
 
-            {:eq, bdd, _} ->
-              bdd
-          end
+              {:eq, bdd, _} ->
+                bdd
+            end
+        end
       end
-    end
+    end)
   end
 
   # The arms of bdd_intersect equal have shape:
@@ -6617,19 +6685,23 @@ defmodule Module.Types.Descr do
   end
 
   defp bdd_simplify({_, _, _} = leaf, assumptions) do
-    if bdd_has_same?(leaf, assumptions) do
-      :bdd_bot
-    else
-      bdd_simplify(leaf, leaf, :bdd_top, :bdd_bot, :bdd_bot, [], [], [], assumptions)
-    end
+    bdd_simplify_memoized(leaf, assumptions, fn ->
+      if bdd_has_same?(leaf, assumptions) do
+        :bdd_bot
+      else
+        bdd_simplify(leaf, leaf, :bdd_top, :bdd_bot, :bdd_bot, [], [], [], assumptions)
+      end
+    end)
   end
 
   defp bdd_simplify({lit, c, u, d, _} = bdd, assumptions) do
-    if bdd_has_top?(assumptions) or bdd_has_same?(bdd, assumptions) do
-      :bdd_bot
-    else
-      bdd_simplify(bdd, lit, c, u, d, [], [], [], assumptions)
-    end
+    bdd_simplify_memoized(bdd, assumptions, fn ->
+      if bdd_has_top?(assumptions) or bdd_has_same?(bdd, assumptions) do
+        :bdd_bot
+      else
+        bdd_simplify(bdd, lit, c, u, d, [], [], [], assumptions)
+      end
+    end)
   end
 
   defp bdd_simplify(_bdd, lit, c, u, d, pos, union, neg, []) do
