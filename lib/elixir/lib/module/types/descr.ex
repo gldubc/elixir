@@ -40,6 +40,8 @@ defmodule Module.Types.Descr do
   defguardp is_fields_empty(fields) when fields == []
   defguardp fields_size(fields) when length(fields)
 
+  @bdd_cache_limit 50_000
+
   @domain_key_types :lists.sort(
                       [:binary, :integer, :float, :pid, :port, :reference] ++
                         [:fun, :atom, :tuple, :map, :list]
@@ -415,42 +417,46 @@ defmodule Module.Types.Descr do
   @doc """
   Computes the union of two descrs.
   """
-  def union(:term, other), do: optional_to_term(other)
-  def union(other, :term), do: optional_to_term(other)
-  def union(none, other) when none == @none, do: other
-  def union(other, none) when none == @none, do: other
-
   def union(left, right) do
+    with_bdd_cache(fn cache -> union_descr(left, right, cache) end)
+  end
+
+  defp union_descr(:term, other, cache), do: {optional_to_term(other), cache}
+  defp union_descr(other, :term, cache), do: {optional_to_term(other), cache}
+  defp union_descr(none, other, cache) when none == @none, do: {other, cache}
+  defp union_descr(other, none, cache) when none == @none, do: {other, cache}
+
+  defp union_descr(left, right, cache) do
     is_gradual_left = gradual?(left)
     is_gradual_right = gradual?(right)
 
     cond do
       is_gradual_left and not is_gradual_right ->
         right_with_dynamic = Map.put(unfold(right), :dynamic, right)
-        union_static(left, right_with_dynamic)
+        union_static(left, right_with_dynamic, cache)
 
       is_gradual_right and not is_gradual_left ->
         left_with_dynamic = Map.put(unfold(left), :dynamic, left)
-        union_static(left_with_dynamic, right)
+        union_static(left_with_dynamic, right, cache)
 
       true ->
-        union_static(left, right)
+        union_static(left, right, cache)
     end
   end
 
-  @compile {:inline, union_static: 2}
-  defp union_static(left, right) do
-    symmetrical_merge(left, right, &union/3)
+  @compile {:inline, union_static: 3}
+  defp union_static(left, right, cache) do
+    symmetrical_merge(left, right, cache, &union/4)
   end
 
-  defp union(:atom, v1, v2), do: atom_union(v1, v2)
-  defp union(:bitmap, v1, v2), do: v1 ||| v2
-  defp union(:dynamic, v1, v2), do: dynamic_union(v1, v2)
-  defp union(:list, v1, v2), do: bdd_union(v1, v2)
-  defp union(:map, v1, v2), do: map_union(v1, v2)
-  defp union(:optional, 1, 1), do: 1
-  defp union(:tuple, v1, v2), do: tuple_union(v1, v2)
-  defp union(:fun, v1, v2), do: fun_union(v1, v2)
+  defp union(:atom, v1, v2, cache), do: {atom_union(v1, v2), cache}
+  defp union(:bitmap, v1, v2, cache), do: {v1 ||| v2, cache}
+  defp union(:dynamic, v1, v2, cache), do: dynamic_union(v1, v2, cache)
+  defp union(:list, v1, v2, cache), do: {list_union(v1, v2), cache}
+  defp union(:map, v1, v2, cache), do: {map_union(v1, v2), cache}
+  defp union(:optional, 1, 1, cache), do: {1, cache}
+  defp union(:tuple, v1, v2, cache), do: {tuple_union(v1, v2), cache}
+  defp union(:fun, v1, v2, cache), do: fun_union(v1, v2, cache)
 
   @doc """
   Computes the intersection of two descrs.
@@ -459,88 +465,108 @@ defmodule Module.Types.Descr do
   def intersection(other, :term), do: remove_optional(other)
 
   def intersection(left, right) do
+    with_bdd_cache(fn cache -> intersection_descr(left, right, cache) end)
+  end
+
+  defp intersection_descr(left, right, cache) do
     is_gradual_left = gradual?(left)
     is_gradual_right = gradual?(right)
 
     cond do
       is_gradual_left and not is_gradual_right ->
         right_with_dynamic = Map.put(unfold(right), :dynamic, right)
-        intersection_static(left, right_with_dynamic)
+        intersection_static(left, right_with_dynamic, cache)
 
       is_gradual_right and not is_gradual_left ->
         left_with_dynamic = Map.put(unfold(left), :dynamic, left)
-        intersection_static(left_with_dynamic, right)
+        intersection_static(left_with_dynamic, right, cache)
 
       true ->
-        intersection_static(left, right)
+        intersection_static(left, right, cache)
     end
   end
 
-  @compile {:inline, intersection_static: 2}
+  @compile {:inline, intersection_static: 2, intersection_static: 3}
   defp intersection_static(left, right) do
-    symmetrical_intersection(left, right, &intersection/3)
+    with_bdd_cache(fn cache -> intersection_static(left, right, cache) end)
+  end
+
+  defp intersection_static(:term, other, cache), do: {remove_optional(other), cache}
+  defp intersection_static(other, :term, cache), do: {remove_optional(other), cache}
+
+  defp intersection_static(left, right, cache) do
+    symmetrical_intersection(left, right, cache, &intersection/4)
   end
 
   # Returning 0 from the callback is taken as none() for that subtype.
-  defp intersection(:atom, v1, v2), do: atom_intersection(v1, v2)
-  defp intersection(:bitmap, v1, v2), do: v1 &&& v2
-  defp intersection(:list, v1, v2), do: list_intersection(v1, v2)
-  defp intersection(:map, v1, v2), do: map_intersection(v1, v2)
-  defp intersection(:optional, 1, 1), do: 1
-  defp intersection(:tuple, v1, v2), do: tuple_intersection(v1, v2)
-  defp intersection(:fun, v1, v2), do: fun_intersection(v1, v2)
+  defp intersection(key, v1, v2) do
+    with_bdd_cache(fn cache -> intersection(key, v1, v2, cache) end)
+  end
 
-  defp intersection(:dynamic, v1, v2) do
-    descr = dynamic_intersection(v1, v2)
-    if descr == @none, do: 0, else: descr
+  defp intersection(:atom, v1, v2, cache), do: {atom_intersection(v1, v2), cache}
+  defp intersection(:bitmap, v1, v2, cache), do: {v1 &&& v2, cache}
+  defp intersection(:list, v1, v2, cache), do: {list_intersection(v1, v2), cache}
+  defp intersection(:map, v1, v2, cache), do: {map_intersection(v1, v2), cache}
+  defp intersection(:optional, 1, 1, cache), do: {1, cache}
+  defp intersection(:tuple, v1, v2, cache), do: {tuple_intersection(v1, v2), cache}
+  defp intersection(:fun, v1, v2, cache), do: fun_intersection(v1, v2, cache)
+
+  defp intersection(:dynamic, v1, v2, cache) do
+    {descr, cache} = dynamic_intersection(v1, v2, cache)
+    {if(descr == @none, do: 0, else: descr), cache}
   end
 
   @doc """
   Computes the difference between two types.
   """
-  def difference(left, :term), do: keep_optional(left)
-  def difference(left, none) when none == @none, do: left
-
   def difference(left, right) do
+    with_bdd_cache(fn cache -> difference_descr(left, right, cache) end)
+  end
+
+  defp difference_descr(left, :term, cache), do: {keep_optional(left), cache}
+  defp difference_descr(left, none, cache) when none == @none, do: {left, cache}
+
+  defp difference_descr(left, right, cache) do
     if gradual?(left) or gradual?(right) do
       {left_dynamic, left_static} = pop_dynamic(left)
       {right_dynamic, right_static} = pop_dynamic(right)
-      dynamic_part = difference_static(left_dynamic, right_static)
+      {dynamic_part, cache} = difference_static(left_dynamic, right_static, cache)
+      {static_part, cache} = difference_static(left_static, right_dynamic, cache)
 
-      Map.put(difference_static(left_static, right_dynamic), :dynamic, dynamic_part)
+      {Map.put(static_part, :dynamic, dynamic_part), cache}
     else
-      difference_static(left, right)
+      difference_static(left, right, cache)
     end
   end
 
   # For static types, the difference is component-wise
-  defp difference_static(left, descr) when descr == %{}, do: left
-  defp difference_static(left, :term), do: keep_optional(left)
+  defp difference_static(left, descr, cache) when descr == %{}, do: {left, cache}
+  defp difference_static(left, :term, cache), do: {keep_optional(left), cache}
 
-  defp difference_static(left, right) do
-    iterator_difference_static(:maps.next(:maps.iterator(unfold(right))), unfold(left))
+  defp difference_static(left, right, cache) do
+    iterator_difference_static(:maps.next(:maps.iterator(unfold(right))), unfold(left), cache)
   end
 
-  defp iterator_difference_static({key, v2, iterator}, map) do
-    acc =
+  defp iterator_difference_static({key, v2, iterator}, map, cache) do
+    {acc, cache} =
       case map do
         %{^key => v1} ->
-          value = difference(key, v1, v2)
+          {value, cache} = difference(key, v1, v2, cache)
 
           if value in @empty_difference do
-            Map.delete(map, key)
+            {Map.delete(map, key), cache}
           else
-            %{map | key => value}
+            {%{map | key => value}, cache}
           end
 
         %{} ->
-          map
+          {map, cache}
       end
 
-    iterator_difference_static(:maps.next(iterator), acc)
+    iterator_difference_static(:maps.next(iterator), acc, cache)
   end
 
-  defp iterator_difference_static(:none, map), do: map
+  defp iterator_difference_static(:none, map, cache), do: {map, cache}
 
   # This function is designed to compute the difference during subtyping efficiently.
   # Do not use it for anything else.
@@ -571,13 +597,17 @@ defmodule Module.Types.Descr do
   defp iterator_empty_difference_subtype?(:none, _map), do: true
 
   # Returning 0 from the callback is taken as none() for that subtype.
-  defp difference(:atom, v1, v2), do: atom_difference(v1, v2)
-  defp difference(:bitmap, v1, v2), do: v1 - (v1 &&& v2)
-  defp difference(:list, v1, v2), do: list_difference(v1, v2)
-  defp difference(:map, v1, v2), do: map_difference(v1, v2)
-  defp difference(:optional, 1, 1), do: 0
-  defp difference(:tuple, v1, v2), do: tuple_difference(v1, v2)
-  defp difference(:fun, v1, v2), do: fun_difference(v1, v2)
+  defp difference(key, v1, v2) do
+    with_bdd_cache(fn cache -> difference(key, v1, v2, cache) end)
+  end
+
+  defp difference(:atom, v1, v2, cache), do: {atom_difference(v1, v2), cache}
+  defp difference(:bitmap, v1, v2, cache), do: {v1 - (v1 &&& v2), cache}
+  defp difference(:list, v1, v2, cache), do: {list_difference(v1, v2), cache}
+  defp difference(:map, v1, v2, cache), do: {map_difference(v1, v2), cache}
+  defp difference(:optional, 1, 1, cache), do: {0, cache}
+  defp difference(:tuple, v1, v2, cache), do: {tuple_difference(v1, v2), cache}
+  defp difference(:fun, v1, v2, cache), do: fun_difference(v1, v2, cache)
 
   @doc """
   Compute the negation of a type.
@@ -1878,62 +1908,105 @@ defmodule Module.Types.Descr do
 
   # For all integers keys in fun_repr1, fun_repr2, call fun_bdd_union on the values that are in
   # both, else return the single value.
-  defp fun_union({tag1, repr1}, {tag2, repr2}) do
+  defp fun_union({tag1, repr1}, {tag2, repr2}, cache) do
     case {tag1, tag2} do
-      {:union, :union} -> {:union, fun_repr_union(repr1, repr2)}
-      {:negation, :negation} -> {:negation, fun_repr_intersection(repr1, repr2)}
-      {:union, :negation} -> {:negation, fun_repr_difference(repr2, repr1)}
-      {:negation, :union} -> {:negation, fun_repr_difference(repr1, repr2)}
+      {:union, :union} ->
+        {repr, cache} = fun_repr_union(repr1, repr2, cache)
+        {{:union, repr}, cache}
+
+      {:negation, :negation} ->
+        {repr, cache} = fun_repr_intersection(repr1, repr2, cache)
+        {{:negation, repr}, cache}
+
+      {:union, :negation} ->
+        {repr, cache} = fun_repr_difference(repr2, repr1, cache)
+        {{:negation, repr}, cache}
+
+      {:negation, :union} ->
+        {repr, cache} = fun_repr_difference(repr1, repr2, cache)
+        {{:negation, repr}, cache}
     end
   end
 
   # For all integer keys that are both in fun_repr1 and fun_repr2, call fun_bdd_intersection
   # on the values that are in both, else discard.
-  defp fun_intersection({tag1, repr1}, {tag2, repr2}) do
-    {tag, repr} =
+  defp fun_intersection({tag1, repr1}, {tag2, repr2}, cache) do
+    {tag, repr, cache} =
       case {tag1, tag2} do
-        {:union, :union} -> {:union, fun_repr_intersection(repr1, repr2)}
-        {:negation, :negation} -> {:negation, fun_repr_union(repr1, repr2)}
-        {:union, :negation} -> {:union, fun_repr_difference(repr1, repr2)}
-        {:negation, :union} -> {:union, fun_repr_difference(repr2, repr1)}
+        {:union, :union} ->
+          {repr, cache} = fun_repr_intersection(repr1, repr2, cache)
+          {:union, repr, cache}
+
+        {:negation, :negation} ->
+          {repr, cache} = fun_repr_union(repr1, repr2, cache)
+          {:negation, repr, cache}
+
+        {:union, :negation} ->
+          {repr, cache} = fun_repr_difference(repr1, repr2, cache)
+          {:union, repr, cache}
+
+        {:negation, :union} ->
+          {repr, cache} = fun_repr_difference(repr2, repr1, cache)
+          {:union, repr, cache}
       end
 
-    if tag == :union and map_size(repr) == 0, do: 0, else: {tag, repr}
+    {if(tag == :union and map_size(repr) == 0, do: 0, else: {tag, repr}), cache}
   end
 
-  defp fun_difference({tag1, repr1}, {tag2, repr2}) do
-    {tag, repr} =
+  defp fun_difference({tag1, repr1}, {tag2, repr2}, cache) do
+    {tag, repr, cache} =
       case {tag1, tag2} do
-        {:union, :union} -> {:union, fun_repr_difference(repr1, repr2)}
-        {:negation, :negation} -> {:union, fun_repr_difference(repr2, repr1)}
-        {:union, :negation} -> {:union, fun_repr_intersection(repr1, repr2)}
-        {:negation, :union} -> {:negation, fun_repr_union(repr1, repr2)}
+        {:union, :union} ->
+          {repr, cache} = fun_repr_difference(repr1, repr2, cache)
+          {:union, repr, cache}
+
+        {:negation, :negation} ->
+          {repr, cache} = fun_repr_difference(repr2, repr1, cache)
+          {:union, repr, cache}
+
+        {:union, :negation} ->
+          {repr, cache} = fun_repr_intersection(repr1, repr2, cache)
+          {:union, repr, cache}
+
+        {:negation, :union} ->
+          {repr, cache} = fun_repr_union(repr1, repr2, cache)
+          {:negation, repr, cache}
       end
 
-    if tag == :union and map_size(repr) == 0, do: 0, else: {tag, repr}
+    {if(tag == :union and map_size(repr) == 0, do: 0, else: {tag, repr}), cache}
   end
 
-  defp fun_repr_union(repr1, repr2) do
-    symmetrical_merge(repr1, repr2, fn _arity, v1, v2 -> bdd_union(v1, v2) end)
+  defp fun_repr_union(repr1, repr2, cache) do
+    symmetrical_merge(repr1, repr2, cache, fn _arity, v1, v2, cache ->
+      bdd_union(v1, v2, cache)
+    end)
   end
 
-  defp fun_repr_intersection(repr1, repr2) do
-    symmetrical_intersection(repr1, repr2, fn _arity, v1, v2 -> bdd_intersection(v1, v2) end)
+  defp fun_repr_intersection(repr1, repr2, cache) do
+    symmetrical_intersection(repr1, repr2, cache, fn _arity, v1, v2, cache ->
+      bdd_intersection(v1, v2, cache)
+    end)
   end
 
-  defp fun_repr_difference(repr1, repr2) do
+  defp fun_repr_difference(repr1, repr2, cache) do
     :maps.fold(
-      fn arity, bdd2, acc ->
+      fn arity, bdd2, {acc, cache} ->
         case acc do
           %{^arity => bdd1} ->
-            diff = bdd_difference(bdd1, bdd2)
-            if diff in @empty_difference, do: Map.delete(acc, arity), else: %{acc | arity => diff}
+            {diff, cache} = bdd_difference(bdd1, bdd2, cache)
+
+            acc =
+              if diff in @empty_difference,
+                do: Map.delete(acc, arity),
+                else: %{acc | arity => diff}
+
+            {acc, cache}
 
           %{} ->
-            acc
+            {acc, cache}
         end
       end,
-      repr1,
+      {repr1, cache},
       repr2
     )
   end
@@ -2250,6 +2323,9 @@ defmodule Module.Types.Descr do
 
   defp list_tail_unfold(:term), do: @not_non_empty_list
   defp list_tail_unfold(other), do: Map.delete(other, :list)
+
+  @compile {:inline, list_union: 2}
+  defp list_union(bdd1, bdd2), do: bdd_union(bdd1, bdd2)
 
   defp list_top?(bdd_leaf(:term, :term)), do: true
   defp list_top?(_), do: false
@@ -2677,17 +2753,17 @@ defmodule Module.Types.Descr do
   # `:dynamic` field is not_set, or it contains a type equal to the static component
   # (that is, there are no extra dynamic values).
 
-  defp dynamic_union(:term, other), do: optional_to_term(other)
-  defp dynamic_union(other, :term), do: optional_to_term(other)
+  defp dynamic_union(:term, other, cache), do: {optional_to_term(other), cache}
+  defp dynamic_union(other, :term, cache), do: {optional_to_term(other), cache}
 
-  defp dynamic_union(left, right),
-    do: symmetrical_merge(unfold(left), unfold(right), &union/3)
+  defp dynamic_union(left, right, cache),
+    do: symmetrical_merge(unfold(left), unfold(right), cache, &union/4)
 
-  defp dynamic_intersection(:term, other), do: remove_optional_static(other)
-  defp dynamic_intersection(other, :term), do: remove_optional_static(other)
+  defp dynamic_intersection(:term, other, cache), do: {remove_optional_static(other), cache}
+  defp dynamic_intersection(other, :term, cache), do: {remove_optional_static(other), cache}
 
-  defp dynamic_intersection(left, right),
-    do: symmetrical_intersection(unfold(left), unfold(right), &intersection/3)
+  defp dynamic_intersection(left, right, cache),
+    do: symmetrical_intersection(unfold(left), unfold(right), cache, &intersection/4)
 
   defp dynamic_to_quoted(descr, opts) do
     cond do
@@ -6009,7 +6085,13 @@ defmodule Module.Types.Descr do
   defp bdd_leaf_new(:closed, arg2), do: {-:erlang.phash2(arg2), :closed, arg2}
   defp bdd_leaf_new(arg1, arg2), do: {:erlang.phash2([arg1 | arg2]), arg1, arg2}
 
-  defp bdd_node_new(lit, c, u, d),
+  defp bdd_node_new(_lit, _c, :bdd_top, _d), do: :bdd_top
+  defp bdd_node_new(_lit, :bdd_bot, u, :bdd_bot), do: u
+  defp bdd_node_new(_lit, :bdd_top, _u, :bdd_top), do: :bdd_top
+  defp bdd_node_new(lit, :bdd_top, :bdd_bot, :bdd_bot), do: lit
+  defp bdd_node_new(lit, c, u, d), do: bdd_node_raw(lit, c, u, d)
+
+  defp bdd_node_raw(lit, c, u, d),
     do: {bdd_compute_hash(lit, c, u, d), lit, c, u, d}
 
   defp bdd_compute_hash(lit, c, u, d) do
@@ -6033,46 +6115,124 @@ defmodule Module.Types.Descr do
   defp bdd_hash({hash, _, _}), do: hash
   defp bdd_hash({hash, _, _, _, _}), do: hash
 
+  defp bdd_cache_key(:bdd_bot), do: {@bdd_bot_hash, 0}
+  defp bdd_cache_key(:bdd_top), do: {@bdd_top_hash, 1}
+  defp bdd_cache_key({hash, _, _}), do: {hash, 2}
+
+  defp bdd_cache_key({hash, lit, c, u, d}),
+    do: {hash, 3, bdd_hash(lit), bdd_hash(c), bdd_hash(u), bdd_hash(d)}
+
+  defp with_bdd_cache(fun) do
+    cache = bdd_cache_new()
+    {result, _cache} = fun.(cache)
+    result
+  end
+
+  defp bdd_cache_new, do: %{}
+
+  defp bdd_cache_get(cache, key) do
+    case cache do
+      %{^key => result} -> {:ok, result}
+      %{} -> :error
+    end
+  end
+
+  defp bdd_memoized_commutative(op, bdd1, bdd2, cache, fun) do
+    {bdd1, bdd2} = bdd_commutative_key_order(bdd1, bdd2)
+    bdd_memoized(op, bdd1, bdd2, cache, fun)
+  end
+
+  defp bdd_memoized(op, bdd1, bdd2, cache, fun) do
+    key = {op, bdd_cache_key(bdd1), bdd_cache_key(bdd2)}
+
+    case bdd_cache_get(cache, key) do
+      {:ok, result} ->
+        {result, cache}
+
+      :error ->
+        {result, cache} = fun.(bdd1, bdd2, cache)
+        {result, bdd_cache_put(cache, key, result)}
+    end
+  end
+
+  defp bdd_cache_put(cache, key, result) do
+    if map_size(cache) < @bdd_cache_limit do
+      Map.put(cache, key, result)
+    else
+      cache
+    end
+  end
+
+  defp bdd_commutative_key_order(bdd1, bdd2) do
+    hash1 = bdd_hash(bdd1)
+    hash2 = bdd_hash(bdd2)
+
+    cond do
+      hash1 < hash2 -> {bdd1, bdd2}
+      hash1 > hash2 -> {bdd2, bdd1}
+      true -> {bdd1, bdd2}
+    end
+  end
+
   def bdd_union(bdd, bdd), do: bdd
 
   def bdd_union(bdd1, bdd2) do
+    with_bdd_cache(fn cache -> bdd_union(bdd1, bdd2, cache) end)
+  end
+
+  defp bdd_union(bdd, bdd, cache), do: {bdd, cache}
+
+  defp bdd_union(bdd1, bdd2, cache) do
     case {bdd1, bdd2} do
       {:bdd_top, _bdd} ->
-        :bdd_top
+        {:bdd_top, cache}
 
       {_bdd, :bdd_top} ->
-        :bdd_top
+        {:bdd_top, cache}
 
       {:bdd_bot, bdd} ->
-        bdd
+        {bdd, cache}
 
       {bdd, :bdd_bot} ->
-        bdd
+        {bdd, cache}
 
       _ ->
-        case bdd_compare(bdd1, bdd2) do
-          {:lt, {_, lit1, c1, u1, d1}, bdd2} ->
-            bdd_node_new(lit1, bdd_remove(c1, bdd2), bdd_union(u1, bdd2), bdd_remove(d1, bdd2))
+        bdd_memoized_commutative(:union, bdd1, bdd2, cache, fn bdd1, bdd2, cache ->
+          {result, cache} =
+            case bdd_compare(bdd1, bdd2) do
+              {:lt, {_, lit1, c1, u1, d1}, bdd2} ->
+                {c, cache} = bdd_remove(c1, bdd2, cache)
+                {u, cache} = bdd_union(u1, bdd2, cache)
+                {d, cache} = bdd_remove(d1, bdd2, cache)
+                {bdd_node_new(lit1, c, u, d), cache}
 
-          {:gt, bdd1, {_, lit2, c2, u2, d2}} ->
-            bdd_node_new(lit2, bdd_remove(c2, bdd1), bdd_union(bdd1, u2), bdd_remove(d2, bdd1))
+              {:gt, bdd1, {_, lit2, c2, u2, d2}} ->
+                {c, cache} = bdd_remove(c2, bdd1, cache)
+                {u, cache} = bdd_union(bdd1, u2, cache)
+                {d, cache} = bdd_remove(d2, bdd1, cache)
+                {bdd_node_new(lit2, c, u, d), cache}
 
-          {:eq, {_, lit, c1, u1, d1}, {_, _, c2, u2, d2}} ->
-            bdd_node_new(lit, bdd_union(c1, c2), bdd_union(u1, u2), bdd_union(d1, d2))
+              {:eq, {_, lit, c1, u1, d1}, {_, _, c2, u2, d2}} ->
+                {c, cache} = bdd_union(c1, c2, cache)
+                {u, cache} = bdd_union(u1, u2, cache)
+                {d, cache} = bdd_union(d1, d2, cache)
+                {bdd_node_new(lit, c, u, d), cache}
 
-          {:eq, {_, lit, _, u1, d1}, _} ->
-            bdd_node_new(lit, :bdd_top, u1, d1)
+              {:eq, {_, lit, _, u1, d1}, _} ->
+                {bdd_node_new(lit, :bdd_top, u1, d1), cache}
 
-          {:eq, _, {_, lit, _, u2, d2}} ->
-            bdd_node_new(lit, :bdd_top, u2, d2)
+              {:eq, _, {_, lit, _, u2, d2}} ->
+                {bdd_node_new(lit, :bdd_top, u2, d2), cache}
 
-          {:eq, _, _} ->
-            bdd1
-        end
-        |> case do
-          {_, _, bdd, u, bdd} -> bdd_union(bdd, u)
-          other -> other
-        end
+              {:eq, _, _} ->
+                {bdd1, cache}
+            end
+
+          case result do
+            {_, _, bdd, u, bdd} -> bdd_union(bdd, u, cache)
+            other -> {other, cache}
+          end
+        end)
     end
   end
 
@@ -6080,10 +6240,10 @@ defmodule Module.Types.Descr do
   # However, if BDD2 appears in the constrained or dual nodes of BDD1,
   # we want to remove them, to avoid carrying unecessary information.
   # This function does precisely so.
-  defp bdd_remove(_bdd, :bdd_top), do: :bdd_bot
-  defp bdd_remove(bdd, :bdd_bot), do: bdd
-  defp bdd_remove(bdd, bdd_leaf(_, _) = leaf), do: bdd_remove_leaf(bdd, leaf)
-  defp bdd_remove(bdd1, bdd2), do: bdd_remove_bdd(bdd1, bdd2)
+  defp bdd_remove(_bdd, :bdd_top, cache), do: {:bdd_bot, cache}
+  defp bdd_remove(bdd, :bdd_bot, cache), do: {bdd, cache}
+  defp bdd_remove(bdd, bdd_leaf(_, _) = leaf, cache), do: bdd_remove_leaf(bdd, leaf, cache)
+  defp bdd_remove(bdd1, bdd2, cache), do: bdd_memoized(:remove, bdd1, bdd2, cache, &bdd_remove_bdd/3)
 
   # (a and C) or U or (not a and D) or a
   #
@@ -6094,138 +6254,136 @@ defmodule Module.Types.Descr do
   # Because:
   # (a and C) or a => a
   # (not a and D) or a => a or D
-  defp bdd_remove_leaf({_, leaf, _c, u, d}, leaf), do: leaf |> bdd_union(u) |> bdd_union(d)
-  defp bdd_remove_leaf(leaf, leaf), do: :bdd_bot
-  defp bdd_remove_leaf(bdd, _), do: bdd
+  defp bdd_remove_leaf({_, leaf, _c, u, d}, leaf, cache) do
+    {result, cache} = bdd_union(leaf, u, cache)
+    bdd_union(result, d, cache)
+  end
 
-  defp bdd_remove_bdd(bdd, bdd), do: :bdd_bot
+  defp bdd_remove_leaf(leaf, leaf, cache), do: {:bdd_bot, cache}
+  defp bdd_remove_leaf(bdd, _, cache), do: {bdd, cache}
 
-  defp bdd_remove_bdd({_, lit1, c1, u1, d1} = bdd1, {_, lit2, c2, u2, d2} = bdd2) do
+  defp bdd_remove_bdd(bdd, bdd, cache), do: {:bdd_bot, cache}
+
+  defp bdd_remove_bdd({_, lit1, c1, u1, d1} = bdd1, {_, lit2, c2, u2, d2} = bdd2, cache) do
     cond do
       lit1 < lit2 ->
-        bdd_node_new(
-          lit1,
-          bdd_remove_bdd(c1, bdd2),
-          bdd_remove_bdd(u1, bdd2),
-          bdd_remove_bdd(d1, bdd2)
-        )
+        {c, cache} = bdd_remove(c1, bdd2, cache)
+        {u, cache} = bdd_remove(u1, bdd2, cache)
+        {d, cache} = bdd_remove(d1, bdd2, cache)
+        {bdd_node_new(lit1, c, u, d), cache}
 
       lit1 > lit2 ->
-        bdd_remove(bdd1, u2)
+        bdd_remove(bdd1, u2, cache)
 
       true ->
-        bdd_node_new(
-          lit1,
-          bdd_remove(bdd_remove(c1, c2), u2),
-          u1,
-          bdd_remove(bdd_remove(d1, d2), u2)
-        )
+        {c, cache} = bdd_remove(c1, c2, cache)
+        {c, cache} = bdd_remove(c, u2, cache)
+        {d, cache} = bdd_remove(d1, d2, cache)
+        {d, cache} = bdd_remove(d, u2, cache)
+        {bdd_node_new(lit1, c, u1, d), cache}
     end
   end
 
-  defp bdd_remove_bdd(bdd, _), do: bdd
+  defp bdd_remove_bdd(bdd, _, cache), do: {bdd, cache}
 
   def bdd_difference(bdd, bdd), do: :bdd_bot
 
   def bdd_difference(bdd1, bdd2) do
-    case {bdd1, bdd2} do
-      {_bdd, :bdd_top} ->
-        :bdd_bot
-
-      {:bdd_bot, _bdd} ->
-        :bdd_bot
-
-      {bdd, :bdd_bot} ->
-        bdd
-
-      {:bdd_top, bdd} ->
-        bdd_negation(bdd)
-
-      _ ->
-        case bdd_compare(bdd1, bdd2) do
-          {:lt, {_, lit1, c1, u1, d1}, bdd2} ->
-            bdd_node_new(
-              lit1,
-              bdd_difference(c1, bdd2),
-              bdd_difference(u1, bdd2),
-              bdd_difference(d1, bdd2)
-            )
-
-          {:gt, bdd1, {_, lit2, c2, u2, d2}} ->
-            # The proper formula is:
-            #
-            #     b1 and not (c2 or u2) : bdd_bot : b1 and not (d2 or u2)
-            #
-            # Both extremes have (b1 and not u2), so we compute it once.
-            bdd1_minus_u2 = bdd_difference(bdd1, u2)
-
-            bdd_node_new(
-              lit2,
-              bdd_difference(bdd1_minus_u2, c2),
-              :bdd_bot,
-              bdd_difference(bdd1_minus_u2, d2)
-            )
-
-          {:eq, {_, lit, c1, u1, d1}, {_, _, c2, u2, d2}} ->
-            # The formula is:
-            # {a1, (C1 or U1) and not (C2 or U2), :bdd_bot, (D1 or U1) and not (D2 or U2)} when a1 == a2
-            #
-            # Constrained: (C1 and not C2 and not U2) or (U1 and not C2 and not U2)
-            # Dual: (D1 and not D2 and not U2) or (U1 and not D2 and not U2)
-            #
-            # We can optimize the cases below.
-            if u1 == :bdd_bot or u1 == u2 do
-              # Constrained = (C1 and not C2 and not U2)
-              # Dual = (D1 and not D2 and not U2)
-              # Hence:
-
-              bdd_node_new(
-                lit,
-                bdd_difference_union(c1, c2, u2),
-                :bdd_bot,
-                bdd_difference_union(d1, d2, u2)
-              )
-            else
-              c =
-                if c2 == :bdd_top,
-                  do: :bdd_bot,
-                  else: bdd_difference(bdd_union(c1, u1), bdd_union(c2, u2))
-
-              d =
-                if d2 == :bdd_top,
-                  do: :bdd_bot,
-                  else: bdd_difference(bdd_union(d1, u1), bdd_union(d2, u2))
-
-              bdd_node_new(lit, c, :bdd_bot, d)
-            end
-
-          {:eq, _, {_, lit, c2, u2, _d2}} ->
-            bdd_node_new(lit, bdd_negation_union(c2, u2), :bdd_bot, :bdd_bot)
-
-          {:eq, {_, lit, _c1, u1, d1}, _} ->
-            bdd_node_new(lit, :bdd_bot, :bdd_bot, bdd_union(d1, u1))
-
-          {:eq, _, _} ->
-            :bdd_bot
-        end
-        |> case do
-          {_, _, bdd, u, bdd} -> bdd_union(bdd, u)
-          other -> other
-        end
-    end
+    with_bdd_cache(fn cache -> bdd_difference(bdd1, bdd2, cache) end)
   end
 
-  # Version of i \ (u1 v u2) that only computes the union if i is not bottom
-  defp bdd_difference_union(:bdd_bot, _u1, _u2),
-    do: :bdd_bot
+  defp bdd_difference(bdd, bdd, cache) when not is_function(cache), do: {:bdd_bot, cache}
 
-  defp bdd_difference_union(i, u1, u2),
-    do: bdd_difference(i, bdd_union(u1, u2))
+  defp bdd_difference(bdd1, bdd2, cache) when not is_function(cache) do
+    case {bdd1, bdd2} do
+      {_bdd, :bdd_top} ->
+        {:bdd_bot, cache}
 
-  # We avoid bdd_negation(bdd_union(u1, u2)) because the negation
-  # would spread the unions across constrained and dual parts anyway.
-  defp bdd_negation_union(u1, u2) do
-    bdd_intersection(bdd_negation(u1), bdd_negation(u2))
+      {:bdd_bot, _bdd} ->
+        {:bdd_bot, cache}
+
+      {bdd, :bdd_bot} ->
+        {bdd, cache}
+
+      {:bdd_top, bdd} ->
+        bdd_negation(bdd, cache)
+
+      _ ->
+        bdd_memoized(:difference, bdd1, bdd2, cache, fn bdd1, bdd2, cache ->
+          {result, cache} =
+            case bdd_compare(bdd1, bdd2) do
+              {:lt, {_, lit1, c1, u1, d1}, bdd2} ->
+                {c, cache} = bdd_difference(c1, bdd2, cache)
+                {u, cache} = bdd_difference(u1, bdd2, cache)
+                {d, cache} = bdd_difference(d1, bdd2, cache)
+                {bdd_node_new(lit1, c, u, d), cache}
+
+              {:gt, bdd1, {_, lit2, c2, u2, d2}} ->
+                # The proper formula is:
+                #
+                #     b1 and not (c2 or u2) : bdd_bot : b1 and not (d2 or u2)
+                #
+                # Both extremes have (b1 and not u2), so we compute it once.
+                {bdd1_minus_u2, cache} = bdd_difference(bdd1, u2, cache)
+                {c, cache} = bdd_difference(bdd1_minus_u2, c2, cache)
+                {d, cache} = bdd_difference(bdd1_minus_u2, d2, cache)
+                {bdd_node_new(lit2, c, :bdd_bot, d), cache}
+
+              {:eq, {_, lit, c1, u1, d1}, {_, _, c2, u2, d2}} ->
+                # The formula is:
+                # {a1, (C1 or U1) and not (C2 or U2), :bdd_bot, (D1 or U1) and not (D2 or U2)} when a1 == a2
+                #
+                # Constrained: (C1 and not C2 and not U2) or (U1 and not C2 and not U2)
+                # Dual: (D1 and not D2 and not U2) or (U1 and not D2 and not U2)
+                #
+                # We can optimize the cases below.
+                if u1 == :bdd_bot or u1 == u2 do
+                  # Constrained = (C1 and not C2 and not U2)
+                  # Dual = (D1 and not D2 and not U2)
+                  # Hence:
+                  {c, cache} = bdd_difference_union(c1, c2, u2, cache)
+                  {d, cache} = bdd_difference_union(d1, d2, u2, cache)
+                  {bdd_node_new(lit, c, :bdd_bot, d), cache}
+                else
+                  {c, cache} =
+                    if c2 == :bdd_top do
+                      {:bdd_bot, cache}
+                    else
+                      {left, cache} = bdd_union(c1, u1, cache)
+                      {right, cache} = bdd_union(c2, u2, cache)
+                      bdd_difference(left, right, cache)
+                    end
+
+                  {d, cache} =
+                    if d2 == :bdd_top do
+                      {:bdd_bot, cache}
+                    else
+                      {left, cache} = bdd_union(d1, u1, cache)
+                      {right, cache} = bdd_union(d2, u2, cache)
+                      bdd_difference(left, right, cache)
+                    end
+
+                  {bdd_node_new(lit, c, :bdd_bot, d), cache}
+                end
+
+              {:eq, _, {_, lit, c2, u2, _d2}} ->
+                {c, cache} = bdd_negation_union(c2, u2, cache)
+                {bdd_node_new(lit, c, :bdd_bot, :bdd_bot), cache}
+
+              {:eq, {_, lit, _c1, u1, d1}, _} ->
+                {d, cache} = bdd_union(d1, u1, cache)
+                {bdd_node_new(lit, :bdd_bot, :bdd_bot, d), cache}
+
+              {:eq, _, _} ->
+                {:bdd_bot, cache}
+            end
+
+          case result do
+            {_, _, bdd, u, bdd} -> bdd_union(bdd, u, cache)
+            other -> {other, cache}
+          end
+        end)
+    end
   end
 
   ## Optimize differences
@@ -6319,98 +6477,98 @@ defmodule Module.Types.Descr do
   defp bdd_difference(bdd1, bdd2, _leaf_compare),
     do: bdd_difference(bdd1, bdd2)
 
+  defp bdd_difference_union(:bdd_bot, _u1, _u2, cache),
+    do: {:bdd_bot, cache}
+
+  defp bdd_difference_union(i, u1, u2, cache) do
+    {union, cache} = bdd_union(u1, u2, cache)
+    bdd_difference(i, union, cache)
+  end
+
+  defp bdd_negation_union(u1, u2, cache) do
+    {u1, cache} = bdd_negation(u1, cache)
+    {u2, cache} = bdd_negation(u2, cache)
+    bdd_intersection(u1, u2, cache)
+  end
+
   def bdd_intersection(bdd, bdd), do: bdd
 
   def bdd_intersection(bdd1, bdd2) do
-    case {bdd1, bdd2} do
-      {:bdd_top, bdd} ->
-        bdd
-
-      {bdd, :bdd_top} ->
-        bdd
-
-      {:bdd_bot, _bdd} ->
-        :bdd_bot
-
-      {_, :bdd_bot} ->
-        :bdd_bot
-
-      _ ->
-        case bdd_compare(bdd1, bdd2) do
-          {:lt, {_, lit1, c1, u1, d1}, bdd2} ->
-            bdd_node_new(
-              lit1,
-              bdd_intersection(c1, bdd2),
-              bdd_intersection(u1, bdd2),
-              bdd_intersection(d1, bdd2)
-            )
-
-          {:gt, bdd1, {_, lit2, c2, u2, d2}} ->
-            bdd_node_new(
-              lit2,
-              bdd_intersection(bdd1, c2),
-              bdd_intersection(bdd1, u2),
-              bdd_intersection(bdd1, d2)
-            )
-
-          # Notice that (a, c1, u1, d1) and (a, c2, u2, d2) is described as:
-          #
-          #     {a, (C1 or U1) and (C2 or U2), :bdd_bot, (D1 or U1) and (D2 or U2)}
-          #
-          # However, if we distribute the intersection over the unions, we find a
-          # common term, U1 and U2, leading to:
-          #
-          #     {a1,
-          #      (C1 and (C2 or U2)) or (U1 and C2),
-          #      (U1 and U2),
-          #      (D1 and (D2 or U2)) or (U1 and D2)}
-          #
-          # This formula is longer, meaning more operations, but it does preserve
-          # unions in place whenever possible, especially in the cases where C1
-          # and C2 are top, D1 and D2 are bottom.
-          {:eq, {_, lit, c1, u1, d1}, {_, _, c2, u2, d2}} ->
-            bdd_node_new(
-              lit,
-              bdd_intersection_eq(c1, c2, u1, u2),
-              bdd_intersection(u1, u2),
-              bdd_intersection_eq(d1, d2, u1, u2)
-            )
-
-          {:eq, {_, lit, c1, u1, _}, _} ->
-            bdd_node_new(lit, bdd_union(c1, u1), :bdd_bot, :bdd_bot)
-
-          {:eq, _, {_, lit, c2, u2, _}} ->
-            bdd_node_new(lit, bdd_union(c2, u2), :bdd_bot, :bdd_bot)
-
-          {:eq, bdd, _} ->
-            bdd
-        end
-        |> case do
-          {_, _, bdd, u, bdd} -> bdd_union(bdd, u)
-          other -> other
-        end
-    end
+    with_bdd_cache(fn cache -> bdd_intersection(bdd1, bdd2, cache) end)
   end
 
-  # The arms of bdd_intersect equal have shape:
-  #
-  # (C1 and C2) or (C1 and U2) or (U1 and C2)
-  # (D1 and D2) or (D1 and U2) or (U1 and D2)
-  #
-  # They are symmetrical, so we optimize it using the formula below,
-  # which also deals with cases that lead to large eliminations.
-  #
-  # The final clause reduces the amount of operations by rewriting it to:
-  # (C1 and (C2 or U2)) or (U1 and C2)
-  defp bdd_intersection_eq(:bdd_top, :bdd_top, _u1, _u2), do: :bdd_top
+  defp bdd_intersection(bdd, bdd, cache) when not is_function(cache), do: {bdd, cache}
 
-  defp bdd_intersection_eq(:bdd_bot, cd2, u1, _u2), do: bdd_intersection(u1, cd2)
-  defp bdd_intersection_eq(cd1, :bdd_bot, _u1, u2), do: bdd_intersection(u2, cd1)
-  defp bdd_intersection_eq(cd1, cd2, :bdd_bot, u2), do: bdd_intersection(cd1, bdd_union(cd2, u2))
-  defp bdd_intersection_eq(cd1, cd2, u1, :bdd_bot), do: bdd_intersection(cd2, bdd_union(cd1, u1))
+  defp bdd_intersection(bdd1, bdd2, cache) when not is_function(cache) do
+    case {bdd1, bdd2} do
+      {:bdd_top, bdd} ->
+        {bdd, cache}
 
-  defp bdd_intersection_eq(cd1, cd2, u1, u2) do
-    bdd_union(bdd_intersection(cd1, bdd_union(cd2, u2)), bdd_intersection(u1, cd2))
+      {bdd, :bdd_top} ->
+        {bdd, cache}
+
+      {:bdd_bot, _bdd} ->
+        {:bdd_bot, cache}
+
+      {_, :bdd_bot} ->
+        {:bdd_bot, cache}
+
+      _ ->
+        bdd_memoized_commutative(:intersection, bdd1, bdd2, cache, fn bdd1, bdd2, cache ->
+          {result, cache} =
+            case bdd_compare(bdd1, bdd2) do
+              {:lt, {_, lit1, c1, u1, d1}, bdd2} ->
+                {c, cache} = bdd_intersection(c1, bdd2, cache)
+                {u, cache} = bdd_intersection(u1, bdd2, cache)
+                {d, cache} = bdd_intersection(d1, bdd2, cache)
+                {bdd_node_new(lit1, c, u, d), cache}
+
+              {:gt, bdd1, {_, lit2, c2, u2, d2}} ->
+                {c, cache} = bdd_intersection(bdd1, c2, cache)
+                {u, cache} = bdd_intersection(bdd1, u2, cache)
+                {d, cache} = bdd_intersection(bdd1, d2, cache)
+                {bdd_node_new(lit2, c, u, d), cache}
+
+              # Notice that (a, c1, u1, d1) and (a, c2, u2, d2) is described as:
+              #
+              #     {a, (C1 or U1) and (C2 or U2), :bdd_bot, (D1 or U1) and (D2 or U2)}
+              #
+              # However, if we distribute the intersection over the unions, we find a
+              # common term, U1 and U2, leading to:
+              #
+              #     {a1,
+              #      (C1 and (C2 or U2)) or (U1 and C2),
+              #      (U1 and U2),
+              #      (D1 and (D2 or U2)) or (U1 and D2)}
+              #
+              # This formula is longer, meaning more operations, but it does preserve
+              # unions in place whenever possible. This change has reduced the algorithmic
+              # complexity in the past, but perhaps it is rendered less useful now due to
+              # the eager literal intersections.
+              {:eq, {_, lit, c1, u1, d1}, {_, _, c2, u2, d2}} ->
+                {c, cache} = bdd_intersection_eq(c1, c2, u1, u2, cache)
+                {u, cache} = bdd_intersection(u1, u2, cache)
+                {d, cache} = bdd_intersection_eq(d1, d2, u1, u2, cache)
+                {bdd_node_new(lit, c, u, d), cache}
+
+              {:eq, {_, lit, c1, u1, _}, _} ->
+                {c, cache} = bdd_union(c1, u1, cache)
+                {bdd_node_new(lit, c, :bdd_bot, :bdd_bot), cache}
+
+              {:eq, _, {_, lit, c2, u2, _}} ->
+                {c, cache} = bdd_union(c2, u2, cache)
+                {bdd_node_new(lit, c, :bdd_bot, :bdd_bot), cache}
+
+              {:eq, bdd, _} ->
+                {bdd, cache}
+            end
+
+          case result do
+            {_, _, bdd, u, bdd} -> bdd_union(bdd, u, cache)
+            other -> {other, cache}
+          end
+        end)
+    end
   end
 
   # Intersections are great because they allow us to cut down
@@ -6430,6 +6588,41 @@ defmodule Module.Types.Descr do
 
   defp bdd_intersection(bdd1, bdd2, _leaf_intersection) do
     bdd_intersection(bdd1, bdd2)
+  end
+
+  # The arms of bdd_intersect equal have shape:
+  #
+  # (C1 and C2) or (C1 and U2) or (U1 and C2)
+  # (D1 and D2) or (D1 and U2) or (U1 and D2)
+  #
+  # They are symmetrical, so we optimize it using the formula below,
+  # which also deals with cases that lead to large eliminations.
+  #
+  # The final clause reduces the amount of operations by rewriting it to:
+  # (C1 and (C2 or U2)) or (U1 and C2)
+  defp bdd_intersection_eq(:bdd_top, :bdd_top, _u1, _u2, cache), do: {:bdd_top, cache}
+
+  defp bdd_intersection_eq(:bdd_bot, cd2, u1, _u2, cache),
+    do: bdd_intersection(u1, cd2, cache)
+
+  defp bdd_intersection_eq(cd1, :bdd_bot, _u1, u2, cache),
+    do: bdd_intersection(u2, cd1, cache)
+
+  defp bdd_intersection_eq(cd1, cd2, :bdd_bot, u2, cache) do
+    {right, cache} = bdd_union(cd2, u2, cache)
+    bdd_intersection(cd1, right, cache)
+  end
+
+  defp bdd_intersection_eq(cd1, cd2, u1, :bdd_bot, cache) do
+    {right, cache} = bdd_union(cd1, u1, cache)
+    bdd_intersection(cd2, right, cache)
+  end
+
+  defp bdd_intersection_eq(cd1, cd2, u1, u2, cache) do
+    {right, cache} = bdd_union(cd2, u2, cache)
+    {left, cache} = bdd_intersection(cd1, right, cache)
+    {right, cache} = bdd_intersection(u1, cd2, cache)
+    bdd_union(left, right, cache)
   end
 
   # Take two BDDs, B1 = {a1, C1, U1, D1} and B2 = a2.
@@ -6494,6 +6687,25 @@ defmodule Module.Types.Descr do
     end
   end
 
+  defp bdd_negation(:bdd_top, cache), do: {:bdd_bot, cache}
+  defp bdd_negation(:bdd_bot, cache), do: {:bdd_top, cache}
+
+  defp bdd_negation(bdd_leaf(_, _) = pair, cache),
+    do: {bdd_node_new(pair, :bdd_bot, :bdd_bot, :bdd_top), cache}
+
+  defp bdd_negation({_, lit, c, u, d}, cache) do
+    {c, cache} = bdd_negation(c, cache)
+    {d, cache} = bdd_negation(d, cache)
+    inner = bdd_node_new(lit, c, :bdd_bot, d)
+    {u, cache} = bdd_negation(u, cache)
+
+    case bdd_intersection(inner, u, cache) do
+      # Full simplification necessary for e.g. formatter.ex compilation
+      {{_, _lit, c, u, c}, cache} -> bdd_union(u, c, cache)
+      other -> other
+    end
+  end
+
   def bdd_to_dnf(bdd), do: bdd_to_dnf([], [], [], bdd)
 
   defp bdd_to_dnf(acc, _pos, _neg, :bdd_bot), do: acc
@@ -6514,10 +6726,18 @@ defmodule Module.Types.Descr do
   end
 
   defp bdd_compare(bdd1, bdd2) do
-    case {bdd_head(bdd1), bdd_head(bdd2)} do
-      {lit1, lit2} when lit1 < lit2 -> {:lt, bdd_expand(bdd1), bdd2}
-      {lit1, lit2} when lit1 > lit2 -> {:gt, bdd1, bdd_expand(bdd2)}
-      _ -> {:eq, bdd1, bdd2}
+    case bdd_compare_literal(bdd_head(bdd1), bdd_head(bdd2)) do
+      :lt -> {:lt, bdd_expand(bdd1), bdd2}
+      :gt -> {:gt, bdd1, bdd_expand(bdd2)}
+      :eq -> {:eq, bdd1, bdd2}
+    end
+  end
+
+  defp bdd_compare_literal(lit1, lit2) do
+    cond do
+      lit1 < lit2 -> :lt
+      lit1 > lit2 -> :gt
+      true -> :eq
     end
   end
 
@@ -6558,66 +6778,72 @@ defmodule Module.Types.Descr do
   end
 
   @compile {:inline, bdd_expand: 1, bdd_head: 1}
-  defp bdd_expand(bdd_leaf(_, _) = pair), do: bdd_node_new(pair, :bdd_top, :bdd_bot, :bdd_bot)
+  defp bdd_expand(bdd_leaf(_, _) = pair), do: bdd_node_raw(pair, :bdd_top, :bdd_bot, :bdd_bot)
   defp bdd_expand(bdd), do: bdd
 
-  defp bdd_head({_, lit, _, _, _}), do: lit
-  defp bdd_head(pair), do: pair
+  defp bdd_head({_, bdd_leaf(arg1, arg2), _, _, _}), do: {arg1, arg2}
+  defp bdd_head(bdd_leaf(arg1, arg2)), do: {arg1, arg2}
 
   ## Map helpers
 
-  # Erlang maps:merge_with/3 has to preserve the order in combiner.
-  # We don't care about the order, so we have a faster implementation.
-  defp symmetrical_merge(left, right, fun) do
+  defp symmetrical_merge(left, right, cache, fun) do
     if map_size(left) > map_size(right) do
-      iterator_merge(:maps.next(:maps.iterator(right)), left, fun)
+      iterator_merge(:maps.next(:maps.iterator(right)), left, cache, fun)
     else
-      iterator_merge(:maps.next(:maps.iterator(left)), right, fun)
+      iterator_merge(:maps.next(:maps.iterator(left)), right, cache, fun)
     end
   end
 
-  defp iterator_merge({key, v1, iterator}, map, fun) do
-    acc =
-      case map do
-        %{^key => v2} -> %{map | key => fun.(key, v1, v2)}
-        %{} -> Map.put(map, key, v1)
-      end
-
-    iterator_merge(:maps.next(iterator), acc, fun)
-  end
-
-  defp iterator_merge(:none, map, _fun), do: map
-
-  # Erlang maps:intersect_with/3 has to preserve the order in combiner.
-  # We don't care about the order, so we have a faster implementation.
-  defp symmetrical_intersection(left, right, fun) do
-    if map_size(left) > map_size(right) do
-      iterator_intersection(:maps.next(:maps.iterator(right)), left, [], fun)
-    else
-      iterator_intersection(:maps.next(:maps.iterator(left)), right, [], fun)
-    end
-  end
-
-  defp iterator_intersection({key, v1, iterator}, map, acc, fun) do
-    acc =
+  defp iterator_merge({key, v1, iterator}, map, cache, fun) do
+    {acc, cache} =
       case map do
         %{^key => v2} ->
-          value = fun.(key, v1, v2)
+          {value, cache} = fun.(key, v1, v2, cache)
+          {%{map | key => value}, cache}
+
+        %{} ->
+          {Map.put(map, key, v1), cache}
+      end
+
+    iterator_merge(:maps.next(iterator), acc, cache, fun)
+  end
+
+  defp iterator_merge(:none, map, cache, _fun), do: {map, cache}
+
+  defp symmetrical_intersection(:term, right, cache, fun),
+    do: symmetrical_intersection(unfolded_term(), right, cache, fun)
+
+  defp symmetrical_intersection(left, :term, cache, fun),
+    do: symmetrical_intersection(left, unfolded_term(), cache, fun)
+
+  defp symmetrical_intersection(left, right, cache, fun) do
+    if map_size(left) > map_size(right) do
+      iterator_intersection(:maps.next(:maps.iterator(right)), left, [], cache, fun)
+    else
+      iterator_intersection(:maps.next(:maps.iterator(left)), right, [], cache, fun)
+    end
+  end
+
+  defp iterator_intersection({key, v1, iterator}, map, acc, cache, fun) do
+    {acc, cache} =
+      case map do
+        %{^key => v2} ->
+          {value, cache} = fun.(key, v1, v2, cache)
 
           if value in @empty_intersection do
-            acc
+            {acc, cache}
           else
-            [{key, value} | acc]
+            {[{key, value} | acc], cache}
           end
 
         %{} ->
-          acc
+          {acc, cache}
       end
 
-    iterator_intersection(:maps.next(iterator), map, acc, fun)
+    iterator_intersection(:maps.next(iterator), map, acc, cache, fun)
   end
 
-  defp iterator_intersection(:none, _map, acc, _fun), do: :maps.from_list(acc)
+  defp iterator_intersection(:none, _map, acc, cache, _fun), do: {:maps.from_list(acc), cache}
 
   defp non_disjoint_intersection?(left, right) do
     # Erlang maps:intersect_with/3 has to preserve the order in combiner.
