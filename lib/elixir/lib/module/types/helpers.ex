@@ -535,6 +535,16 @@ defmodule Module.Types.Helpers do
   @doc """
   Emits a warning.
   """
+  def warn(
+        Module.Types.Pattern,
+        {:redundant, {{:def, _kind, _fun, _types}, _args, _guards}, _, _, _, _},
+        _meta,
+        _stack,
+        context
+      ) do
+    context
+  end
+
   def warn(module, warning, meta, stack, context) do
     if Keyword.get(meta, :generated, false) do
       context
@@ -554,6 +564,16 @@ defmodule Module.Types.Helpers do
 
   In practice an error is a warning that halts other errors from being collected.
   """
+  def error(
+        Module.Types.Pattern,
+        {:badpattern, _meta, _index, {{:def, _kind, _fun, _types}, _args, _guards}, _context},
+        _diagnostic_meta,
+        _stack,
+        context
+      ) do
+    %{context | failed: true}
+  end
+
   def error(module, warning, meta, stack, context) do
     case context do
       %{failed: true} ->

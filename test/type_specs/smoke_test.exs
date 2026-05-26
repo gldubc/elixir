@@ -16,7 +16,6 @@ defmodule TypeSpecs.SmokeTest do
   @assert_type_form (integer() -> {atom(), integer(), boolean()})
   def to_tuple3(x) when is_integer(x), do: {:ok, x, true}
 
-
   @assert_type_form (not integer() -> true) and (integer() -> false)
   def f(x) when not is_integer(x), do: true
   def f(x), do: false

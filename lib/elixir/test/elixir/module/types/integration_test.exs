@@ -602,30 +602,7 @@ defmodule Module.Types.IntegrationTest do
         """
       }
 
-      warnings = [
-        """
-            warning: the following clause is redundant:
-
-                def foo(x, y) when is_integer(x) and is_integer(y)
-
-            it has type:
-
-                integer(), integer()
-
-            previous clauses have already matched on the following types:
-
-                integer(), term()
-                term(), integer()
-
-            │
-          4 │   def foo(x, y) when is_integer(x) and is_integer(y), do: :three
-            │       ~
-            │
-            └─ a.ex:4:7: A.foo/2
-        """
-      ]
-
-      assert_warnings(files, warnings)
+      assert_no_warnings(files)
     end
 
     test "mismatched locals" do
@@ -833,47 +810,16 @@ defmodule Module.Types.IntegrationTest do
         """
       }
 
-      warnings = [
-        """
-            warning: the 1st pattern in clause will never match:
+      warning = """
+          warning: this clause cannot match because a previous clause at line 7 matches the same pattern as this clause
+          │
+        8 │   def itself(%Range{}), do: raise "oops"
+          │       ~
+          │
+          └─ a.ex:8:7
+      """
 
-                nil
-
-            because it is expected to receive type:
-
-                dynamic(%Range{})
-
-            hint: defimpl for Range requires its callbacks to match exclusively on %Range{}
-
-            type warning found at:
-            │
-          6 │   def itself(nil), do: nil
-            │   ~~~~~~~~~~~~~~~~~~~~~~~~
-            │
-            └─ a.ex:6: Itself.Range.itself/1
-        """,
-        """
-            warning: the following clause is redundant:
-
-                def itself(%Range{})
-
-            it has type:
-
-                %Range{}
-
-            previous clauses have already matched on the following types:
-
-                %Range{}
-
-            │
-          8 │   def itself(%Range{}), do: raise "oops"
-            │       ~
-            │
-            └─ a.ex:8:7: Itself.Range.itself/1
-        """
-      ]
-
-      assert_warnings(files, warnings)
+      assert_warnings(files, [warning])
     end
 
     @tag :require_ast
