@@ -141,10 +141,10 @@ defmodule Module.Types.InferTest do
     number = union(integer(), float())
 
     assert types[{:fun, 1}] ==
-             {:infer, nil, [{[open_map(foo: number, bar: number)], dynamic(number)}]}
+             {:infer, nil, [{[open_map(foo: number, bar: number)], number}]}
 
     assert types[{:fun_nested, 1}] ==
-             {:infer, nil, [{[open_map(x: open_map(foo: number, bar: number))], dynamic(number)}]}
+             {:infer, nil, [{[open_map(x: open_map(foo: number, bar: number))], number}]}
   end
 
   test "from Elixir built-in", config do

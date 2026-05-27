@@ -1727,15 +1727,9 @@ defmodule Module.Types.Apply do
   @doc """
   Computes the return type of an application.
   """
-  def return(type, args_types, stack) do
-    # An argument being gradual does not imply the return type
-    # is gradual in static mode. However, we do wrap in dynamic
-    # in :dynamic / :gradual mode to avoid false positives.
-    cond do
-      stack.mode == :static -> type
-      Enum.any?(args_types, &gradual?/1) -> dynamic(type)
-      true -> type
-    end
+  def return(type, _args_types, _stack) do
+    # An argument being gradual does not imply the return type is gradual.
+    type
   end
 
   ## Map helpers

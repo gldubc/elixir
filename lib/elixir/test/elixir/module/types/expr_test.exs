@@ -1562,9 +1562,9 @@ defmodule Module.Types.ExprTest do
     end
 
     test "in dynamic mode" do
-      assert typedyn!([x = 123, y = 456.0], x < y) == dynamic(boolean())
-      assert typedyn!([x = 123, y = 456.0], x == y) == dynamic(boolean())
-      assert typedyn!([x = 123, y = 456], x == y) == dynamic(boolean())
+      assert typedyn!([x = 123, y = 456.0], x < y) == boolean()
+      assert typedyn!([x = 123, y = 456.0], x == y) == boolean()
+      assert typedyn!([x = 123, y = 456], x == y) == boolean()
     end
 
     test "using literals" do
@@ -1790,6 +1790,14 @@ defmodule Module.Types.ExprTest do
                    # from: types_test.ex:LINE-1
                    x = :foo
                """
+    end
+
+    test "strong calls with dynamic inputs in dynamic mode do not wrap their returns" do
+      assert typedyn!([x], x) == dynamic()
+      assert typedyn!([x], Integer.to_string(x)) == binary()
+      assert typedyn!([x], String.to_atom(x)) == atom()
+      assert typedyn!([x], length(x)) == integer()
+      assert typedyn!([x, y], rem(x, y)) == integer()
     end
 
     test "Bitwise.bnot/1" do
