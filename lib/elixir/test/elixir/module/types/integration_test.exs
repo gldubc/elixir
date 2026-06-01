@@ -366,9 +366,9 @@ defmodule Module.Types.IntegrationTest do
       files = %{
         "a.ex" => """
         defmodule A do
-          @assert_type_form (dynamic() -> dynamic())
-          def typed(x) when is_integer(x), do: -x
-          def typed(x) when is_boolean(x), do: not x
+          @assert_type_form (dynamic(), dynamic() -> dynamic())
+          def typed(x, y) when is_integer(x), do: y
+          def typed(x, y) when is_boolean(x), do: y
         end
         """
       }
@@ -376,18 +376,18 @@ defmodule Module.Types.IntegrationTest do
       modules = compile_modules(files)
       exports = read_chunk(modules[A]).exports |> Map.new()
 
-      assert %{{:typed, 1} => %{sig: {:strong, nil, clauses}}} = exports
-      assert clauses == [{[dynamic()], dynamic()}]
+      assert %{{:typed, 2} => %{sig: {:strong, nil, clauses}}} = exports
+      assert clauses == [{[dynamic(), dynamic()], dynamic()}]
     end
 
     test "expands @define_type_form aliases in @assert_type_form" do
       files = %{
         "a.ex" => """
         defmodule A do
-          @define_type_form t: (dynamic() -> dynamic())
+          @define_type_form t: (dynamic(), dynamic() -> dynamic())
           @assert_type_form t()
-          def typed(x) when is_integer(x), do: -x
-          def typed(x) when is_boolean(x), do: not x
+          def typed(x, y) when is_integer(x), do: y
+          def typed(x, y) when is_boolean(x), do: y
         end
         """
       }
@@ -395,8 +395,8 @@ defmodule Module.Types.IntegrationTest do
       modules = compile_modules(files)
       exports = read_chunk(modules[A]).exports |> Map.new()
 
-      assert %{{:typed, 1} => %{sig: {:strong, nil, clauses}}} = exports
-      assert clauses == [{[dynamic()], dynamic()}]
+      assert %{{:typed, 2} => %{sig: {:strong, nil, clauses}}} = exports
+      assert clauses == [{[dynamic(), dynamic()], dynamic()}]
     end
 
     test "supports map literals in @define_type_form" do
@@ -404,7 +404,7 @@ defmodule Module.Types.IntegrationTest do
         "a.ex" => """
         defmodule A do
           @define_type_form m: %{..., a: pid()}
-          @assert_type_form (m() -> dynamic())
+          @assert_type_form (m() -> m())
           def typed(x), do: x
         end
         """
@@ -414,7 +414,7 @@ defmodule Module.Types.IntegrationTest do
       exports = read_chunk(modules[A]).exports |> Map.new()
 
       assert %{{:typed, 1} => %{sig: {:strong, nil, clauses}}} = exports
-      assert clauses == [{[open_map(a: pid())], dynamic()}]
+      assert clauses == [{[open_map(a: pid())], open_map(a: pid())}]
     end
 
     test "supports tuple literals in @define_type_form" do
@@ -422,7 +422,7 @@ defmodule Module.Types.IntegrationTest do
         "a.ex" => """
         defmodule A do
           @define_type_form t: {atom(), integer()}
-          @assert_type_form (t() -> dynamic())
+          @assert_type_form (t() -> t())
           def typed(x), do: x
         end
         """
@@ -432,7 +432,7 @@ defmodule Module.Types.IntegrationTest do
       exports = read_chunk(modules[A]).exports |> Map.new()
 
       assert %{{:typed, 1} => %{sig: {:strong, nil, clauses}}} = exports
-      assert clauses == [{[tuple([atom(), integer()])], dynamic()}]
+      assert clauses == [{[tuple([atom(), integer()])], tuple([atom(), integer()])}]
     end
 
     test "supports domain key map literals in @assert_type_form" do
@@ -687,6 +687,78 @@ defmodule Module.Types.IntegrationTest do
         "but @assert_type expects:",
         "float()",
         "atom()"
+      ]
+
+      assert_warnings(files, warnings)
+    end
+
+    test "asserted returns use subtyping for gradual return types" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @assert_type_form (term() -> dynamic())
+          def typed(_x), do: 1
+        end
+        """
+      }
+
+      warnings = [
+        "asserted return type does not match the function body",
+        "but @assert_type expects:",
+        "dynamic()",
+        "integer()"
+      ]
+
+      assert_warnings(files, warnings)
+    end
+
+    test "asserted returns check conditional results statically" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @assert_type_form (term() -> integer())
+          def typed(_x) do
+            if true do
+              "abc"
+            else
+              0
+            end
+          end
+        end
+        """
+      }
+
+      warnings = [
+        "asserted return type does not match the function body",
+        "but @assert_type expects:",
+        "integer()",
+        "binary()"
+      ]
+
+      assert_warnings(files, warnings)
+    end
+
+    test "asserted returns check refined field results statically" do
+      files = %{
+        "a.ex" => """
+        defmodule A do
+          @assert_type_form (%{..., a: term()} -> integer())
+          def typed(x) do
+            if is_binary(x.a) do
+              x.a
+            else
+              0
+            end
+          end
+        end
+        """
+      }
+
+      warnings = [
+        "asserted return type does not match the function body",
+        "but @assert_type expects:",
+        "integer()",
+        "binary()"
       ]
 
       assert_warnings(files, warnings)

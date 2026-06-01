@@ -468,7 +468,7 @@ defmodule Module.Types.Descr do
 
   defp add_asserted_fun_bdd_arrows(arrows, acc) do
     Enum.reduce_while(arrows, {:ok, acc}, fn
-      {args, return}, {:ok, acc} ->
+      bdd_leaf(args, return), {:ok, acc} ->
         {:cont, {:ok, [{args, return} | acc]}}
 
       _other, _acc ->

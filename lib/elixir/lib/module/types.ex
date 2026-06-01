@@ -260,7 +260,7 @@ defmodule Module.Types do
               else
                 {[clause_index | used_indexes], unused_indexes}
               end
-          end)
+            end)
 
           unused_indexes = Enum.uniq(unused_indexes) -- used_indexes
 
@@ -330,6 +330,7 @@ defmodule Module.Types do
     {fun, _arity} = fun_arity
     asserted_clauses = asserted_clauses(meta, fun_arity, clauses)
     asserted? = asserted_clauses != []
+    mode = if asserted?, do: :static, else: mode
     stack = stack |> fresh_stack(mode, fun_arity) |> with_file_meta(meta)
     base_info = {:def, kind, fun, expected}
 
@@ -822,7 +823,7 @@ defmodule Module.Types do
   end
 
   defp validate_asserted_return(actual, expected, body, meta, stack, context) do
-    if Descr.compatible?(actual, expected) do
+    if Descr.subtype?(actual, expected) do
       {actual, context}
     else
       warning = {:badassertreturn, expected, actual, body, context}
