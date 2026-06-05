@@ -5,7 +5,7 @@
 defmodule Module.Types.Pattern do
   @moduledoc false
 
-  alias Module.Types.{Apply, Of}
+  alias Module.Types.{Apply, Instrumentation, Of}
   import Module.Types.{Helpers, Descr}
 
   @doc """
@@ -186,36 +186,39 @@ defmodule Module.Types.Pattern do
     {trees, precise?, check_previous?, args_types, context} =
       of_precise_head(patterns, guards, expected, previous, tag, stack, original)
 
-    if context.failed and stack.mode != :infer and not empty_previous?(previous) and
-         Keyword.get(meta, :generated, false) != true do
-      # If it failed, let's try to break it down to a better error message.
-      # First we check if it fails without previous, if it doesn't, check if it is redundant.
-      case of_precise_head(patterns, guards, expected, init_previous(), tag, stack, original) do
-        {other_trees, _, _, _, %{failed: true} = other_context} ->
-          {other_trees, false, args_types, previous, other_context}
+    result =
+      if context.failed and stack.mode != :infer and not empty_previous?(previous) and
+           Keyword.get(meta, :generated, false) != true do
+        # If it failed, let's try to break it down to a better error message.
+        # First we check if it fails without previous, if it doesn't, check if it is redundant.
+        case of_precise_head(patterns, guards, expected, init_previous(), tag, stack, original) do
+          {other_trees, _, _, _, %{failed: true} = other_context} ->
+            {other_trees, false, args_types, previous, other_context}
 
-        {other_trees, _, _, args_types, other_context} ->
-          if previous_subtype?(args_types, previous) do
-            warning = {:redundant, tag, expected, args_types, previous, other_context}
-            context = warn(__MODULE__, warning, meta, stack, other_context)
-            {other_trees, false, args_types, previous, context}
-          else
+          {other_trees, _, _, args_types, other_context} ->
+            if previous_subtype?(args_types, previous) do
+              warning = {:redundant, tag, expected, args_types, previous, other_context}
+              context = warn(__MODULE__, warning, meta, stack, other_context)
+              {other_trees, false, args_types, previous, context}
+            else
+              {trees, false, args_types, previous, context}
+            end
+        end
+      else
+        cond do
+          check_previous? and previous_subtype?(args_types, previous) ->
+            warning = {:redundant, tag, expected, args_types, previous, context}
+            {trees, false, args_types, previous, warn(__MODULE__, warning, meta, stack, context)}
+
+          precise? ->
+            {trees, true, args_types, concat_previous(args_types, previous), context}
+
+          true ->
             {trees, false, args_types, previous, context}
-          end
+        end
       end
-    else
-      cond do
-        check_previous? and previous_subtype?(args_types, previous) ->
-          warning = {:redundant, tag, expected, args_types, previous, context}
-          {trees, false, args_types, previous, warn(__MODULE__, warning, meta, stack, context)}
 
-        precise? ->
-          {trees, true, args_types, concat_previous(args_types, previous), context}
-
-        true ->
-          {trees, false, args_types, previous, context}
-      end
-    end
+    instrument_head(result, patterns, guards, expected, tag, meta, stack)
   end
 
   defp of_precise_head([], guards, _expected, _previous, _tag, stack, context) do
@@ -336,14 +339,69 @@ defmodule Module.Types.Pattern do
     args = [{tree, expected, pattern}]
     tag = {op, expr, expected}
 
-    with {:ok, types} <-
-           of_pattern_intersect(args, 0, [], pattern_info, tag, stack, context),
-         {:ok, context} <-
-           of_pattern_refine(types, changed, pattern_info, tag, stack, context) do
-      {args, pattern_precise? and guard_precise?, context}
-    else
-      {:error, context} -> {args, false, context}
-    end
+    result =
+      with {:ok, types} <-
+             of_pattern_intersect(args, 0, [], pattern_info, tag, stack, context),
+           {:ok, context} <-
+             of_pattern_refine(types, changed, pattern_info, tag, stack, context) do
+        {args, pattern_precise? and guard_precise?, context}
+      else
+        {:error, context} -> {args, false, context}
+      end
+
+    instrument_generator(result, pattern, guards, expected, op, meta, stack)
+  end
+
+  defp instrument_head(
+         {trees, precise?, _args_types, _previous, context} = result,
+         patterns,
+         guards,
+         expected,
+         tag,
+         meta,
+         stack
+       ) do
+    possible = trees_to_args_types(trees, stack, context)
+
+    Instrumentation.guard_exactness(
+      :head,
+      patterns,
+      guards,
+      expected,
+      possible,
+      precise?,
+      tag,
+      meta,
+      stack
+    )
+
+    result
+  end
+
+  defp instrument_generator(
+         {args, precise?, context} = result,
+         pattern,
+         guards,
+         expected,
+         op,
+         meta,
+         stack
+       ) do
+    possible = trees_to_args_types(args, stack, context)
+
+    Instrumentation.guard_exactness(
+      op,
+      [pattern],
+      guards,
+      [expected],
+      possible,
+      precise?,
+      {op, pattern, guards},
+      meta,
+      stack
+    )
+
+    result
   end
 
   defp of_pattern_intersect([head | tail], index, acc, pattern_info, tag, stack, context) do

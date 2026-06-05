@@ -222,6 +222,7 @@ bootstrap_files() ->
      <<"module/behaviour.ex">>,
      <<"module/types/helpers.ex">>,
      <<"module/types/descr.ex">>,
+     <<"module/types/instrumentation.ex">>,
      <<"module/types/of.ex">>,
      <<"module/types/pattern.ex">>,
      <<"module/types/apply.ex">>,
