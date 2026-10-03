@@ -120,6 +120,38 @@ defmodule Module.Types.Descr do
   defp polymorphic_bdd({_, _, _} = node), do: Poly.leaf(node)
   defp polymorphic_bdd(descr), do: Poly.leaf(descr)
 
+  # The leaves of a Poly diagram are meant to be monomorphic, but polymorphic_bdd/1
+  # keeps a recursive node as a leaf, and the unfolding of a node may have type
+  # variables at the top level. Leaves can be compared pairwise (Poly.all_pairs?/3) only
+  # once these variables are part of the diagram: exposed_bdd/1 builds a diagram in
+  # which no leaf is a node.
+  defp exposed_bdd(descr), do: descr |> polymorphic_bdd() |> expose_node_leaves()
+
+  defp expose_node_leaves(bdd) do
+    if Poly.reduce_leaves(bdd, false, &(&2 or match?({_, _, _}, &1))) do
+      bdd
+      |> Poly.to_dnf()
+      |> Enum.reduce(Poly.leaf(none()), fn {positive, negative, leaf}, acc ->
+        line =
+          Enum.reduce(positive, exposed_leaf(leaf), fn variable, line ->
+            Poly.intersection(Poly.variable(variable, term(), none()), line, &bare_intersection/2)
+          end)
+
+        line =
+          Enum.reduce(negative, line, fn variable, line ->
+            Poly.intersection(Poly.variable(variable, none(), term()), line, &bare_intersection/2)
+          end)
+
+        Poly.union(acc, line, &bare_union/2)
+      end)
+    else
+      bdd
+    end
+  end
+
+  defp exposed_leaf({_, _, _} = node), do: node |> to_descr() |> exposed_bdd()
+  defp exposed_leaf(descr), do: Poly.leaf(descr)
+
   # Constructor-specific operations work on the monomorphic descriptor. As in
   # SSTT's get_descr, erase top-level variable tests by unioning their leaves;
   # variables nested below constructors remain intact.
@@ -166,7 +198,7 @@ defmodule Module.Types.Descr do
   end
 
   defp polymorphic_subtype?(left, right) do
-    Poly.all_pairs?(left, right, &subtype?/2)
+    Poly.all_pairs?(expose_node_leaves(left), expose_node_leaves(right), &subtype?/2)
   end
 
   defp variable_identity({:type_variables, {:node, identity, {:leaf, :term}, {:leaf, none}}})
@@ -1698,7 +1730,7 @@ defmodule Module.Types.Descr do
     right = unfold(right)
 
     if is_polymorphic(left) or is_polymorphic(right) do
-      Poly.all_pairs?(polymorphic_bdd(left), polymorphic_bdd(right), &subtype?/2)
+      Poly.all_pairs?(exposed_bdd(left), exposed_bdd(right), &subtype?/2)
     else
       is_grad_left = gradual?(left)
       is_grad_right = gradual?(right)
@@ -1721,7 +1753,7 @@ defmodule Module.Types.Descr do
   defp subtype_static?(same, same), do: true
 
   defp subtype_static?(left, right) when is_polymorphic(left) or is_polymorphic(right) do
-    Poly.all_pairs?(polymorphic_bdd(left), polymorphic_bdd(right), &subtype_static?/2)
+    Poly.all_pairs?(exposed_bdd(left), exposed_bdd(right), &subtype_static?/2)
   end
 
   defp subtype_static?(left, right), do: empty_difference_subtype?(left, right)

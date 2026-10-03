@@ -441,6 +441,22 @@ defmodule Module.Types.RecursiveTest do
       refute assert_finishes(fn -> subtype?(w.(), atom([:bump])) end)
     end
 
+    test "subtyping with type variables at the top level of a node" do
+      # K = {K} | a
+      a = var(:a)
+      b = var(:b)
+      k = recursive(%{K: fn recur -> tuple([recur.(:K)]) |> bare_union(a) end}) |> Map.fetch!(:K)
+
+      assert subtype?(a, k)
+      assert subtype?(tuple([k]), k)
+      refute subtype?(k, a)
+
+      # The node is a leaf of the diagram of b and K, whose unfolding has a at the top
+      assert subtype?(opt_intersection(b, k), k)
+      assert subtype?(opt_intersection(b, k), to_descr(k))
+      assert subtype?(opt_union(opt_intersection(b, k), opt_difference(tuple([k]), b)), k)
+    end
+
     test "set operations accept nodes" do
       n = recursive_node(integer())
       assert equal?(bare_union(n, float()), bare_union(integer(), float()))
