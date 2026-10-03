@@ -2695,10 +2695,10 @@ defmodule Module.Types.Descr do
     # input to the positive intersection yields a subtype of the return
     case disjoint_non_empty_domains?({arguments, return}, positives, seen) do
       :disjoint_non_empty ->
-        apply_disjoint(arguments, positives) |> subtype?(return)
+        apply_disjoint(arguments, positives) |> subtype_seen?(return, seen)
 
       :non_empty ->
-        fun_apply_static(arguments, [positives]) |> subtype?(return)
+        fun_apply_static(arguments, [positives]) |> subtype_seen?(return, seen)
 
       _ ->
         # Initialize memoization cache for the recursive phi computation

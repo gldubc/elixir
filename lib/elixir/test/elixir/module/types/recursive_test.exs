@@ -419,6 +419,28 @@ defmodule Module.Types.RecursiveTest do
       assert subtype?(tx, ty)
     end
 
+    test "subtyping through function codomains" do
+      # Each type is built twice, by two calls to recursive/1, and the copies compared
+
+      # W = (-> W)
+      w = fn -> recursive(%{W: fn recur -> fun([], recur.(:W)) end}) |> Map.fetch!(:W) end
+      assert assert_finishes(fn -> equal?(w.(), w.()) end)
+
+      # W = :bump | {:run, ((-> W) -> term())}
+      w = fn ->
+        recursive(%{
+          W: fn recur ->
+            job = fun([fun([], recur.(:W))], term())
+            atom([:bump]) |> bare_union(tuple([atom([:run]), job]))
+          end
+        })
+        |> Map.fetch!(:W)
+      end
+
+      assert assert_finishes(fn -> equal?(w.(), w.()) end)
+      refute assert_finishes(fn -> subtype?(w.(), atom([:bump])) end)
+    end
+
     test "set operations accept nodes" do
       n = recursive_node(integer())
       assert equal?(bare_union(n, float()), bare_union(integer(), float()))
