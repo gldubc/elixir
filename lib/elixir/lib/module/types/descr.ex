@@ -1388,6 +1388,22 @@ defmodule Module.Types.Descr do
     do_to_quoted(descr, opts)
   end
 
+  # A recursive node is printed as rec(x, body): body is one unfolding of the node, in
+  # which the node itself is printed as the variable x.
+  defp do_to_quoted({id, state, _generator} = node, opts) do
+    bound = Keyword.get(opts, :recursive_nodes, %{})
+
+    case bound do
+      %{^id => name} ->
+        {name, [], nil}
+
+      %{} ->
+        name = recursive_node_name(id, state, bound)
+        opts = Keyword.put(opts, :recursive_nodes, Map.put(bound, id, name))
+        {:rec, [], [{name, [], nil}, do_to_quoted(to_descr(node), opts)]}
+    end
+  end
+
   defp do_to_quoted({:type_variables, bdd}, opts) do
     bdd
     |> Poly.to_dnf()
@@ -1405,6 +1421,25 @@ defmodule Module.Types.Descr do
     else
       non_term_type_to_quoted(descr, opts)
     end
+  end
+
+  # The name of the equation that defines the node, made distinct from the names of
+  # the nodes being printed around it.
+  defp recursive_node_name(id, state, bound) do
+    base =
+      case recursive_state_position(id, state) do
+        {_kind, name} when is_atom(name) -> Atom.to_string(name)
+        _ -> "rec"
+      end
+
+    used = bound |> Map.values() |> MapSet.new()
+
+    Stream.iterate(1, &(&1 + 1))
+    |> Stream.map(fn
+      1 -> String.to_unsafe_atom(base)
+      n -> String.to_unsafe_atom("#{base}_#{n}")
+    end)
+    |> Enum.find(&(not MapSet.member?(used, &1)))
   end
 
   defp polymorphic_line_to_quoted({positive, negative, descr}, opts) do
@@ -1838,6 +1873,7 @@ defmodule Module.Types.Descr do
   """
   def term_type?(:term), do: true
   def term_type?({:type_variables, _bdd} = descr), do: subtype?(term(), descr)
+  def term_type?({_, _, _} = node), do: node |> to_descr() |> term_type?()
   def term_type?(descr), do: subtype_static?(unfolded_term(), Map.delete(descr, :dynamic))
 
   @doc """

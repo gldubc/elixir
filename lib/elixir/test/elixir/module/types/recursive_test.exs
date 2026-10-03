@@ -559,5 +559,48 @@ defmodule Module.Types.RecursiveTest do
       assert {:ok, type} = fun_apply(fun([term()], integer()), [nx])
       assert equal?(type, integer())
     end
+
+    test "printing" do
+      # X = {integer(), X} | nil
+      list =
+        recursive(%{X: fn recur -> tuple([integer(), recur.(:X)]) |> bare_union(atom([nil])) end})
+        |> Map.fetch!(:X)
+
+      assert to_quoted_string(list) == "rec(X, nil or {integer(), X})"
+
+      assert to_quoted_string(to_descr(list)) ==
+               "nil or {integer(), rec(X, nil or {integer(), X})}"
+
+      # X = {integer(), Y} | nil, Y = {boolean(), X} | nil
+      %{X: nx} =
+        recursive(%{
+          X: fn recur -> tuple([integer(), recur.(:Y)]) |> bare_union(atom([nil])) end,
+          Y: fn recur -> tuple([boolean(), recur.(:X)]) |> bare_union(atom([nil])) end
+        })
+
+      assert to_quoted_string(nx) == "rec(X, nil or {integer(), rec(Y, nil or {boolean(), X})})"
+
+      # Two systems that both name their equation X
+      nested =
+        recursive(%{
+          X: fn outer ->
+            recursive(%{
+              X: fn inner -> tuple([outer.(:X), inner.(:X)]) |> bare_union(atom([nil])) end
+            })
+            |> Map.fetch!(:X)
+          end
+        })
+        |> Map.fetch!(:X)
+
+      assert to_quoted_string(nested) == "rec(X, rec(X_2, nil or {X, X_2}))"
+
+      # Below a type variable, and in a solution of tallying
+      a = var(:a)
+      assert to_quoted_string(opt_intersection(a, list)) == "a and rec(X, nil or {integer(), X})"
+
+      x = var(:x)
+      assert [%{^x => solution}] = tally([{tuple([x]), x}])
+      assert to_quoted_string(solution) == "rec(solution, (not x and {solution}) or x)"
+    end
   end
 end
