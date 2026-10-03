@@ -159,12 +159,12 @@ defmodule Module.Types.TallyTest do
     end
   end
 
-  # Open problems: these tests fail, because tallying does not terminate. Each
-  # computation is stopped after one second, or when its heap goes beyond 50M words.
-  describe "open problems" do
+  # Each computation is stopped after one second, or when its heap goes beyond 50M
+  # words.
+  describe "recursive solutions below constructors" do
     test "a variable in a Boolean combination below a constructor" do
       # The recursive solution is a node whose generator substitutes the node for x in
-      # {x or :b}; computing the union unfolds the node, which runs the generator again.
+      # {x or :b}: the union is substituted lazily, in a node of its own.
       x = var(:x)
       constraints = [{tuple([opt_union(x, atom([:b]))]), x}]
       assert_sound(finishes(fn -> tally(constraints) end), constraints)
@@ -181,9 +181,8 @@ defmodule Module.Types.TallyTest do
     end
 
     test "validating solutions with recursive types through function types" do
-      # solve/1 finds the expected solution at once, but valid_solution?/2 does not
-      # terminate: the fast paths of phi_starter/4 compute applications with checks
-      # that start without the assumptions of the emptiness check in progress.
+      # solve/1 finds the expected solution at once; valid_solution?/2 must compare
+      # copies of the recursive types, which are named after their substitution.
       worker =
         recursive(%{
           W: fn recur ->
@@ -211,6 +210,30 @@ defmodule Module.Types.TallyTest do
       solutions = finishes(fn -> tally(constraints) end)
       assert_sound(solutions, constraints)
       assert Enum.any?(solutions, &equal?(Map.fetch!(&1, i_app), worker))
+    end
+  end
+
+  # Open problem: this test fails, because tallying does not terminate.
+  describe "open problems" do
+    test "a recursive solution through function types, with bracket variables" do
+      # As above, but both annotations of job are variables, and the application of
+      # job adds the variables o_app and i_app between them and the worker.
+      [oa, ia, o_spawn, i_spawn, p1, p2, o_app, i_app, res] =
+        Enum.map([:oa, :ia, :o_spawn, :i_spawn, :p1, :p2, :o_app, :i_app, :res], &var/1)
+
+      job = process_fun(tuple([]), oa, ia, term())
+      worker = opt_union(atom([:bump]), tuple([atom([:run]), job]))
+
+      constraints = [
+        {o_spawn, worker},
+        {worker, i_spawn},
+        {opt_intersection(i_spawn, tuple([atom([:run]), term()])), tuple([p1, p2])},
+        {o_app, o_spawn},
+        {i_spawn, i_app},
+        {p2, process_fun(tuple([]), o_app, i_app, res)}
+      ]
+
+      assert_sound(finishes(fn -> tally(constraints) end), constraints)
     end
   end
 

@@ -128,7 +128,7 @@ defmodule Module.Types.Descr do
   defp exposed_bdd(descr), do: descr |> polymorphic_bdd() |> expose_node_leaves()
 
   defp expose_node_leaves(bdd) do
-    if Poly.reduce_leaves(bdd, false, &(&2 or match?({_, _, _}, &1))) do
+    if Poly.reduce_leaves(bdd, false, &(&2 or exposable_leaf?(&1))) do
       bdd
       |> Poly.to_dnf()
       |> Enum.reduce(Poly.leaf(none()), fn {positive, negative, leaf}, acc ->
@@ -149,7 +149,15 @@ defmodule Module.Types.Descr do
     end
   end
 
+  # A connective applied to a node leaf unfolds it, and Poly stores the result as a
+  # leaf, polymorphic when the unfolding has variables at the top level: such leaves are
+  # exposed too.
+  defp exposable_leaf?({_, _, _}), do: true
+  defp exposable_leaf?({:type_variables, _bdd}), do: true
+  defp exposable_leaf?(_descr), do: false
+
   defp exposed_leaf({_, _, _} = node), do: node |> to_descr() |> exposed_bdd()
+  defp exposed_leaf({:type_variables, bdd}), do: expose_node_leaves(bdd)
   defp exposed_leaf(descr), do: Poly.leaf(descr)
 
   # Constructor-specific operations work on the monomorphic descriptor. As in
@@ -419,7 +427,11 @@ defmodule Module.Types.Descr do
     do: descr
 
   defp substitute_normalized(descr, substitutions, simplify?) do
-    copy_ref = make_ref()
+    # The copies of recursive nodes made by a substitution are named after the
+    # substitution, not by a fresh reference: substituting again with the same map, as
+    # every unfolding of a recursive solution of tallying does, gives the same nodes, so
+    # that the assumptions of emptiness checks (seen) recognize them.
+    copy_ref = {:substitution, substitutions}
     do_substitute(descr, substitutions, fn _node -> {:error, copy_ref} end, simplify?)
   end
 
@@ -448,6 +460,13 @@ defmodule Module.Types.Descr do
   defp do_substitute(:term, _substitutions, _node_mapper, _simplify?), do: :term
 
   defp do_substitute({:type_variables, bdd}, substitutions, node_mapper, simplify?) do
+    # In structural mode, the connectives do not simplify either: simplification decides
+    # equivalence with subtype?/2, which would unfold the nodes being defined.
+    {union, intersection, difference} =
+      if simplify?,
+        do: {&bare_union/2, &bare_intersection/2, &bare_difference/2},
+        else: {&plain_union/2, &plain_intersection/2, &plain_difference/2}
+
     bdd =
       Poly.substitute(
         bdd,
@@ -456,12 +475,12 @@ defmodule Module.Types.Descr do
           do_substitute(descr, substitutions, node_mapper, simplify?)
         end,
         &polymorphic_bdd/1,
-        &bare_union/2,
-        &bare_intersection/2,
-        &bare_difference/2
+        union,
+        intersection,
+        difference
       )
 
-    bdd = if simplify?, do: simplify_polymorphic(bdd), else: bdd
+    bdd = if simplify?, do: simplify_polymorphic(bdd), else: flatten_polymorphic_leaves(bdd)
     wrap_polymorphic(bdd)
   end
 
@@ -487,8 +506,8 @@ defmodule Module.Types.Descr do
   defp substitute_component(:list, bdd, substitutions, node_mapper, simplify?) do
     bdd_map_reorder(bdd, fn bdd_leaf(head, tail) ->
       bdd_leaf_new(
-        do_substitute(head, substitutions, node_mapper, simplify?),
-        do_substitute(tail, substitutions, node_mapper, simplify?)
+        substitute_element(head, substitutions, node_mapper, simplify?),
+        substitute_element(tail, substitutions, node_mapper, simplify?)
       )
     end)
   end
@@ -496,7 +515,7 @@ defmodule Module.Types.Descr do
   defp substitute_component(:tuple, bdd, substitutions, node_mapper, simplify?) do
     bdd_map_reorder(bdd, fn bdd_leaf(tag, elements) ->
       elements =
-        Enum.map(elements, &do_substitute(&1, substitutions, node_mapper, simplify?))
+        Enum.map(elements, &substitute_element(&1, substitutions, node_mapper, simplify?))
 
       bdd_leaf_new(tag, elements)
     end)
@@ -509,7 +528,7 @@ defmodule Module.Types.Descr do
       fields =
         fields_map(
           fn _key, value ->
-            do_substitute(value, substitutions, node_mapper, simplify?)
+            substitute_element(value, substitutions, node_mapper, simplify?)
           end,
           fields
         )
@@ -525,9 +544,9 @@ defmodule Module.Types.Descr do
         bdd =
           bdd_map_reorder(bdd, fn bdd_leaf(arguments, return) ->
             arguments =
-              Enum.map(arguments, &do_substitute(&1, substitutions, node_mapper, simplify?))
+              Enum.map(arguments, &substitute_element(&1, substitutions, node_mapper, simplify?))
 
-            return = do_substitute(return, substitutions, node_mapper, simplify?)
+            return = substitute_element(return, substitutions, node_mapper, simplify?)
             bdd_leaf_new(arguments, return)
           end)
 
@@ -539,9 +558,130 @@ defmodule Module.Types.Descr do
 
   defp substitute_component(_key, value, _substitutions, _node_mapper, _simplify?), do: value
 
+  # Below a constructor, substituting a recursive node for a variable that occurs in a
+  # Boolean combination computes connectives on the node, which unfold it. Inside the
+  # generator of that very node (a recursive solution of tallying, or a copy made by
+  # substitute_recursive_node/4), the unfolding never ends. In structural mode such an
+  # element is substituted lazily, in a node of its own whose identity is the
+  # substitution itself: the generator then terminates, and unfolding the node again
+  # gives the same nodes, which the assumptions of emptiness checks recognize.
+  defp substitute_element({:type_variables, bdd} = element, substitutions, node_mapper, false) do
+    if lazy_substitution?(bdd, substitutions) do
+      lazy_substitution(element, substitutions, node_mapper)
+    else
+      do_substitute(element, substitutions, node_mapper, false)
+    end
+  end
+
+  defp substitute_element(element, substitutions, node_mapper, simplify?),
+    do: do_substitute(element, substitutions, node_mapper, simplify?)
+
+  defp lazy_substitution?({:node, _variable, {:leaf, :term}, {:leaf, none}}, _substitutions)
+       when none == @none,
+       do: false
+
+  defp lazy_substitution?(bdd, substitutions) do
+    replaced = bdd |> Poly.variables() |> Enum.filter(&is_map_key(substitutions, &1))
+
+    replaced != [] and
+      (Enum.any?(replaced, &node_at_top?(Map.fetch!(substitutions, &1))) or
+         Poly.reduce_leaves(bdd, false, &(&2 or match?({_, _, _}, &1))))
+  end
+
+  defp node_at_top?({_, _, _}), do: true
+
+  defp node_at_top?({:type_variables, bdd}),
+    do: Poly.reduce_leaves(bdd, false, &(&2 or match?({_, _, _}, &1)))
+
+  defp node_at_top?(_descr), do: false
+
+  # Connectives for structural substitution: as bare_union/2, bare_intersection/2 and
+  # bare_difference/2, whose clauses for term() and none() keep a node unevaluated, but
+  # without simplify_polymorphic/1. They may return polymorphic types, which Poly stores
+  # as leaves: flatten_polymorphic_leaves/1 merges them into the diagram.
+  defp plain_union(left, right) do
+    cond do
+      left == @none -> right
+      right == @none -> left
+      left == :term or right == :term -> bare_union(left, right)
+      true -> plain_operation(left, right, &Poly.union/3, &bare_union/2)
+    end
+  end
+
+  defp plain_intersection(left, right) do
+    cond do
+      left == :term or right == :term -> bare_intersection(left, right)
+      left == @none or right == @none -> @none
+      true -> plain_operation(left, right, &Poly.intersection/3, &bare_intersection/2)
+    end
+  end
+
+  defp plain_difference(left, right) do
+    cond do
+      left == @none -> @none
+      right == @none -> left
+      right == :term -> bare_difference(left, right)
+      true -> plain_operation(left, right, &Poly.difference/3, &bare_difference/2)
+    end
+  end
+
+  defp plain_operation(left, right, poly_operation, bare_operation) do
+    left = unfold(left)
+    right = unfold(right)
+
+    if is_polymorphic(left) or is_polymorphic(right) do
+      poly_operation.(exposed_bdd(left), exposed_bdd(right), bare_operation)
+      |> wrap_polymorphic()
+    else
+      bare_operation.(left, right)
+    end
+  end
+
+  defp flatten_polymorphic_leaves(bdd) do
+    if Poly.reduce_leaves(bdd, false, &(&2 or is_polymorphic(&1))) do
+      bdd
+      |> Poly.to_dnf()
+      |> Enum.reduce(Poly.leaf(none()), fn {positive, negative, leaf}, acc ->
+        line =
+          case leaf do
+            {:type_variables, leaf_bdd} -> flatten_polymorphic_leaves(leaf_bdd)
+            leaf -> Poly.leaf(leaf)
+          end
+
+        line =
+          Enum.reduce(positive, line, fn variable, line ->
+            Poly.intersection(
+              Poly.variable(variable, term(), none()),
+              line,
+              &plain_intersection/2
+            )
+          end)
+
+        line =
+          Enum.reduce(negative, line, fn variable, line ->
+            Poly.intersection(
+              Poly.variable(variable, none(), term()),
+              line,
+              &plain_intersection/2
+            )
+          end)
+
+        Poly.union(acc, line, &plain_union/2)
+      end)
+    else
+      bdd
+    end
+  end
+
+  defp lazy_substitution(element, substitutions, node_mapper) do
+    id = {:lazy_substitution, element, substitutions, node_mapper}
+    generator = fn _recur -> do_substitute(element, substitutions, node_mapper, false) end
+    make_node(id, %{lazy: {id, {:if_set, id}, generator}}, generator)
+  end
+
   defp substitute_map_tag(tag, substitutions, node_mapper, simplify?) when is_list(tag) do
     fields_map(
-      fn _key, value -> do_substitute(value, substitutions, node_mapper, simplify?) end,
+      fn _key, value -> substitute_element(value, substitutions, node_mapper, simplify?) end,
       tag
     )
   end
@@ -1261,7 +1401,7 @@ defmodule Module.Types.Descr do
   defp empty_seen?(:term, _seen), do: false
 
   defp empty_seen?({:type_variables, bdd}, seen) do
-    Poly.all_leaves?(bdd, &empty_seen?(&1, seen))
+    Poly.all_leaves?(expose_node_leaves(bdd), &empty_seen?(&1, seen))
   end
 
   defp empty_seen?({id, _state, _generator} = node, seen) do
