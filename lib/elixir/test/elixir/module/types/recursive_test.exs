@@ -469,6 +469,15 @@ defmodule Module.Types.RecursiveTest do
       assert assert_finishes(fn -> equal?(to_descr(n.()), to_descr(n.())) end)
     end
 
+    # Open problem: this test fails. opt_intersection/2 intersects tuple literals
+    # componentwise (zip_non_empty_intersection!/4) and descends through the nodes of the
+    # components, with no memo on pairs of nodes.
+    test "intersection of recursive tuple types" do
+      list = int_linked_list()
+      assert assert_finishes(fn -> equal?(opt_intersection(list, list), list) end)
+      assert assert_finishes(fn -> equal?(opt_intersection(list, int_linked_list()), list) end)
+    end
+
     test "set operations accept nodes" do
       n = recursive_node(integer())
       assert equal?(bare_union(n, float()), bare_union(integer(), float()))

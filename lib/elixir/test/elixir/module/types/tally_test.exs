@@ -159,6 +159,61 @@ defmodule Module.Types.TallyTest do
     end
   end
 
+  # Open problems: these tests fail, because tallying does not terminate. Each
+  # computation is stopped after one second, or when its heap goes beyond 50M words.
+  describe "open problems" do
+    test "a variable in a Boolean combination below a constructor" do
+      # The recursive solution is a node whose generator substitutes the node for x in
+      # {x or :b}; computing the union unfolds the node, which runs the generator again.
+      x = var(:x)
+      constraints = [{tuple([opt_union(x, atom([:b]))]), x}]
+      assert_sound(finishes(fn -> tally(constraints) end), constraints)
+    end
+
+    test "a recursive solution through function types" do
+      # Solutions need ia >= i >= :bump | {:run, job(ia)}, where ia occurs in the
+      # codomain of an argument of job.
+      [oa, ia, i, res] = Enum.map([:oa, :ia, :i, :res], &var/1)
+      job = process_fun(tuple([]), oa, ia, term())
+      worker = opt_union(atom([:bump]), tuple([atom([:run]), job]))
+      constraints = [{job, process_fun(tuple([]), none(), i, res)}, {worker, i}]
+      assert_sound(finishes(fn -> tally(constraints) end), constraints)
+    end
+
+    test "validating solutions with recursive types through function types" do
+      # solve/1 finds the expected solution at once, but valid_solution?/2 does not
+      # terminate: the fast paths of phi_starter/4 compute applications with checks
+      # that start without the assumptions of the emptiness check in progress.
+      worker =
+        recursive(%{
+          W: fn recur ->
+            job = process_fun(tuple([]), atom([:bump]), recur.(:W), term())
+            atom([:bump]) |> bare_union(tuple([atom([:run]), job]))
+          end
+        })
+        |> Map.fetch!(:W)
+        |> to_descr()
+
+      [o_spawn, i_spawn, p1, p2, o_app, i_app, res] =
+        Enum.map([:o_spawn, :i_spawn, :p1, :p2, :o_app, :i_app, :res], &var/1)
+
+      constraints = [
+        {o_spawn, worker},
+        {worker, i_spawn},
+        {opt_intersection(i_spawn, tuple([atom([:run]), term()])), tuple([p1, p2])},
+        {p1, atom([:run])},
+        {o_app, o_spawn},
+        {i_spawn, i_app},
+        {p2, process_fun(tuple([]), o_app, i_app, res)},
+        {opt_intersection(i_spawn, atom([:bump])), atom([:bump])}
+      ]
+
+      solutions = finishes(fn -> tally(constraints) end)
+      assert_sound(solutions, constraints)
+      assert Enum.any?(solutions, &equal?(Map.fetch!(&1, i_app), worker))
+    end
+  end
+
   describe "validation" do
     test "rejects malformed, gradual, and non-variable inputs" do
       x = var(:x)
@@ -167,6 +222,28 @@ defmodule Module.Types.TallyTest do
       assert_raise ArgumentError, ~r/static types/, fn -> tally([{dynamic(), x}]) end
       assert_raise ArgumentError, ~r/type variable/, fn -> tally([{x, term()}], [integer()]) end
       assert_raise ArgumentError, ~r/MapSet or list/, fn -> tally([{x, term()}], :fixed) end
+    end
+  end
+
+  # A function type with three arguments, as a checker for message-passing processes
+  # encodes a function of domain s and codomain t whose body sends messages of type o
+  # and receives messages of type i.
+  defp process_fun(s, o, i, t) do
+    fun([opt_union(s, port()), fun([o], port()), fun([], i)], t)
+  end
+
+  defp finishes(fun) do
+    task =
+      Task.async(fn ->
+        Process.flag(:max_heap_size, %{size: 50_000_000, kill: true, error_logger: false})
+        fun.()
+      end)
+
+    Process.unlink(task.pid)
+
+    case Task.yield(task, 1_000) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      _ -> flunk("operation did not finish")
     end
   end
 
