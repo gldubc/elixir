@@ -144,6 +144,19 @@ defmodule Module.Types.TallyTest do
       assert match?({_, _, _}, solution)
       assert_sound(solutions, constraints)
     end
+
+    @tag timeout: 2_000
+    test "validates recursive solutions with residual variables" do
+      i = var(:i)
+      ia = var(:ia)
+
+      # Solutions need ia >= i >= {ia}, a recursive type with a residual variable
+      constraints = [{i, ia}, {tuple([ia]), i}]
+      assert_sound(tally(constraints), constraints)
+
+      constraints = [{i, ia}, {opt_union(atom([:bump]), tuple([fun([], ia)])), i}]
+      assert_sound(tally(constraints), constraints)
+    end
   end
 
   describe "validation" do

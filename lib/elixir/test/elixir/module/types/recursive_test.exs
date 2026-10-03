@@ -457,6 +457,18 @@ defmodule Module.Types.RecursiveTest do
       assert subtype?(opt_union(opt_intersection(b, k), opt_difference(tuple([k]), b)), k)
     end
 
+    test "subtyping between copies of a type with type variables" do
+      # N = {N} | a, built twice
+      a = var(:a)
+
+      n = fn ->
+        recursive(%{N: fn recur -> tuple([recur.(:N)]) |> bare_union(a) end}) |> Map.fetch!(:N)
+      end
+
+      assert assert_finishes(fn -> subtype?(n.(), n.()) end)
+      assert assert_finishes(fn -> equal?(to_descr(n.()), to_descr(n.())) end)
+    end
+
     test "set operations accept nodes" do
       n = recursive_node(integer())
       assert equal?(bare_union(n, float()), bare_union(integer(), float()))

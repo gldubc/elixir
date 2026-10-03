@@ -1760,7 +1760,36 @@ defmodule Module.Types.Descr do
 
   # Internal static subtype helper: unlike subtype?/2, it only checks empty?(left \ right) with seen.
   defp subtype_seen?(left, right, seen),
-    do: empty_seen?(bare_difference(left, right), seen)
+    do: empty_seen?(seen_difference(left, right), seen)
+
+  # Connectives for emptiness checks. On polymorphic types, bare_difference/2 and
+  # bare_intersection/2 simplify their result with simplify_polymorphic/1, which decides
+  # equivalence with subtype?/2: the emptiness check would start again without the
+  # assumptions in seen and, with recursive types, might not terminate. These work on
+  # exposed diagrams and do not simplify.
+  defp seen_difference(left, right) do
+    left = unfold(left)
+    right = unfold(right)
+
+    if is_polymorphic(left) or is_polymorphic(right) do
+      Poly.difference(exposed_bdd(left), exposed_bdd(right), &bare_difference/2)
+      |> wrap_polymorphic()
+    else
+      bare_difference(left, right)
+    end
+  end
+
+  defp seen_intersection(left, right) do
+    left = unfold(left)
+    right = unfold(right)
+
+    if is_polymorphic(left) or is_polymorphic(right) do
+      Poly.intersection(exposed_bdd(left), exposed_bdd(right), &bare_intersection/2)
+      |> wrap_polymorphic()
+    else
+      bare_intersection(left, right)
+    end
+  end
 
   # This function is designed to compute the difference during subtyping efficiently.
   # Do not use it for anything else.
@@ -5921,8 +5950,8 @@ defmodule Module.Types.Descr do
 
     # In this case, there is no intersection between the positive and this negative.
     # So we should just "go next"
-    diff = bare_difference(ty, neg_type)
-    meet = bare_intersection(ty, neg_type)
+    diff = seen_difference(ty, neg_type)
+    meet = seen_intersection(ty, neg_type)
 
     (empty_seen?(diff, seen) or
        tuple_line_empty?(tag, Enum.reverse(acc_meet, [diff | elements]), negs, seen)) and
