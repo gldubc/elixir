@@ -16,6 +16,8 @@ defmodule Module.Types.Descr do
 
   import Bitwise
 
+  alias Module.Types.Descr.Polymorphic, as: Poly
+
   @bit_binary 0b1
   @bit_bitstring_no_binary 0b10
   @bit_empty_list 0b100
@@ -82,7 +84,14 @@ defmodule Module.Types.Descr do
   @empty_intersection [0, :bdd_bot]
   @empty_difference [0, :bdd_bot]
 
-  defguard is_descr(descr) when is_map(descr) or descr == :term
+  defguard is_descr(descr)
+           when is_map(descr) or descr == :term or
+                  (is_tuple(descr) and tuple_size(descr) == 2 and
+                     elem(descr, 0) == :type_variables)
+
+  defguardp is_polymorphic(descr)
+            when is_tuple(descr) and tuple_size(descr) == 2 and
+                   elem(descr, 0) == :type_variables
 
   defp descr_key?(:term, _key), do: true
   defp descr_key?(descr, key), do: is_map_key(descr, key)
@@ -90,6 +99,82 @@ defmodule Module.Types.Descr do
   def dynamic(), do: %{dynamic: :term}
   def none(), do: @none
   def term(), do: :term
+
+  @doc """
+  Creates a fresh type variable with the given display name.
+
+  Type variable identity is distinct from its display name, so calling this
+  function twice creates two different variables. Reuse the returned value for
+  repeated occurrences of the same variable.
+  """
+  def var(name) when is_atom(name) do
+    identity = {:type_variable, :erlang.unique_integer([:positive, :monotonic]), name}
+    wrap_polymorphic(Poly.variable(identity, term(), none()))
+  end
+
+  defp wrap_polymorphic({:leaf, descr}), do: descr
+  defp wrap_polymorphic(bdd), do: {:type_variables, bdd}
+
+  defp polymorphic_bdd({:type_variables, bdd}), do: bdd
+  defp polymorphic_bdd(:term), do: Poly.leaf(:term)
+  defp polymorphic_bdd({_, _, _} = node), do: Poly.leaf(node)
+  defp polymorphic_bdd(descr), do: Poly.leaf(descr)
+
+  # Constructor-specific operations work on the monomorphic descriptor. As in
+  # SSTT's get_descr, erase top-level variable tests by unioning their leaves;
+  # variables nested below constructors remain intact.
+  defp monomorphic_descr({:type_variables, bdd}) do
+    Poly.reduce_leaves(bdd, none(), &bare_union/2)
+  end
+
+  defp simplify_polymorphic(bdd), do: simplify_polymorphic(bdd, [])
+
+  defp simplify_polymorphic({:leaf, _descr} = leaf, _context), do: leaf
+
+  defp simplify_polymorphic({:node, variable, positive, negative}, context) do
+    positive = simplify_polymorphic(positive, [{:positive, variable} | context])
+    negative = simplify_polymorphic(negative, [{:negative, variable} | context])
+    bdd = Poly.node(variable, positive, negative)
+
+    cond do
+      polymorphic_equivalent?(
+        polymorphic_with_context(bdd, context),
+        polymorphic_with_context(positive, context)
+      ) ->
+        positive
+
+      polymorphic_equivalent?(
+        polymorphic_with_context(bdd, context),
+        polymorphic_with_context(negative, context)
+      ) ->
+        negative
+
+      true ->
+        bdd
+    end
+  end
+
+  defp polymorphic_with_context(bdd, context) do
+    Enum.reduce(context, bdd, fn
+      {:positive, variable}, acc -> Poly.node(variable, acc, Poly.leaf(none()))
+      {:negative, variable}, acc -> Poly.node(variable, Poly.leaf(none()), acc)
+    end)
+  end
+
+  defp polymorphic_equivalent?(left, right) do
+    polymorphic_subtype?(left, right) and polymorphic_subtype?(right, left)
+  end
+
+  defp polymorphic_subtype?(left, right) do
+    Poly.all_pairs?(left, right, &subtype?/2)
+  end
+
+  defp variable_identity({:type_variables, {:node, identity, {:leaf, :term}, {:leaf, none}}})
+       when none == @none,
+       do: {:ok, identity}
+
+  defp variable_identity({:type_variable, _id, _name} = identity), do: {:ok, identity}
+  defp variable_identity(_other), do: :error
 
   @compile {:inline, unfold: 1}
   defp unfold(:term), do: unfolded_term()
@@ -127,6 +212,7 @@ defmodule Module.Types.Descr do
 
   def to_descr(:term), do: :term
   def to_descr(descr = %{}), do: descr
+  def to_descr({:type_variables, _bdd} = descr), do: descr
 
   def to_descr({_id, state, generator}) do
     recur = fn name ->
@@ -164,10 +250,416 @@ defmodule Module.Types.Descr do
   end
 
   @doc """
+  Returns the type variables that occur at the top level of a type.
+
+  Variables underneath a tuple, map, list, function, or another constructor
+  are not included.
+  """
+  def top_vars({_, _, _} = node), do: node |> to_descr() |> top_vars()
+
+  def top_vars({:type_variables, bdd}) do
+    bdd
+    |> Poly.variables()
+    |> Enum.map(&variable_from_identity/1)
+    |> MapSet.new()
+  end
+
+  def top_vars(_descr), do: MapSet.new()
+
+  @doc """
+  Returns all meaningful type variables in a type.
+
+  A variable is meaningful when replacing it by `none()` changes the type
+  semantically. This makes the result invariant under type equivalence.
+  """
+  def vars(descr) do
+    {variables, _seen} = collect_variables(descr, MapSet.new(), MapSet.new())
+
+    Enum.reduce(variables, MapSet.new(), fn identity, acc ->
+      variable = variable_from_identity(identity)
+
+      if equal?(substitute(descr, %{variable => none()}), descr) do
+        acc
+      else
+        MapSet.put(acc, variable)
+      end
+    end)
+  end
+
+  @doc """
+  Solves a finite set of subtype constraints by tallying.
+
+  Each constraint is a `{left, right}` pair denoting `left <= right`. The
+  result is a finite list of principal substitutions, represented as maps from
+  values returned by `var/1` to static types. An empty list means that the
+  constraints are unsatisfiable; a list containing an empty map means they hold
+  without instantiating any variable.
+
+  Variables in `fixed` are treated as monomorphic and are never included in a
+  substitution. Tallying is defined for static types only.
+  """
+  def tally(constraints, fixed \\ MapSet.new()) when is_list(constraints) do
+    Module.Types.Descr.Tally.tally(constraints, fixed)
+  end
+
+  @doc false
+  def __tally_variable_identity__(variable), do: variable_identity(variable)
+
+  @doc false
+  def __tally_variable__(identity), do: variable_from_identity(identity)
+
+  @doc false
+  def __tally_bound__({_, _, _} = node, variable, lower, upper, direction)
+      when direction in [:strengthen, :weaken] do
+    descr = to_descr(node)
+
+    if MapSet.member?(top_vars(descr), variable) do
+      __tally_bound__(descr, variable, lower, upper, direction)
+    else
+      node
+    end
+  end
+
+  def __tally_bound__(descr, variable, lower, upper, direction)
+      when direction in [:strengthen, :weaken] do
+    with {:ok, identity} <- variable_identity(variable),
+         {:type_variables, bdd} <- descr,
+         true <- MapSet.member?(Poly.variables(bdd), identity) do
+      {positive, negative} =
+        case direction do
+          :strengthen ->
+            {bare_intersection(variable, upper), bare_union(variable, lower)}
+
+          :weaken ->
+            {bare_union(variable, lower), bare_intersection(variable, upper)}
+        end
+
+      bdd
+      |> Poly.substitute_polarity(
+        identity,
+        positive,
+        negative,
+        &polymorphic_bdd/1,
+        &bare_union/2,
+        &bare_intersection/2,
+        &bare_difference/2
+      )
+      |> simplify_polymorphic()
+      |> wrap_polymorphic()
+    else
+      _ -> descr
+    end
+  end
+
+  @doc false
+  def __tally_tuple_intersection__(literals),
+    do: non_empty_tuple_literals_intersection(literals)
+
+  @doc false
+  def __tally_map_intersection__(literals),
+    do: non_empty_map_literals_intersection(literals)
+
+  @doc false
+  def __tally_list_tail__(tail), do: list_tail_unfold(tail)
+
+  @doc false
+  def __tally_remove_optional__(type), do: remove_optional(type)
+
+  @doc """
+  Applies a simultaneous type-variable substitution.
+
+  Substitution keys are values previously returned by `var/1`. Replacement
+  types must be static. They are inserted as given and are not substituted
+  again by the same map.
+  """
+  def substitute(descr, substitutions) when is_map(substitutions) do
+    substitutions = normalize_substitutions(substitutions, true)
+    substitute_normalized(descr, substitutions, true)
+  end
+
+  @doc false
+  def __tally_substitute__(descr, substitutions) when is_map(substitutions) do
+    substitutions = normalize_substitutions(substitutions, false)
+    substitute_normalized(descr, substitutions, false)
+  end
+
+  defp substitute_normalized(descr, substitutions, _simplify?) when map_size(substitutions) == 0,
+    do: descr
+
+  defp substitute_normalized(descr, substitutions, simplify?) do
+    copy_ref = make_ref()
+    do_substitute(descr, substitutions, fn _node -> {:error, copy_ref} end, simplify?)
+  end
+
+  defp variable_from_identity(identity) do
+    wrap_polymorphic(Poly.variable(identity, term(), none()))
+  end
+
+  defp normalize_substitutions(substitutions, validate_replacements?) do
+    Map.new(substitutions, fn {variable, replacement} ->
+      if validate_replacements? and gradual?(replacement) do
+        raise ArgumentError,
+              "expected a static type as substitution value, got: #{inspect(replacement)}"
+      end
+
+      case variable_identity(variable) do
+        {:ok, identity} ->
+          {identity, replacement}
+
+        :error ->
+          raise ArgumentError,
+                "expected a type variable as substitution key, got: #{inspect(variable)}"
+      end
+    end)
+  end
+
+  defp do_substitute(:term, _substitutions, _node_mapper, _simplify?), do: :term
+
+  defp do_substitute({:type_variables, bdd}, substitutions, node_mapper, simplify?) do
+    bdd =
+      Poly.substitute(
+        bdd,
+        substitutions,
+        fn descr, substitutions ->
+          do_substitute(descr, substitutions, node_mapper, simplify?)
+        end,
+        &polymorphic_bdd/1,
+        &bare_union/2,
+        &bare_intersection/2,
+        &bare_difference/2
+      )
+
+    bdd = if simplify?, do: simplify_polymorphic(bdd), else: bdd
+    wrap_polymorphic(bdd)
+  end
+
+  defp do_substitute({_, _, _} = node, substitutions, node_mapper, simplify?) do
+    case node_mapper.(node) do
+      {:ok, replacement} ->
+        replacement
+
+      {:error, copy_ref} ->
+        substitute_recursive_node(node, substitutions, copy_ref, simplify?)
+    end
+  end
+
+  defp do_substitute(%{} = descr, substitutions, node_mapper, simplify?) do
+    Map.new(descr, fn {key, value} ->
+      {key, substitute_component(key, value, substitutions, node_mapper, simplify?)}
+    end)
+  end
+
+  defp substitute_component(:dynamic, descr, substitutions, node_mapper, simplify?),
+    do: do_substitute(descr, substitutions, node_mapper, simplify?)
+
+  defp substitute_component(:list, bdd, substitutions, node_mapper, simplify?) do
+    bdd_map_reorder(bdd, fn bdd_leaf(head, tail) ->
+      bdd_leaf_new(
+        do_substitute(head, substitutions, node_mapper, simplify?),
+        do_substitute(tail, substitutions, node_mapper, simplify?)
+      )
+    end)
+  end
+
+  defp substitute_component(:tuple, bdd, substitutions, node_mapper, simplify?) do
+    bdd_map_reorder(bdd, fn bdd_leaf(tag, elements) ->
+      elements =
+        Enum.map(elements, &do_substitute(&1, substitutions, node_mapper, simplify?))
+
+      bdd_leaf_new(tag, elements)
+    end)
+  end
+
+  defp substitute_component(:map, bdd, substitutions, node_mapper, simplify?) do
+    bdd_map_reorder(bdd, fn bdd_leaf(tag, fields) ->
+      tag = substitute_map_tag(tag, substitutions, node_mapper, simplify?)
+
+      fields =
+        fields_map(
+          fn _key, value ->
+            do_substitute(value, substitutions, node_mapper, simplify?)
+          end,
+          fields
+        )
+
+      bdd_leaf_new(tag, fields)
+    end)
+  end
+
+  defp substitute_component(:fun, {kind, bdds}, substitutions, node_mapper, simplify?)
+       when kind in [:union, :negation] do
+    bdds =
+      Map.new(bdds, fn {arity, bdd} ->
+        bdd =
+          bdd_map_reorder(bdd, fn bdd_leaf(arguments, return) ->
+            arguments =
+              Enum.map(arguments, &do_substitute(&1, substitutions, node_mapper, simplify?))
+
+            return = do_substitute(return, substitutions, node_mapper, simplify?)
+            bdd_leaf_new(arguments, return)
+          end)
+
+        {arity, bdd}
+      end)
+
+    {kind, bdds}
+  end
+
+  defp substitute_component(_key, value, _substitutions, _node_mapper, _simplify?), do: value
+
+  defp substitute_map_tag(tag, substitutions, node_mapper, simplify?) when is_list(tag) do
+    fields_map(
+      fn _key, value -> do_substitute(value, substitutions, node_mapper, simplify?) end,
+      tag
+    )
+  end
+
+  defp substitute_map_tag(tag, _substitutions, _node_mapper, _simplify?), do: tag
+
+  defp substitute_recursive_node(
+         {id, state, _generator} = node,
+         substitutions,
+         copy_ref,
+         _simplify?
+       ) do
+    {variables, _seen} = collect_variables(node, MapSet.new(), MapSet.new())
+    domain = substitutions |> Map.keys() |> MapSet.new()
+
+    if MapSet.disjoint?(variables, domain) do
+      node
+    else
+      copied_state =
+        Map.new(state, fn {name, {old_id, old_if_set_id, generator}} ->
+          copied_generator = fn recur ->
+            original_recur = fn original_name ->
+              {original_id, _if_set_id, original_generator} = Map.fetch!(state, original_name)
+              make_node(original_id, state, original_generator)
+            end
+
+            node_mapper = fn {nested_id, nested_state, _nested_generator} ->
+              if nested_state === state do
+                case recursive_state_position(nested_id, state) do
+                  {:node, old_name} -> {:ok, recur.(old_name)}
+                  {:if_set, old_name} -> {:ok, recur.(old_name) |> map_domain_if_set()}
+                  nil -> {:error, copy_ref}
+                end
+              else
+                {:error, copy_ref}
+              end
+            end
+
+            generator.(original_recur)
+            # Semantic simplification may unfold the graph being constructed.
+            # Keep substitution inside a recursive generator purely structural.
+            |> do_substitute(substitutions, node_mapper, false)
+          end
+
+          {name, {{copy_ref, old_id}, {copy_ref, old_if_set_id}, copied_generator}}
+        end)
+
+      case recursive_state_position(id, state) do
+        {:node, name} ->
+          {copied_id, _copied_if_set_id, copied_generator} = Map.fetch!(copied_state, name)
+          make_node(copied_id, copied_state, copied_generator)
+
+        {:if_set, name} ->
+          {copied_id, _copied_if_set_id, copied_generator} = Map.fetch!(copied_state, name)
+
+          make_node(copied_id, copied_state, copied_generator)
+          |> map_domain_if_set()
+      end
+    end
+  end
+
+  defp recursive_state_position(id, state) do
+    Enum.find_value(state, fn
+      {name, {^id, _if_set_id, _generator}} -> {:node, name}
+      {name, {_node_id, ^id, _generator}} -> {:if_set, name}
+      _ -> nil
+    end)
+  end
+
+  defp collect_variables(:term, acc, seen), do: {acc, seen}
+
+  defp collect_variables({id, _state, _generator} = node, acc, seen) do
+    if MapSet.member?(seen, id) do
+      {acc, seen}
+    else
+      collect_variables(to_descr(node), acc, MapSet.put(seen, id))
+    end
+  end
+
+  defp collect_variables({:type_variables, bdd}, acc, seen) do
+    acc = MapSet.union(acc, Poly.variables(bdd))
+
+    Poly.reduce_leaves(bdd, {acc, seen}, fn descr, {acc, seen} ->
+      collect_variables(descr, acc, seen)
+    end)
+  end
+
+  defp collect_variables(%{} = descr, acc, seen) do
+    Enum.reduce(descr, {acc, seen}, fn {key, value}, {acc, seen} ->
+      collect_component_variables(key, value, acc, seen)
+    end)
+  end
+
+  defp collect_component_variables(:dynamic, descr, acc, seen),
+    do: collect_variables(descr, acc, seen)
+
+  defp collect_component_variables(:list, bdd, acc, seen) do
+    bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(head, tail), {acc, seen} ->
+      {acc, seen} = collect_variables(head, acc, seen)
+      collect_variables(tail, acc, seen)
+    end)
+  end
+
+  defp collect_component_variables(:tuple, bdd, acc, seen) do
+    bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(_tag, elements), {acc, seen} ->
+      Enum.reduce(elements, {acc, seen}, fn descr, {acc, seen} ->
+        collect_variables(descr, acc, seen)
+      end)
+    end)
+  end
+
+  defp collect_component_variables(:map, bdd, acc, seen) do
+    bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(tag, fields), {acc, seen} ->
+      {acc, seen} = collect_fields_variables(tag, acc, seen)
+      collect_fields_variables(fields, acc, seen)
+    end)
+  end
+
+  defp collect_component_variables(:fun, {_kind, bdds}, acc, seen) do
+    Enum.reduce(bdds, {acc, seen}, fn {_arity, bdd}, {acc, seen} ->
+      bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(arguments, return), {acc, seen} ->
+        {acc, seen} =
+          Enum.reduce(arguments, {acc, seen}, fn descr, {acc, seen} ->
+            collect_variables(descr, acc, seen)
+          end)
+
+        collect_variables(return, acc, seen)
+      end)
+    end)
+  end
+
+  defp collect_component_variables(_key, _value, acc, seen), do: {acc, seen}
+
+  defp collect_fields_variables(fields, acc, seen) when is_list(fields) do
+    Enum.reduce(fields, {acc, seen}, fn {_key, descr}, {acc, seen} ->
+      collect_variables(descr, acc, seen)
+    end)
+  end
+
+  defp collect_fields_variables(_tag, acc, seen), do: {acc, seen}
+
+  @doc """
   Gets the upper bound of a gradual type.
 
   This is the same as removing the gradual type.
   """
+  def upper_bound({:type_variables, bdd}) do
+    bdd |> Poly.map_leaves(&upper_bound/1) |> wrap_polymorphic()
+  end
+
   def upper_bound(%{dynamic: dynamic}), do: dynamic
   def upper_bound(static), do: static
 
@@ -178,6 +670,11 @@ defmodule Module.Types.Descr do
   Note this is not generally safe and changes the representation of the type.
   """
   def lower_bound(:term), do: :term
+
+  def lower_bound({:type_variables, bdd}) do
+    bdd |> Poly.map_leaves(&lower_bound/1) |> wrap_polymorphic()
+  end
+
   def lower_bound(type), do: Map.delete(type, :dynamic)
 
   ## Function constructors
@@ -317,6 +814,9 @@ defmodule Module.Types.Descr do
     then combines them.
 
   """
+  def domain_to_args({:type_variables, _bdd} = descr),
+    do: descr |> monomorphic_descr() |> domain_to_args()
+
   def domain_to_args(descr) do
     case :maps.take(:dynamic, descr) do
       :error ->
@@ -362,6 +862,10 @@ defmodule Module.Types.Descr do
     node |> unfold() |> if_set()
   end
 
+  def if_set({:type_variables, bdd}) do
+    bdd |> Poly.map_leaves(&if_set/1) |> wrap_polymorphic()
+  end
+
   def if_set(:term), do: term_or_optional()
 
   # If type contains a :dynamic part, :optional gets added there.
@@ -378,6 +882,10 @@ defmodule Module.Types.Descr do
 
   @compile {:inline,
             keep_optional: 1, remove_optional: 1, remove_optional_static: 1, optional_to_term: 1}
+  defp keep_optional({:type_variables, bdd}) do
+    bdd |> Poly.map_leaves(&keep_optional/1) |> wrap_polymorphic()
+  end
+
   defp keep_optional(descr) do
     case descr do
       %{dynamic: %{optional: 1}, optional: 1} -> %{dynamic: %{optional: 1}, optional: 1}
@@ -385,6 +893,10 @@ defmodule Module.Types.Descr do
       %{optional: 1} -> %{optional: 1}
       _ -> @none
     end
+  end
+
+  defp remove_optional({:type_variables, bdd}) do
+    bdd |> Poly.map_leaves(&remove_optional/1) |> wrap_polymorphic()
   end
 
   defp remove_optional(descr) do
@@ -404,8 +916,16 @@ defmodule Module.Types.Descr do
     end
   end
 
+  defp remove_optional_static({:type_variables, bdd}) do
+    bdd |> Poly.map_leaves(&remove_optional_static/1) |> wrap_polymorphic()
+  end
+
   defp remove_optional_static(%{} = descr), do: Map.delete(descr, :optional)
   defp remove_optional_static(descr), do: descr
+
+  defp optional_to_term({:type_variables, bdd}) do
+    bdd |> Poly.map_leaves(&optional_to_term/1) |> wrap_polymorphic()
+  end
 
   defp optional_to_term(descr) do
     case descr do
@@ -416,6 +936,20 @@ defmodule Module.Types.Descr do
   end
 
   defp pop_optional_static(:term), do: {false, :term}
+
+  defp pop_optional_static({:type_variables, bdd}) do
+    optional? =
+      Poly.reduce_leaves(bdd, false, fn descr, acc ->
+        elem(pop_optional_static(descr), 0) or acc
+      end)
+
+    type =
+      bdd
+      |> Poly.map_leaves(fn descr -> elem(pop_optional_static(descr), 1) end)
+      |> wrap_polymorphic()
+
+    {optional?, type}
+  end
 
   defp pop_optional_static(%{} = type) do
     case :maps.take(:optional, type) do
@@ -433,11 +967,22 @@ defmodule Module.Types.Descr do
   """
   def gradual?(:term), do: false
   def gradual?({_, _, _} = node), do: gradual?(to_descr(node))
+
+  def gradual?({:type_variables, bdd}) do
+    Poly.reduce_leaves(bdd, false, fn descr, acc -> gradual?(descr) or acc end)
+  end
+
   def gradual?(descr), do: is_map_key(descr, :dynamic)
 
   @doc """
   Returns true if the type only has a gradual part.
   """
+  def only_gradual?({:type_variables, bdd}) do
+    Poly.reduce_leaves(bdd, true, fn descr, acc ->
+      acc and (empty?(descr) or only_gradual?(descr))
+    end)
+  end
+
   def only_gradual?(%{dynamic: _} = descr), do: map_size(descr) == 1
   def only_gradual?(_), do: false
 
@@ -447,6 +992,10 @@ defmodule Module.Types.Descr do
   It is an optimized version of `bare_intersection(dynamic(), type)`.
   """
   @compile {:inline, dynamic: 1}
+  def dynamic({:type_variables, bdd}) do
+    bdd |> Poly.map_leaves(&dynamic/1) |> wrap_polymorphic()
+  end
+
   def dynamic(descr) do
     case descr do
       %{dynamic: dynamic} -> %{dynamic: dynamic}
@@ -457,7 +1006,28 @@ defmodule Module.Types.Descr do
   @compile {:inline, pop_dynamic: 1}
   defp pop_dynamic(:term), do: {:term, :term}
   defp pop_dynamic({_, _, _} = node), do: pop_dynamic(to_descr(node))
+
+  defp pop_dynamic({:type_variables, bdd}) do
+    dynamic =
+      bdd
+      |> Poly.map_leaves(fn descr -> elem(pop_dynamic(descr), 0) end)
+      |> wrap_polymorphic()
+
+    static =
+      bdd
+      |> Poly.map_leaves(fn descr -> elem(pop_dynamic(descr), 1) end)
+      |> wrap_polymorphic()
+
+    {dynamic, static}
+  end
+
   defp pop_dynamic(descr), do: Map.pop(descr, :dynamic, descr)
+
+  defp put_dynamic(static, dynamic)
+       when is_polymorphic(static) or is_polymorphic(dynamic) do
+    Poly.union(polymorphic_bdd(static), polymorphic_bdd(dynamic), &put_dynamic/2)
+    |> wrap_polymorphic()
+  end
 
   defp put_dynamic(:term, dynamic), do: optional_to_term(%{dynamic: dynamic})
   defp put_dynamic(static, dynamic) when static == dynamic, do: static
@@ -467,6 +1037,11 @@ defmodule Module.Types.Descr do
   defp split_dynamic(:term), do: {:term, :term, false}
   defp split_dynamic({_, _, _} = node), do: {node, node, false}
 
+  defp split_dynamic({:type_variables, _bdd} = descr) do
+    {dynamic, static} = pop_dynamic(descr)
+    {dynamic, static, gradual?(descr)}
+  end
+
   defp split_dynamic(%{dynamic: dynamic} = descr),
     do: {dynamic, Map.delete(descr, :dynamic), true}
 
@@ -475,6 +1050,12 @@ defmodule Module.Types.Descr do
   @doc """
   Computes the union of two descrs.
   """
+  def bare_union(left, right) when is_polymorphic(left) or is_polymorphic(right) do
+    Poly.union(polymorphic_bdd(left), polymorphic_bdd(right), &bare_union/2)
+    |> simplify_polymorphic()
+    |> wrap_polymorphic()
+  end
+
   def bare_union(:term, other), do: optional_to_term(other)
   def bare_union(other, :term), do: optional_to_term(other)
   def bare_union(none, other) when none == @none, do: other
@@ -521,6 +1102,12 @@ defmodule Module.Types.Descr do
   @doc """
   Computes the intersection of two descrs.
   """
+  def bare_intersection(left, right) when is_polymorphic(left) or is_polymorphic(right) do
+    Poly.intersection(polymorphic_bdd(left), polymorphic_bdd(right), &bare_intersection/2)
+    |> simplify_polymorphic()
+    |> wrap_polymorphic()
+  end
+
   def bare_intersection(:term, other), do: remove_optional(other)
   def bare_intersection(other, :term), do: remove_optional(other)
 
@@ -570,6 +1157,14 @@ defmodule Module.Types.Descr do
   @doc """
   Computes the difference between two types.
   """
+  def bare_difference(none, _right) when none == @none, do: none
+
+  def bare_difference(left, right) when is_polymorphic(left) or is_polymorphic(right) do
+    Poly.difference(polymorphic_bdd(left), polymorphic_bdd(right), &bare_difference/2)
+    |> simplify_polymorphic()
+    |> wrap_polymorphic()
+  end
+
   def bare_difference(left, :term), do: keep_optional(left)
   def bare_difference(left, none) when none == @none, do: left
 
@@ -610,6 +1205,12 @@ defmodule Module.Types.Descr do
   Compute the negation of a type.
   """
   def bare_negation(:term), do: none()
+  def bare_negation({_, _, _} = node), do: node |> to_descr() |> bare_negation()
+
+  def bare_negation({:type_variables, bdd}) do
+    bdd |> Poly.negation(&bare_negation/1) |> wrap_polymorphic()
+  end
+
   def bare_negation(%{} = descr), do: bare_difference(term(), descr)
 
   @doc """
@@ -623,8 +1224,13 @@ defmodule Module.Types.Descr do
   def empty?(:term), do: false
   def empty?(%{} = descr), do: empty_seen?(descr, %{})
   def empty?({_, _, _} = node), do: empty_seen?(node, %{})
+  def empty?({:type_variables, _bdd} = descr), do: empty_seen?(descr, %{})
 
   defp empty_seen?(:term, _seen), do: false
+
+  defp empty_seen?({:type_variables, bdd}, seen) do
+    Poly.all_leaves?(bdd, &empty_seen?(&1, seen))
+  end
 
   defp empty_seen?({id, _state, _generator} = node, seen) do
     if :erlang.is_map_key(id, seen) do
@@ -670,6 +1276,11 @@ defmodule Module.Types.Descr do
   Converts all floats or integers into numbers.
   """
   def numberize(:term), do: :term
+
+  def numberize({:type_variables, bdd}) do
+    bdd |> Poly.map_leaves(&numberize/1) |> wrap_polymorphic()
+  end
+
   def numberize(descr), do: numberize_each(descr, [:bitmap, :tuple, :map, :list, :dynamic])
 
   defp numberize_each(descr, [key | keys]) do
@@ -706,6 +1317,7 @@ defmodule Module.Types.Descr do
   Returns if the type is a singleton.
   """
   def singleton?(:term), do: false
+  def singleton?({:type_variables, _bdd}), do: false
   def singleton?(descr), do: static_singleton?(Map.get(descr, :dynamic, descr))
 
   defp static_singleton?(:term), do: false
@@ -766,11 +1378,127 @@ defmodule Module.Types.Descr do
       their default type
   """
   def to_quoted(descr, opts \\ []) do
+    opts =
+      if Keyword.has_key?(opts, :type_variable_names) do
+        opts
+      else
+        Keyword.put(opts, :type_variable_names, type_variable_names(descr))
+      end
+
+    do_to_quoted(descr, opts)
+  end
+
+  defp do_to_quoted({:type_variables, bdd}, opts) do
+    bdd
+    |> Poly.to_dnf()
+    |> Enum.reject(fn {_positive, _negative, descr} -> empty?(descr) end)
+    |> Enum.map(&polymorphic_line_to_quoted(&1, opts))
+    |> case do
+      [] -> {:none, [], []}
+      [quoted | quoted_types] -> Enum.reduce(quoted_types, quoted, &{:or, [], [&2, &1]})
+    end
+  end
+
+  defp do_to_quoted(descr, opts) do
     if term_type?(descr) do
       {:term, [], []}
     else
       non_term_type_to_quoted(descr, opts)
     end
+  end
+
+  defp polymorphic_line_to_quoted({positive, negative, descr}, opts) do
+    variables =
+      Enum.map(positive, &variable_to_quoted(&1, opts)) ++
+        Enum.map(negative, &{:not, [], [variable_to_quoted(&1, opts)]})
+
+    factors =
+      if term_type?(descr) do
+        variables
+      else
+        variables ++ [to_quoted(descr, opts)]
+      end
+
+    case factors do
+      [] -> {:term, [], []}
+      [quoted | quoted_types] -> Enum.reduce(quoted_types, quoted, &{:and, [], [&2, &1]})
+    end
+  end
+
+  @type_variable_name ~r/^[a-z_][a-zA-Z0-9_]*[!?]?$/
+  @reserved_type_variable_names [
+    :after,
+    :alias,
+    :and,
+    :case,
+    :catch,
+    :cond,
+    :do,
+    :else,
+    :end,
+    false,
+    :fn,
+    :for,
+    :if,
+    :import,
+    :in,
+    nil,
+    :not,
+    :or,
+    :quote,
+    :receive,
+    :require,
+    :rescue,
+    true,
+    :try,
+    :unless,
+    :unquote,
+    :unquote_splicing,
+    :use,
+    :when,
+    :with
+  ]
+
+  defp type_variable_names(descr) do
+    {identities, _seen} = collect_variables(descr, MapSet.new(), MapSet.new())
+    identities = Enum.sort(identities)
+    frequencies = Enum.frequencies_by(identities, &elem(&1, 2))
+
+    {names, _used} =
+      Enum.reduce(identities, {%{}, MapSet.new()}, fn
+        {:type_variable, id, display_name} = identity, {names, used} ->
+          string = Atom.to_string(display_name)
+
+          preferred =
+            cond do
+              not valid_type_variable_name?(display_name, string) -> "type_var__#{id}"
+              Map.fetch!(frequencies, display_name) > 1 -> "#{string}__#{id}"
+              true -> string
+            end
+
+          rendered = unique_type_variable_name(preferred, used, 2)
+          {Map.put(names, identity, String.to_atom(rendered)), MapSet.put(used, rendered)}
+      end)
+
+    names
+  end
+
+  defp valid_type_variable_name?(name, string) do
+    name != :_ and name not in @reserved_type_variable_names and
+      Regex.match?(@type_variable_name, string)
+  end
+
+  defp unique_type_variable_name(name, used, suffix) do
+    if MapSet.member?(used, name) do
+      unique_type_variable_name("#{name}__#{suffix}", used, suffix + 1)
+    else
+      name
+    end
+  end
+
+  defp variable_to_quoted(identity, opts) do
+    name = opts |> Keyword.fetch!(:type_variable_names) |> Map.fetch!(identity)
+    {name, [], nil}
   end
 
   defp non_term_type_to_quoted(descr, opts) do
@@ -933,24 +1661,34 @@ defmodule Module.Types.Descr do
   def subtype?(left, right) do
     left = unfold(left)
     right = unfold(right)
-    is_grad_left = gradual?(left)
-    is_grad_right = gradual?(right)
 
-    cond do
-      is_grad_left and not is_grad_right ->
-        left_dynamic = Map.get(left, :dynamic)
-        subtype_static?(left_dynamic, right)
+    if is_polymorphic(left) or is_polymorphic(right) do
+      Poly.all_pairs?(polymorphic_bdd(left), polymorphic_bdd(right), &subtype?/2)
+    else
+      is_grad_left = gradual?(left)
+      is_grad_right = gradual?(right)
 
-      is_grad_right and not is_grad_left ->
-        right_static = Map.delete(right, :dynamic)
-        subtype_static?(left, right_static)
+      cond do
+        is_grad_left and not is_grad_right ->
+          left_dynamic = Map.get(left, :dynamic)
+          subtype_static?(left_dynamic, right)
 
-      true ->
-        subtype_static?(left, right)
+        is_grad_right and not is_grad_left ->
+          right_static = Map.delete(right, :dynamic)
+          subtype_static?(left, right_static)
+
+        true ->
+          subtype_static?(left, right)
+      end
     end
   end
 
   defp subtype_static?(same, same), do: true
+
+  defp subtype_static?(left, right) when is_polymorphic(left) or is_polymorphic(right) do
+    Poly.all_pairs?(polymorphic_bdd(left), polymorphic_bdd(right), &subtype_static?/2)
+  end
+
   defp subtype_static?(left, right), do: empty_difference_subtype?(left, right)
 
   # Internal static subtype helper: unlike subtype?/2, it only checks empty?(left \ right) with seen.
@@ -1013,10 +1751,15 @@ defmodule Module.Types.Descr do
   def disjoint?(left, right) do
     left = unfold(left)
     right = unfold(right)
-    left_upper = Map.get(left, :dynamic, left) |> unfold()
-    right_upper = Map.get(right, :dynamic, right) |> unfold()
 
-    not non_disjoint_intersection?(left_upper, right_upper)
+    if is_polymorphic(left) or is_polymorphic(right) do
+      Poly.all_pairs?(polymorphic_bdd(left), polymorphic_bdd(right), &disjoint?/2)
+    else
+      left_upper = Map.get(left, :dynamic, left) |> unfold()
+      right_upper = Map.get(right, :dynamic, right) |> unfold()
+
+      not non_disjoint_intersection?(left_upper, right_upper)
+    end
   end
 
   @doc """
@@ -1078,11 +1821,11 @@ defmodule Module.Types.Descr do
 
     cond do
       empty?(left_static) ->
-        dynamic = opt_intersection_static(unfold(left_dynamic), unfold(right_dynamic))
+        dynamic = opt_intersection(unfold(left_dynamic), unfold(right_dynamic))
         if empty?(dynamic), do: {:error, left}, else: {:ok, dynamic(dynamic)}
 
       subtype_static?(left_static, right_dynamic) ->
-        dynamic = opt_intersection_static(unfold(left_dynamic), unfold(right_dynamic))
+        dynamic = opt_intersection(unfold(left_dynamic), unfold(right_dynamic))
         {:ok, opt_union(dynamic(dynamic), left_static)}
 
       true ->
@@ -1094,12 +1837,14 @@ defmodule Module.Types.Descr do
   Optimized version of `not empty?(term(), type)`.
   """
   def term_type?(:term), do: true
+  def term_type?({:type_variables, _bdd} = descr), do: subtype?(term(), descr)
   def term_type?(descr), do: subtype_static?(unfolded_term(), Map.delete(descr, :dynamic))
 
   @doc """
   Optimized version of `not empty?(bare_intersection(empty_list(), type))`.
   """
   def empty_list_type?(:term), do: true
+  def empty_list_type?({:type_variables, _bdd} = descr), do: not disjoint?(empty_list(), descr)
   def empty_list_type?(%{dynamic: :term}), do: true
 
   def empty_list_type?(%{dynamic: %{bitmap: bitmap}}) when (bitmap &&& @bit_empty_list) != 0,
@@ -1112,6 +1857,7 @@ defmodule Module.Types.Descr do
   Optimized version of `not empty?(bare_intersection(bitstring(), type))`.
   """
   def bitstring_type?(:term), do: true
+  def bitstring_type?({:type_variables, _bdd} = descr), do: not disjoint?(bitstring(), descr)
   def bitstring_type?(%{dynamic: :term}), do: true
 
   def bitstring_type?(%{dynamic: %{bitmap: bitmap}}) when (bitmap &&& @bit_bitstring) != 0,
@@ -1127,6 +1873,10 @@ defmodule Module.Types.Descr do
   It only means the bitstring bit is up, regardless of the binary bit.
   """
   def bitstring_no_binary_type?(:term), do: true
+
+  def bitstring_no_binary_type?({:type_variables, _bdd} = descr),
+    do: not disjoint?(bitstring_no_binary(), descr)
+
   def bitstring_no_binary_type?(%{dynamic: :term}), do: true
 
   def bitstring_no_binary_type?(%{dynamic: %{bitmap: bitmap}})
@@ -1141,6 +1891,10 @@ defmodule Module.Types.Descr do
   Optimized version of `not empty?(bare_intersection(integer() or float(), type))`.
   """
   def number_type?(:term), do: true
+
+  def number_type?({:type_variables, _bdd} = descr),
+    do: not disjoint?(%{bitmap: @bit_number}, descr)
+
   def number_type?(%{dynamic: :term}), do: true
   def number_type?(%{dynamic: %{bitmap: bitmap}}) when (bitmap &&& @bit_number) != 0, do: true
   def number_type?(%{bitmap: bitmap}) when (bitmap &&& @bit_number) != 0, do: true
@@ -1201,6 +1955,9 @@ defmodule Module.Types.Descr do
   """
   def booleaness(:term), do: :maybe_both
 
+  def booleaness({:type_variables, _bdd} = descr),
+    do: descr |> monomorphic_descr() |> booleaness()
+
   def booleaness(%{} = descr) do
     descr = Map.get(descr, :dynamic, descr)
 
@@ -1256,6 +2013,9 @@ defmodule Module.Types.Descr do
   """
   def truthiness(:term), do: :undefined
 
+  def truthiness({:type_variables, _bdd} = descr),
+    do: descr |> monomorphic_descr() |> truthiness()
+
   def truthiness(%{} = descr) do
     descr = Map.get(descr, :dynamic, descr)
 
@@ -1295,6 +2055,9 @@ defmodule Module.Types.Descr do
   cases, due to negations.
   """
   def atom_fetch(:term), do: :error
+
+  def atom_fetch({:type_variables, _bdd} = descr),
+    do: descr |> monomorphic_descr() |> atom_fetch()
 
   def atom_fetch(%{} = descr) do
     {static_or_dynamic, static} = pop_dynamic(descr)
@@ -1493,6 +2256,9 @@ defmodule Module.Types.Descr do
       {:ok, dynamic(atom())}
   """
   def fun_apply(:term, _arguments), do: :badfun
+
+  def fun_apply({:type_variables, _bdd} = fun, arguments),
+    do: fun |> monomorphic_descr() |> fun_apply(arguments)
 
   def fun_apply(fun, arguments) do
     case :maps.take(:dynamic, fun) do
@@ -2296,6 +3062,9 @@ defmodule Module.Types.Descr do
         {_, _, _} ->
           list_new(list_type, last_type)
 
+        {:type_variables, _bdd} ->
+          list_new(list_type, last_type)
+
         %{} ->
           case :maps.take(:list, last_type) do
             :error ->
@@ -2377,9 +3146,13 @@ defmodule Module.Types.Descr do
   defp list_tail_unfold(:term), do: @not_non_empty_list
 
   defp list_tail_unfold({_, _, _} = node),
-    do: Map.delete(to_descr(node), :list)
+    do: node |> to_descr() |> list_tail_unfold()
 
-  defp list_tail_unfold(other), do: Map.delete(other, :list)
+  defp list_tail_unfold({:type_variables, bdd}) do
+    bdd |> Poly.map_leaves(&list_tail_unfold/1) |> wrap_polymorphic()
+  end
+
+  defp list_tail_unfold(%{} = other), do: Map.delete(other, :list)
 
   @doc """
   Returns the element type of a list, assuming the list is proper.
@@ -2394,6 +3167,9 @@ defmodule Module.Types.Descr do
   returns `:badproperlist`.
   """
   def list_of(:term), do: :badproperlist
+
+  def list_of({:type_variables, _bdd} = descr),
+    do: descr |> monomorphic_descr() |> list_of()
 
   def list_of(descr) do
     case :maps.take(:dynamic, descr) do
@@ -2557,6 +3333,9 @@ defmodule Module.Types.Descr do
   """
   def list_hd(:term), do: :badnonemptylist
 
+  def list_hd({:type_variables, _bdd} = descr),
+    do: descr |> monomorphic_descr() |> list_hd()
+
   def list_hd(%{} = descr) do
     case :maps.take(:dynamic, descr) do
       :error ->
@@ -2596,6 +3375,9 @@ defmodule Module.Types.Descr do
   `list(t, s) or s` (either the rest of the list or the terminator)
   """
   def list_tl(:term), do: :badnonemptylist
+
+  def list_tl({:type_variables, _bdd} = descr),
+    do: descr |> monomorphic_descr() |> list_tl()
 
   def list_tl(descr) do
     case :maps.take(:dynamic, descr) do
@@ -2869,6 +3651,9 @@ defmodule Module.Types.Descr do
   """
   def to_domain_keys(:term), do: @domain_key_types
 
+  def to_domain_keys({:type_variables, _bdd} = descr),
+    do: descr |> monomorphic_descr() |> to_domain_keys()
+
   def to_domain_keys(%{dynamic: dynamic}), do: to_domain_keys(dynamic)
 
   def to_domain_keys(key_descr) do
@@ -3033,8 +3818,12 @@ defmodule Module.Types.Descr do
     map_domain_tag_to_type(domain)
   end
 
-  defguardp is_optional_static(map)
-            when is_map(map) and is_map_key(map, :optional)
+  defp is_optional_static({:type_variables, bdd}) do
+    Poly.all_leaves?(bdd, &is_optional_static/1)
+  end
+
+  defp is_optional_static(map) when is_map(map), do: is_map_key(map, :optional)
+  defp is_optional_static(_other), do: false
 
   defp map_new(tag, fields), do: bdd_leaf_new(tag, fields)
 
@@ -3165,9 +3954,10 @@ defmodule Module.Types.Descr do
        )
        when k1 < k2 do
     # If the type in the open map is optional, we continue
-    case v1 do
-      %{optional: 1} -> map_literal_intersection_open_closed(t1, l2, intersection_fun, seen)
-      _ -> throw(:empty)
+    if is_optional_static(v1) do
+      map_literal_intersection_open_closed(t1, l2, intersection_fun, seen)
+    else
+      throw(:empty)
     end
   end
 
@@ -3195,7 +3985,7 @@ defmodule Module.Types.Descr do
   end
 
   defp map_literal_intersection_open_closed(t1, t2, _intersection_fun, _seen) do
-    if Enum.all?(t1, fn {_, v} -> match?(%{optional: 1}, v) end) do
+    if Enum.all?(t1, fn {_, v} -> is_optional_static(v) end) do
       t2
     else
       throw(:empty)
@@ -3298,6 +4088,9 @@ defmodule Module.Types.Descr do
   both present and absent).
   """
   def map_fetch_key(:term, _key), do: :badmap
+
+  def map_fetch_key({:type_variables, _bdd} = descr, key) when is_atom(key),
+    do: descr |> monomorphic_descr() |> map_fetch_key(key)
 
   def map_fetch_key(%{} = descr, key) when is_atom(key) do
     case :maps.take(:dynamic, descr) do
@@ -3498,6 +4291,9 @@ defmodule Module.Types.Descr do
 
   def map_to_list(:term, _fun), do: :badmap
 
+  def map_to_list({:type_variables, _bdd} = descr, fun),
+    do: descr |> monomorphic_descr() |> map_to_list(fun)
+
   def map_to_list(descr, fun) do
     case :maps.take(:dynamic, descr) do
       :error ->
@@ -3626,18 +4422,18 @@ defmodule Module.Types.Descr do
   """
   def map_update(descr, key_descr, type, return_type? \\ true, force? \\ false)
 
+  def map_update({:type_variables, _bdd} = descr, key_descr, type, return_type?, force?),
+    do: descr |> monomorphic_descr() |> map_update(key_descr, type, return_type?, force?)
+
   def map_update(descr, key_descr, :term, return_type?, force?),
     do: map_update_unchecked(descr, key_descr, fn _ -> :term end, return_type?, force?)
 
   def map_update(descr, key_descr, type, return_type?, force?) do
-    case type do
-      %{dynamic: dynamic} ->
-        fun = fn _, _ -> dynamic end
-        map_update_unchecked(dynamic(descr), key_descr, fun, return_type?, force?)
-
-      %{} ->
-        fun = fn _, _ -> type end
-        map_update_unchecked(descr, key_descr, fun, return_type?, force?)
+    if gradual?(type) do
+      type = upper_bound(type)
+      map_update_unchecked(dynamic(descr), key_descr, fn _, _ -> type end, return_type?, force?)
+    else
+      map_update_unchecked(descr, key_descr, fn _, _ -> type end, return_type?, force?)
     end
   end
 
@@ -3657,17 +4453,11 @@ defmodule Module.Types.Descr do
 
     type_fun = fn optional?, value ->
       if is_function(type_fun, 1) do
-        case type_fun.(if gradual?, do: dynamic(value), else: value) do
-          %{dynamic: dynamic} -> dynamic
-          descr -> descr
-        end
+        type_fun.(if gradual?, do: dynamic(value), else: value)
+        |> upper_bound()
       else
         value = if gradual?, do: dynamic(value), else: value
-
-        case type_fun.(optional?, value) do
-          %{dynamic: dynamic} -> dynamic
-          descr -> descr
-        end
+        type_fun.(optional?, value) |> upper_bound()
       end
     end
 
@@ -3675,6 +4465,18 @@ defmodule Module.Types.Descr do
   end
 
   def map_update_unchecked(:term, _key_descr, _type_fun, _return_type?, _force?), do: :badmap
+
+  def map_update_unchecked(
+        {:type_variables, _bdd} = descr,
+        key_descr,
+        type_fun,
+        return_type?,
+        force?
+      ),
+      do:
+        descr
+        |> monomorphic_descr()
+        |> map_update_unchecked(key_descr, type_fun, return_type?, force?)
 
   def map_update_unchecked(descr, key_descr, type_fun, return_type?, force?) do
     split_keys = map_split_keys_and_domains(key_descr)
@@ -4066,6 +4868,9 @@ defmodule Module.Types.Descr do
   def map_put_key(:term, key, _) when is_atom(key),
     do: :badmap
 
+  def map_put_key({:type_variables, _bdd} = descr, key, type) when is_atom(key),
+    do: descr |> monomorphic_descr() |> map_put_key(key, type)
+
   def map_put_key(descr, key, type) when is_atom(key),
     do: map_put_shared(descr, {[key], [], nil, [], []}, type)
 
@@ -4077,6 +4882,9 @@ defmodule Module.Types.Descr do
   Returns `{:ok, descr}` or `:badmap`.
   """
   def map_put(:term, _, _), do: :badmap
+
+  def map_put({:type_variables, _bdd} = descr, key_descr, type),
+    do: descr |> monomorphic_descr() |> map_put(key_descr, type)
 
   def map_put(descr, key_descr, type) do
     if key_descr in [:term, %{dynamic: :term}] and type in [:term, %{dynamic: :term}] do
@@ -4090,9 +4898,10 @@ defmodule Module.Types.Descr do
     do: map_put_static_value(descr, split_keys, :term)
 
   defp map_put_shared(%{} = descr, split_keys, type) do
-    case :maps.take(:dynamic, type) do
-      :error -> map_put_static_value(descr, split_keys, type)
-      {dynamic, _static} -> map_put_static_value(dynamic(descr), split_keys, dynamic)
+    if gradual?(type) do
+      map_put_static_value(dynamic(descr), split_keys, upper_bound(type))
+    else
+      map_put_static_value(descr, split_keys, type)
     end
   end
 
@@ -4172,6 +4981,9 @@ defmodule Module.Types.Descr do
   `Map.get`, etc. except `map.key`.
   """
   def map_get(:term, _key_descr), do: :badmap
+
+  def map_get({:type_variables, _bdd} = descr, key_descr),
+    do: descr |> monomorphic_descr() |> map_get(key_descr)
 
   def map_get(%{} = descr, key_descr) do
     split_keys = map_split_keys_and_domains(key_descr)
@@ -5259,6 +6071,9 @@ defmodule Module.Types.Descr do
   def tuple_fetch(_, index) when index < 0, do: :badindex
   def tuple_fetch(:term, _key), do: :badtuple
 
+  def tuple_fetch({:type_variables, _bdd} = descr, key) when is_integer(key),
+    do: descr |> monomorphic_descr() |> tuple_fetch(key)
+
   def tuple_fetch(%{} = descr, key) when is_integer(key) do
     case :maps.take(:dynamic, descr) do
       :error ->
@@ -5466,6 +6281,9 @@ defmodule Module.Types.Descr do
   def tuple_values(:term), do: :badtuple
   def tuple_values(descr) when descr == %{}, do: :badtuple
 
+  def tuple_values({:type_variables, _bdd} = descr),
+    do: descr |> monomorphic_descr() |> tuple_values()
+
   def tuple_values(descr) do
     case :maps.take(:dynamic, descr) do
       :error ->
@@ -5510,6 +6328,10 @@ defmodule Module.Types.Descr do
   """
   # Same as tuple_delete but checks if the index is out of range.
   def tuple_delete_at(:term, _key), do: :badtuple
+
+  def tuple_delete_at({:type_variables, _bdd} = descr, index)
+      when is_integer(index) and index >= 0,
+      do: descr |> monomorphic_descr() |> tuple_delete_at(index)
 
   def tuple_delete_at(descr, index) when is_integer(index) and index >= 0 do
     case :maps.take(:dynamic, descr) do
@@ -5595,12 +6417,16 @@ defmodule Module.Types.Descr do
   """
   def tuple_insert_at(:term, _key, _type), do: :badtuple
 
+  def tuple_insert_at({:type_variables, _bdd} = descr, index, type)
+      when is_integer(index) and index >= 0,
+      do: descr |> monomorphic_descr() |> tuple_insert_at(index, type)
+
   def tuple_insert_at(descr, index, type) when is_integer(index) and index >= 0 do
-    case :maps.take(:dynamic, unfold(type)) do
-      :error ->
+    case split_dynamic(type) do
+      {_dynamic_type, _static_type, false} ->
         tuple_insert_at_checked(descr, index, type)
 
-      {dynamic_type, static_type} ->
+      {dynamic_type, static_type, true} ->
         case tuple_insert_at_checked(descr, index, dynamic_type) do
           dynamic_result when is_descr(dynamic_result) ->
             dynamic_result = dynamic(dynamic_result)
@@ -6287,6 +7113,33 @@ defmodule Module.Types.Descr do
     end
   end
 
+  # Mapping a BDD literal can change its ordering key or make two literals
+  # equal. Rebuild through Boolean operations so substitution preserves the
+  # ordered/reduced BDD invariants.
+  defp bdd_map_reorder(bdd, fun) do
+    case bdd do
+      :bdd_bot ->
+        :bdd_bot
+
+      :bdd_top ->
+        :bdd_top
+
+      bdd_leaf(_, _) = leaf ->
+        fun.(leaf)
+
+      {_, leaf, constrained, union, dual} ->
+        leaf = fun.(leaf)
+        constrained = bdd_map_reorder(constrained, fun)
+        union = bdd_map_reorder(union, fun)
+        dual = bdd_map_reorder(dual, fun)
+
+        leaf
+        |> bdd_intersection(constrained)
+        |> bdd_union(union)
+        |> bdd_union(bdd_difference(dual, leaf))
+    end
+  end
+
   defp bdd_reduce(bdd, acc, fun) do
     case bdd do
       :bdd_bot ->
@@ -6395,11 +7248,37 @@ defmodule Module.Types.Descr do
     Enum.reduce(tail, fun.(head), &{:or, [], [&2, fun.(&1)]})
   end
 
+  @doc """
+  Computes the union of two descrs.
+  """
+  def union(left, right), do: opt_union(left, right)
+
+  @doc """
+  Computes the intersection of two descrs.
+  """
+  def intersection(left, right), do: opt_intersection(left, right)
+
+  @doc """
+  Computes the difference of two descrs.
+  """
+  def difference(left, right), do: opt_difference(left, right)
+
+  @doc """
+  Computes the negation of a descr.
+  """
+  def negation(descr), do: opt_negation(descr)
+
   ## Optimizations
 
   @doc """
   Computes the union of two descrs using optimized composite operations.
   """
+  def opt_union(left, right) when is_polymorphic(left) or is_polymorphic(right) do
+    Poly.union(polymorphic_bdd(left), polymorphic_bdd(right), &opt_union/2)
+    |> simplify_polymorphic()
+    |> wrap_polymorphic()
+  end
+
   def opt_union(:term, other), do: optional_to_term(other)
   def opt_union(other, :term), do: optional_to_term(other)
   def opt_union(none, other) when none == @none, do: other
@@ -6446,6 +7325,12 @@ defmodule Module.Types.Descr do
   @doc """
   Computes the intersection of two descrs using optimized composite operations.
   """
+  def opt_intersection(left, right) when is_polymorphic(left) or is_polymorphic(right) do
+    Poly.intersection(polymorphic_bdd(left), polymorphic_bdd(right), &opt_intersection/2)
+    |> simplify_polymorphic()
+    |> wrap_polymorphic()
+  end
+
   def opt_intersection(:term, other), do: remove_optional(other)
   def opt_intersection(other, :term), do: remove_optional(other)
 
@@ -6494,6 +7379,12 @@ defmodule Module.Types.Descr do
   @doc """
   Computes the difference of two descrs using optimized composite operations.
   """
+  def opt_difference(left, right) when is_polymorphic(left) or is_polymorphic(right) do
+    Poly.difference(polymorphic_bdd(left), polymorphic_bdd(right), &opt_difference/2)
+    |> simplify_polymorphic()
+    |> wrap_polymorphic()
+  end
+
   def opt_difference(left, :term), do: keep_optional(left)
   def opt_difference(left, none) when none == @none, do: left
 
@@ -6534,6 +7425,10 @@ defmodule Module.Types.Descr do
   Compute the negation of a type.
   """
   def opt_negation(:term), do: none()
+
+  def opt_negation({:type_variables, bdd}) do
+    bdd |> Poly.negation(&opt_negation/1) |> wrap_polymorphic()
+  end
 
   def opt_negation({_, _, _} = node),
     do: opt_negation(to_descr(node))
