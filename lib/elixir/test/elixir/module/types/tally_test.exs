@@ -160,14 +160,15 @@ defmodule Module.Types.TallyTest do
   end
 
   # Each computation is stopped after one second, or when its heap goes beyond 50M
-  # words.
+  # words. Recursive nodes are interned in the process that builds them, so each test
+  # builds its types, solves and checks within that computation.
   describe "recursive solutions below constructors" do
     test "a variable in a Boolean combination below a constructor" do
       # The recursive solution is a node whose generator substitutes the node for x in
       # {x or :b}: the union is substituted lazily, in a node of its own.
       x = var(:x)
       constraints = [{tuple([opt_union(x, atom([:b]))]), x}]
-      assert_sound(finishes(fn -> tally(constraints) end), constraints)
+      finishes(fn -> assert_sound(tally(constraints), constraints) end)
     end
 
     test "a recursive solution through function types" do
@@ -177,44 +178,43 @@ defmodule Module.Types.TallyTest do
       job = process_fun(tuple([]), oa, ia, term())
       worker = opt_union(atom([:bump]), tuple([atom([:run]), job]))
       constraints = [{job, process_fun(tuple([]), none(), i, res)}, {worker, i}]
-      assert_sound(finishes(fn -> tally(constraints) end), constraints)
+      finishes(fn -> assert_sound(tally(constraints), constraints) end)
     end
 
     test "validating solutions with recursive types through function types" do
       # solve/1 finds the expected solution at once; valid_solution?/2 must compare
       # copies of the recursive types, which are named after their substitution.
-      worker =
-        recursive(%{
-          W: fn recur ->
-            job = process_fun(tuple([]), atom([:bump]), recur.(:W), term())
-            atom([:bump]) |> bare_union(tuple([atom([:run]), job]))
-          end
-        })
-        |> Map.fetch!(:W)
-        |> to_descr()
+      finishes(fn ->
+        worker =
+          recursive(%{
+            W: fn recur ->
+              job = process_fun(tuple([]), atom([:bump]), recur.(:W), term())
+              atom([:bump]) |> bare_union(tuple([atom([:run]), job]))
+            end
+          })
+          |> Map.fetch!(:W)
+          |> to_descr()
 
-      [o_spawn, i_spawn, p1, p2, o_app, i_app, res] =
-        Enum.map([:o_spawn, :i_spawn, :p1, :p2, :o_app, :i_app, :res], &var/1)
+        [o_spawn, i_spawn, p1, p2, o_app, i_app, res] =
+          Enum.map([:o_spawn, :i_spawn, :p1, :p2, :o_app, :i_app, :res], &var/1)
 
-      constraints = [
-        {o_spawn, worker},
-        {worker, i_spawn},
-        {opt_intersection(i_spawn, tuple([atom([:run]), term()])), tuple([p1, p2])},
-        {p1, atom([:run])},
-        {o_app, o_spawn},
-        {i_spawn, i_app},
-        {p2, process_fun(tuple([]), o_app, i_app, res)},
-        {opt_intersection(i_spawn, atom([:bump])), atom([:bump])}
-      ]
+        constraints = [
+          {o_spawn, worker},
+          {worker, i_spawn},
+          {opt_intersection(i_spawn, tuple([atom([:run]), term()])), tuple([p1, p2])},
+          {p1, atom([:run])},
+          {o_app, o_spawn},
+          {i_spawn, i_app},
+          {p2, process_fun(tuple([]), o_app, i_app, res)},
+          {opt_intersection(i_spawn, atom([:bump])), atom([:bump])}
+        ]
 
-      solutions = finishes(fn -> tally(constraints) end)
-      assert_sound(solutions, constraints)
-      assert Enum.any?(solutions, &equal?(Map.fetch!(&1, i_app), worker))
+        solutions = tally(constraints)
+        assert_sound(solutions, constraints)
+        assert Enum.any?(solutions, &equal?(Map.fetch!(&1, i_app), worker))
+      end)
     end
-  end
 
-  # Open problem: this test fails, because tallying does not terminate.
-  describe "open problems" do
     test "a recursive solution through function types, with bracket variables" do
       # As above, but both annotations of job are variables, and the application of
       # job adds the variables o_app and i_app between them and the worker.
@@ -233,7 +233,7 @@ defmodule Module.Types.TallyTest do
         {p2, process_fun(tuple([]), o_app, i_app, res)}
       ]
 
-      assert_sound(finishes(fn -> tally(constraints) end), constraints)
+      finishes(fn -> assert_sound(tally(constraints), constraints) end)
     end
   end
 
@@ -266,6 +266,7 @@ defmodule Module.Types.TallyTest do
 
     case Task.yield(task, 1_000) || Task.shutdown(task, :brutal_kill) do
       {:ok, result} -> result
+      {:exit, {%ExUnit.AssertionError{} = error, stacktrace}} -> reraise error, stacktrace
       _ -> flunk("operation did not finish")
     end
   end

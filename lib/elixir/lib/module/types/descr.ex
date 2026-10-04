@@ -248,19 +248,66 @@ defmodule Module.Types.Descr do
 
   ## Nodes
 
-  defp make_node(id, state, generator), do: {id, state, generator}
+  # Nodes are interned: a node is {n, :node, :node}, where n is a small integer, and the
+  # process dictionary maps n to {id, state, generator} and the id to n. The same id
+  # gives the same node, and hashing or comparing a node does not traverse its state,
+  # whose generators are closures that capture other states and substitutions.
+  defp make_node(id, state, generator) do
+    case dict_get({__MODULE__, :node_id, id}) do
+      nil ->
+        n = dict_get({__MODULE__, :node_count}, 0) + 1
+        :erlang.put({__MODULE__, :node_count}, n)
+        :erlang.put({__MODULE__, :node_id, id}, n)
+        :erlang.put({__MODULE__, :node, n}, {id, state, generator})
+        {n, :node, :node}
+
+      n ->
+        {n, :node, :node}
+    end
+  end
+
+  # The process dictionary, through :erlang: the type checker runs while Elixir
+  # bootstraps, before the module Process exists.
+  defp dict_get(key, default \\ nil) do
+    case :erlang.get(key) do
+      :undefined -> default
+      value -> value
+    end
+  end
+
+  defp node_info({n, :node, :node}) do
+    case dict_get({__MODULE__, :node, n}) do
+      nil -> raise ArgumentError, "unknown recursive node #{n} (nodes are local to a process)"
+      info -> info
+    end
+  end
 
   def to_descr(:term), do: :term
   def to_descr(descr = %{}), do: descr
   def to_descr({:type_variables, _bdd} = descr), do: descr
 
-  def to_descr({_id, state, generator}) do
-    recur = fn name ->
-      {id, _if_set_id, generator} = Map.fetch!(state, name)
-      make_node(id, state, generator)
-    end
+  def to_descr({n, :node, :node} = node) do
+    case dict_get({__MODULE__, :unfolding, n}) do
+      nil ->
+        {_id, state, generator} = node_info(node)
 
-    generator.(recur)
+        recur = fn name ->
+          {id, _if_set_id, generator} = Map.fetch!(state, name)
+          make_node(id, state, generator)
+        end
+
+        descr = generator.(recur)
+        :erlang.put({__MODULE__, :unfolding, n}, descr)
+        descr
+
+      descr ->
+        descr
+    end
+  end
+
+  # The identity of a system of equations: the ids of its nodes, without the generators.
+  defp system_key(state) do
+    Map.new(state, fn {name, {id, if_set_id, _generator}} -> {name, {id, if_set_id}} end)
   end
 
   # Component emptiness can revisit generated BDDs before reaching the original
@@ -324,6 +371,15 @@ defmodule Module.Types.Descr do
         MapSet.put(acc, variable)
       end
     end)
+  end
+
+  @doc """
+  Returns the type variables that occur in a type, syntactically: unlike `vars/1`,
+  without deciding whether they are meaningful.
+  """
+  def syntactic_vars(descr) do
+    {variables, _seen} = collect_variables(descr, MapSet.new(), MapSet.new())
+    MapSet.new(variables, &variable_from_identity/1)
   end
 
   @doc """
@@ -432,7 +488,7 @@ defmodule Module.Types.Descr do
     # every unfolding of a recursive solution of tallying does, gives the same nodes, so
     # that the assumptions of emptiness checks (seen) recognize them.
     copy_ref = {:substitution, substitutions}
-    do_substitute(descr, substitutions, fn _node -> {:error, copy_ref} end, simplify?)
+    do_substitute(descr, substitutions, {{:top, copy_ref}, fn _node -> {:error, copy_ref} end}, simplify?)
   end
 
   defp variable_from_identity(identity) do
@@ -485,7 +541,7 @@ defmodule Module.Types.Descr do
   end
 
   defp do_substitute({_, _, _} = node, substitutions, node_mapper, simplify?) do
-    case node_mapper.(node) do
+    case elem(node_mapper, 1).(node) do
       {:ok, replacement} ->
         replacement
 
@@ -674,7 +730,7 @@ defmodule Module.Types.Descr do
   end
 
   defp lazy_substitution(element, substitutions, node_mapper) do
-    id = {:lazy_substitution, element, substitutions, node_mapper}
+    id = {:lazy_substitution, element, substitutions, elem(node_mapper, 0)}
     generator = fn _recur -> do_substitute(element, substitutions, node_mapper, false) end
     make_node(id, %{lazy: {id, {:if_set, id}, generator}}, generator)
   end
@@ -688,12 +744,8 @@ defmodule Module.Types.Descr do
 
   defp substitute_map_tag(tag, _substitutions, _node_mapper, _simplify?), do: tag
 
-  defp substitute_recursive_node(
-         {id, state, _generator} = node,
-         substitutions,
-         copy_ref,
-         _simplify?
-       ) do
+  defp substitute_recursive_node(node, substitutions, copy_ref, _simplify?) do
+    {id, state, _generator} = node_info(node)
     {variables, _seen} = collect_variables(node, MapSet.new(), MapSet.new())
     domain = substitutions |> Map.keys() |> MapSet.new()
 
@@ -708,8 +760,12 @@ defmodule Module.Types.Descr do
               make_node(original_id, state, original_generator)
             end
 
-            node_mapper = fn {nested_id, nested_state, _nested_generator} ->
-              if nested_state === state do
+            key = system_key(state)
+
+            mapper = fn nested ->
+              {nested_id, nested_state, _nested_generator} = node_info(nested)
+
+              if system_key(nested_state) == key do
                 case recursive_state_position(nested_id, state) do
                   {:node, old_name} -> {:ok, recur.(old_name)}
                   {:if_set, old_name} -> {:ok, recur.(old_name) |> map_domain_if_set()}
@@ -719,6 +775,8 @@ defmodule Module.Types.Descr do
                 {:error, copy_ref}
               end
             end
+
+            node_mapper = {{:copy, key, copy_ref}, mapper}
 
             generator.(original_recur)
             # Semantic simplification may unfold the graph being constructed.
@@ -1408,8 +1466,10 @@ defmodule Module.Types.Descr do
     if :erlang.is_map_key(id, seen) do
       true
     else
-      seen = Map.put(seen, id, true)
-      empty_seen?(to_descr(node), seen)
+      memo_empty({:node_seen, id}, fn ->
+        seen = Map.put(seen, id, true)
+        empty_seen?(to_descr(node), seen)
+      end)
     end
   end
 
@@ -1433,6 +1493,62 @@ defmodule Module.Types.Descr do
           (not Map.has_key?(descr, :list) or list_empty?(descr.list, seen)) and
           (not Map.has_key?(descr, :fun) or fun_empty?(descr.fun, seen))
     end
+  end
+
+  # Emptiness results are memoized in the process dictionary, as in Algorithm 2 of
+  # "Implementing Set-Theoretic Types" (Laurent et al.): a key being checked is assumed
+  # empty. When its check fails, every true result recorded since it was assumed is
+  # rolled back (false results are kept: emptiness is monotone in the assumptions).
+  # When no check is in progress, the recorded results are definitive.
+  defp memo_empty(key, check) do
+    memo_key = {__MODULE__, :empty, key}
+
+    case dict_get(memo_key) do
+      nil ->
+        {length, _entries} = log = dict_get({__MODULE__, :empty_log}, {0, []})
+        :erlang.put(memo_key, true)
+        empty_log_push(memo_key)
+
+        result =
+          try do
+            check.()
+          catch
+            kind, reason ->
+              empty_rollback(length)
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
+
+        if not result do
+          empty_rollback(length)
+          :erlang.put(memo_key, false)
+        end
+
+        if length == 0 and elem(log, 1) == [] and result do
+          # The outermost check succeeded: its results are definitive.
+          :erlang.put({__MODULE__, :empty_log}, {0, []})
+        end
+
+        result
+
+      result ->
+        result
+    end
+  end
+
+  defp empty_log_push(memo_key) do
+    {length, entries} = dict_get({__MODULE__, :empty_log}, {0, []})
+    :erlang.put({__MODULE__, :empty_log}, {length + 1, [memo_key | entries]})
+  end
+
+  defp empty_rollback(base_length) do
+    {length, entries} = dict_get({__MODULE__, :empty_log}, {0, []})
+    {dropped, rest} = Enum.split(entries, length - base_length)
+
+    Enum.each(dropped, fn memo_key ->
+      if dict_get(memo_key) == true, do: :erlang.erase(memo_key)
+    end)
+
+    :erlang.put({__MODULE__, :empty_log}, {base_length, rest})
   end
 
   defp empty_or_optional?(type), do: empty?(remove_optional(type))
@@ -1562,7 +1678,8 @@ defmodule Module.Types.Descr do
 
   # A recursive node is printed as rec(x, body): body is one unfolding of the node, in
   # which the node itself is printed as the variable x.
-  defp do_to_quoted({id, state, _generator} = node, opts) do
+  defp do_to_quoted({_, :node, :node} = node, opts) do
+    {id, state, _generator} = node_info(node)
     bound = Keyword.get(opts, :recursive_nodes, %{})
 
     case bound do
@@ -2835,8 +2952,10 @@ defmodule Module.Types.Descr do
       if :erlang.is_map_key(key, seen) do
         true
       else
-        seen = Map.put(seen, key, true)
-        Enum.all?(bdd_to_dnf(bdd), fn {pos, neg} -> fun_line_empty?(pos, neg, seen) end)
+        memo_empty(key, fn ->
+          seen = Map.put(seen, key, true)
+          Enum.all?(bdd_to_dnf(bdd), fn {pos, neg} -> fun_line_empty?(pos, neg, seen) end)
+        end)
       end
     end)
   end
@@ -3522,14 +3641,16 @@ defmodule Module.Types.Descr do
     if :erlang.is_map_key(key, seen) do
       true
     else
-      seen = Map.put(seen, key, true)
+      memo_empty(key, fn ->
+        seen = Map.put(seen, key, true)
 
-      bdd_to_dnf(bdd)
-      |> Enum.all?(fn {pos, negs} ->
-        case non_empty_list_literals_intersection(pos, seen) do
-          :empty -> true
-          {list, last} -> list_line_empty?(list, last, negs, seen)
-        end
+        bdd_to_dnf(bdd)
+        |> Enum.all?(fn {pos, negs} ->
+          case non_empty_list_literals_intersection(pos, seen) do
+            :empty -> true
+            {list, last} -> list_line_empty?(list, last, negs, seen)
+          end
+        end)
       end)
     end
   end
@@ -3991,7 +4112,8 @@ defmodule Module.Types.Descr do
 
   # Map domains store if_set(value). For recursive nodes, keep that application lazy
   # so constructing the descriptor does not unfold the same map domain forever.
-  defp map_domain_if_set({id, state, _generator} = node) do
+  defp map_domain_if_set({_, :node, :node} = node) do
+    {id, state, _generator} = node_info(node)
     case if_set_node_id(id, state) do
       :already_if_set -> node
       if_set_id -> make_node(if_set_id, state, fn _recur -> node |> unfold() |> if_set() end)
@@ -5387,20 +5509,22 @@ defmodule Module.Types.Descr do
     if :erlang.is_map_key(key, seen) do
       true
     else
-      seen = Map.put(seen, key, true)
+      memo_empty(key, fn ->
+        seen = Map.put(seen, key, true)
 
-      bdd_to_dnf(bdd)
-      |> Enum.all?(fn {pos, negs} ->
-        case non_empty_map_literals_intersection(pos, seen) do
-          :empty ->
-            true
+        bdd_to_dnf(bdd)
+        |> Enum.all?(fn {pos, negs} ->
+          case non_empty_map_literals_intersection(pos, seen) do
+            :empty ->
+              true
 
-          {tag, fields} ->
-            # We check the emptiness of the fields because non_empty_map_literal_intersection
-            # will not return :empty on fields that are set to none() and that exist
-            # just in one map, but not the other.
-            init_map_line_empty?(tag, fields, negs, seen)
-        end
+            {tag, fields} ->
+              # We check the emptiness of the fields because non_empty_map_literal_intersection
+              # will not return :empty on fields that are set to none() and that exist
+              # just in one map, but not the other.
+              init_map_line_empty?(tag, fields, negs, seen)
+          end
+        end)
       end)
     end
   end
@@ -6044,15 +6168,17 @@ defmodule Module.Types.Descr do
     if :erlang.is_map_key(key, seen) do
       true
     else
-      seen = Map.put(seen, key, true)
+      memo_empty(key, fn ->
+        seen = Map.put(seen, key, true)
 
-      bdd_to_dnf(bdd)
-      |> Enum.all?(fn {pos, negs} ->
-        case non_empty_tuple_literals_intersection(pos, seen) do
-          :empty -> true
-          {_tag, _fields} when negs == [] -> false
-          {tag, fields} -> tuple_line_empty?(tag, fields, negs, seen)
-        end
+        bdd_to_dnf(bdd)
+        |> Enum.all?(fn {pos, negs} ->
+          case non_empty_tuple_literals_intersection(pos, seen) do
+            :empty -> true
+            {_tag, _fields} when negs == [] -> false
+            {tag, fields} -> tuple_line_empty?(tag, fields, negs, seen)
+          end
+        end)
       end)
     end
   end

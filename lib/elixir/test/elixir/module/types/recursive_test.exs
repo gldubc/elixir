@@ -322,20 +322,23 @@ defmodule Module.Types.RecursiveTest do
     end
 
     test "recursive map domains" do
-      # X = %{atom() => X}
-      %{X: node} =
-        recursive(%{
-          X: fn recur -> open_map([{to_domain_keys(atom()), recur.(:X)}]) end
-        })
+      # X = %{atom() => X}. Recursive nodes are interned in the process that builds them,
+      # so the types are built within the computation.
+      assert_finishes(fn ->
+        %{X: node} =
+          recursive(%{
+            X: fn recur -> open_map([{to_domain_keys(atom()), recur.(:X)}]) end
+          })
 
-      tx = to_descr(node)
-      rebuilt = open_map([{to_domain_keys(atom()), tx}])
-      closed = closed_map([{to_domain_keys(atom()), tx}])
+        tx = to_descr(node)
+        rebuilt = open_map([{to_domain_keys(atom()), tx}])
+        closed = closed_map([{to_domain_keys(atom()), tx}])
 
-      assert assert_finishes(fn -> subtype?(tx, rebuilt) end)
-      refute assert_finishes(fn -> empty?(opt_intersection(tx, rebuilt)) end)
-      refute assert_finishes(fn -> subtype?(tx, closed) end)
-      refute assert_finishes(fn -> disjoint?(tx, closed) end)
+        assert subtype?(tx, rebuilt)
+        refute empty?(opt_intersection(tx, rebuilt))
+        refute subtype?(tx, closed)
+        refute disjoint?(tx, closed)
+      end)
     end
 
     test "subtyping" do
