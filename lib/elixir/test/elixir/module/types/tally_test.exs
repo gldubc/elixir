@@ -209,6 +209,69 @@ defmodule Module.Types.TallyTest do
     end
   end
 
+  describe "mutually recursive solutions" do
+    # The solutions of all the variables of a saturated set are built together, as one
+    # system of recursive equations.
+    test "a cycle of variables" do
+      finishes(fn ->
+        vars = for i <- 1..6, do: var(:"x#{i}")
+
+        constraints =
+          vars
+          |> Enum.with_index()
+          |> Enum.map(fn {x, i} ->
+            {opt_union(atom([:z]), tuple([Enum.at(vars, rem(i + 1, 6))])), x}
+          end)
+
+        assert [solution | _] = solutions = tally(constraints)
+        assert_sound(solutions, constraints)
+
+        # By symmetry, once the residual variables are none(), every variable is the
+        # same type: :z, {:z}, {{:z}}, ... as a recursive type.
+        ground = fn t -> substitute(t, Map.new(vars(t), &{&1, none()})) end
+        [first | rest] = Enum.map(vars, &(solution |> Map.fetch!(&1) |> ground.()))
+        refute empty?(first)
+        assert Enum.all?(rest, &equal?(&1, first))
+      end)
+    end
+
+    test "variables whose bounds are other variables and recursive types" do
+      finishes(fn ->
+        [x, y, z] = Enum.map([:x, :y, :z], &var/1)
+
+        constraints = [
+          {opt_union(atom([:a]), tuple([y])), x},
+          {opt_union(atom([:b]), tuple([x, z])), y},
+          {z, atom([:c])},
+          {atom([:c]), z}
+        ]
+
+        solutions = tally(constraints)
+        assert_sound(solutions, constraints)
+        assert_sound(tally_first(constraints), constraints)
+      end)
+    end
+
+    test "variables that occur in each other through function types" do
+      # a >= :bump | {:run, job(b)} and b >= :tick | {:run, job(a)}, where the variable
+      # occurs in the codomain of an argument of job.
+      finishes(fn ->
+        [a, b] = Enum.map([:a, :b], &var/1)
+        job_a = process_fun(tuple([]), none(), a, term())
+        job_b = process_fun(tuple([]), none(), b, term())
+
+        constraints = [
+          {opt_union(atom([:bump]), tuple([atom([:run]), job_b])), a},
+          {opt_union(atom([:tick]), tuple([atom([:run]), job_a])), b}
+        ]
+
+        assert [_ | _] = solutions = tally(constraints)
+        assert_sound(solutions, constraints)
+        assert [_] = tally_first(constraints) |> tap(&assert_sound(&1, constraints))
+      end)
+    end
+  end
+
   # Each computation is stopped after one second, or when its heap goes beyond 50M
   # words. Recursive nodes are interned in the process that builds them, so each test
   # builds its types, solves and checks within that computation.
