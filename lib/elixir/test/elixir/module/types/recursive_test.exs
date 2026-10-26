@@ -472,13 +472,33 @@ defmodule Module.Types.RecursiveTest do
       assert assert_finishes(fn -> equal?(to_descr(n.()), to_descr(n.())) end)
     end
 
-    # Open problem: this test fails. opt_intersection/2 intersects tuple literals
-    # componentwise (zip_non_empty_intersection!/4) and descends through the nodes of the
-    # components, with no memo on pairs of nodes.
+    # The intersection of two different nodes is a node of its own, named after the pair,
+    # instead of a descent through both nodes that never ends. The types are built in the
+    # process that uses them, since nodes are local to a process.
     test "intersection of recursive tuple types" do
-      list = int_linked_list()
-      assert assert_finishes(fn -> equal?(opt_intersection(list, list), list) end)
-      assert assert_finishes(fn -> equal?(opt_intersection(list, int_linked_list()), list) end)
+      assert assert_finishes(fn ->
+               list = int_linked_list()
+               equal?(opt_intersection(list, list), list)
+             end)
+
+      assert assert_finishes(fn ->
+               list = int_linked_list()
+               equal?(opt_intersection(list, int_linked_list()), list)
+             end)
+
+      assert assert_finishes(fn ->
+               equal?(opt_intersection(int_linked_list(), number_linked_list()), int_linked_list())
+             end)
+
+      # Integers and floats share nothing but the empty list.
+      assert assert_finishes(fn ->
+               equal?(opt_intersection(int_linked_list(), linked_list(float())), atom([nil]))
+             end)
+
+      assert assert_finishes(fn ->
+               tree = binary_tree(integer())
+               equal?(opt_intersection(tree, binary_tree(integer())), tree)
+             end)
     end
 
     test "set operations accept nodes" do

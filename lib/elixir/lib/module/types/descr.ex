@@ -4396,8 +4396,12 @@ defmodule Module.Types.Descr do
   end
 
   defp non_empty_intersection!(type1, type2, intersection_fun) do
-    type = intersection_fun.(type1, type2)
-    if empty?(type), do: throw(:empty), else: type
+    case intersection_fun.(type1, type2) do
+      # The intersection of two nodes is a node of its own (see lazy_intersection/2):
+      # its emptiness is decided when it is used, not while it is being defined.
+      {_, _, _} = node -> node
+      type -> if empty?(type), do: throw(:empty), else: type
+    end
   end
 
   defp non_empty_intersection!(type1, type2, intersection_fun, seen) do
@@ -7697,6 +7701,10 @@ defmodule Module.Types.Descr do
   def opt_intersection(:term, other), do: remove_optional(other)
   def opt_intersection(other, :term), do: remove_optional(other)
 
+  def opt_intersection({_, _, _} = node, node), do: node
+
+  def opt_intersection({_, _, _} = left, {_, _, _} = right), do: lazy_intersection(left, right)
+
   def opt_intersection({_, _, _} = left, right),
     do: opt_intersection(to_descr(left), to_descr(right))
 
@@ -7719,6 +7727,19 @@ defmodule Module.Types.Descr do
       true ->
         opt_intersection_static(left, right)
     end
+  end
+
+  # Unfolding two recursive nodes and intersecting their components reaches the same two
+  # nodes again, forever. The intersection of two different nodes is instead a node of
+  # its own, named after the pair: unfolding it intersects the unfoldings of the two
+  # nodes, and below the constructors the same pair gives the same node, so that the
+  # recursion closes. Whether the intersection is empty is decided when it is used.
+  defp lazy_intersection(left, right) do
+    {left_id, _, _} = node_info(left)
+    {right_id, _, _} = node_info(right)
+    id = {:lazy_intersection, Enum.sort([left_id, right_id])}
+    generator = fn _recur -> opt_intersection(to_descr(left), to_descr(right)) end
+    make_node(id, %{lazy: {id, {:if_set, id}, generator}}, generator)
   end
 
   @compile {:inline, opt_intersection_static: 2}
