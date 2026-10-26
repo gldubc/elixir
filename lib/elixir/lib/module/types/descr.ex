@@ -120,6 +120,46 @@ defmodule Module.Types.Descr do
   defp polymorphic_bdd({_, _, _} = node), do: Poly.leaf(node)
   defp polymorphic_bdd(descr), do: Poly.leaf(descr)
 
+  # The leaves of a Poly diagram are meant to be monomorphic, but polymorphic_bdd/1
+  # keeps a recursive node as a leaf, and the unfolding of a node may have type
+  # variables at the top level. Leaves can be compared pairwise (Poly.all_pairs?/3) only
+  # once these variables are part of the diagram: exposed_bdd/1 builds a diagram in
+  # which no leaf is a node.
+  defp exposed_bdd(descr), do: descr |> polymorphic_bdd() |> expose_node_leaves()
+
+  defp expose_node_leaves(bdd) do
+    if Poly.reduce_leaves(bdd, false, &(&2 or exposable_leaf?(&1))) do
+      bdd
+      |> Poly.to_dnf()
+      |> Enum.reduce(Poly.leaf(none()), fn {positive, negative, leaf}, acc ->
+        line =
+          Enum.reduce(positive, exposed_leaf(leaf), fn variable, line ->
+            Poly.intersection(Poly.variable(variable, term(), none()), line, &bare_intersection/2)
+          end)
+
+        line =
+          Enum.reduce(negative, line, fn variable, line ->
+            Poly.intersection(Poly.variable(variable, none(), term()), line, &bare_intersection/2)
+          end)
+
+        Poly.union(acc, line, &bare_union/2)
+      end)
+    else
+      bdd
+    end
+  end
+
+  # A connective applied to a node leaf unfolds it, and Poly stores the result as a
+  # leaf, polymorphic when the unfolding has variables at the top level: such leaves are
+  # exposed too.
+  defp exposable_leaf?({_, _, _}), do: true
+  defp exposable_leaf?({:type_variables, _bdd}), do: true
+  defp exposable_leaf?(_descr), do: false
+
+  defp exposed_leaf({_, _, _} = node), do: node |> to_descr() |> exposed_bdd()
+  defp exposed_leaf({:type_variables, bdd}), do: expose_node_leaves(bdd)
+  defp exposed_leaf(descr), do: Poly.leaf(descr)
+
   # Constructor-specific operations work on the monomorphic descriptor. As in
   # SSTT's get_descr, erase top-level variable tests by unioning their leaves;
   # variables nested below constructors remain intact.
@@ -166,7 +206,7 @@ defmodule Module.Types.Descr do
   end
 
   defp polymorphic_subtype?(left, right) do
-    Poly.all_pairs?(left, right, &subtype?/2)
+    Poly.all_pairs?(expose_node_leaves(left), expose_node_leaves(right), &subtype?/2)
   end
 
   defp variable_identity({:type_variables, {:node, identity, {:leaf, :term}, {:leaf, none}}})
@@ -208,19 +248,66 @@ defmodule Module.Types.Descr do
 
   ## Nodes
 
-  defp make_node(id, state, generator), do: {id, state, generator}
+  # Nodes are interned: a node is {n, :node, :node}, where n is a small integer, and the
+  # process dictionary maps n to {id, state, generator} and the id to n. The same id
+  # gives the same node, and hashing or comparing a node does not traverse its state,
+  # whose generators are closures that capture other states and substitutions.
+  defp make_node(id, state, generator) do
+    case dict_get({__MODULE__, :node_id, id}) do
+      nil ->
+        n = dict_get({__MODULE__, :node_count}, 0) + 1
+        :erlang.put({__MODULE__, :node_count}, n)
+        :erlang.put({__MODULE__, :node_id, id}, n)
+        :erlang.put({__MODULE__, :node, n}, {id, state, generator})
+        {n, :node, :node}
+
+      n ->
+        {n, :node, :node}
+    end
+  end
+
+  # The process dictionary, through :erlang: the type checker runs while Elixir
+  # bootstraps, before the module Process exists.
+  defp dict_get(key, default \\ nil) do
+    case :erlang.get(key) do
+      :undefined -> default
+      value -> value
+    end
+  end
+
+  defp node_info({n, :node, :node}) do
+    case dict_get({__MODULE__, :node, n}) do
+      nil -> raise ArgumentError, "unknown recursive node #{n} (nodes are local to a process)"
+      info -> info
+    end
+  end
 
   def to_descr(:term), do: :term
   def to_descr(descr = %{}), do: descr
   def to_descr({:type_variables, _bdd} = descr), do: descr
 
-  def to_descr({_id, state, generator}) do
-    recur = fn name ->
-      {id, _if_set_id, generator} = Map.fetch!(state, name)
-      make_node(id, state, generator)
-    end
+  def to_descr({n, :node, :node} = node) do
+    case dict_get({__MODULE__, :unfolding, n}) do
+      nil ->
+        {_id, state, generator} = node_info(node)
 
-    generator.(recur)
+        recur = fn name ->
+          {id, _if_set_id, generator} = Map.fetch!(state, name)
+          make_node(id, state, generator)
+        end
+
+        descr = generator.(recur)
+        :erlang.put({__MODULE__, :unfolding, n}, descr)
+        descr
+
+      descr ->
+        descr
+    end
+  end
+
+  # The identity of a system of equations: the ids of its nodes, without the generators.
+  defp system_key(state) do
+    Map.new(state, fn {name, {id, if_set_id, _generator}} -> {name, {id, if_set_id}} end)
   end
 
   # Component emptiness can revisit generated BDDs before reaching the original
@@ -287,6 +374,190 @@ defmodule Module.Types.Descr do
   end
 
   @doc """
+  Returns the type variables that occur in a type, syntactically: unlike `vars/1`,
+  without deciding whether they are meaningful.
+  """
+  def syntactic_vars(descr) do
+    {variables, _seen} = collect_variables(descr, MapSet.new(), MapSet.new())
+    MapSet.new(variables, &variable_from_identity/1)
+  end
+
+  @doc """
+  Merges the equivalent recursive nodes of a type, as `factorize` does in SSTT (Laurent
+  and Nguyen, "Implementing Set-Theoretic Types"): every node reachable from the type
+  is replaced by the first node equivalent to it in depth-first order, and these
+  representatives are rebuilt as one system of equations. The result is equivalent to
+  the type, and printing it shows each recursive type once. The type is returned
+  unchanged when no two nodes are equivalent, and when merging would put a node at the
+  top level of its own definition.
+  """
+  def factorize(descr) do
+    nodes = descr |> reachable_nodes([], MapSet.new()) |> elem(0) |> Enum.reverse()
+
+    {representatives, class} =
+      Enum.reduce(nodes, {[], %{}}, fn node, {representatives, class} ->
+        case Enum.find(representatives, &equal?(&1, node)) do
+          nil -> {[node | representatives], Map.put(class, node, node)}
+          representative -> {representatives, Map.put(class, node, representative)}
+        end
+      end)
+
+    representatives = Enum.reverse(representatives)
+
+    above =
+      Map.new(representatives, fn representative ->
+        tops = representative |> to_descr() |> top_nodes() |> Enum.map(&Map.get(class, &1))
+        {representative, tops}
+      end)
+
+    if length(representatives) == length(nodes) or
+         Enum.any?(nodes, &match?({:if_set, _}, node_position(&1))) or
+         top_level_cycle?(above) do
+      descr
+    else
+      names = factorized_names(representatives)
+
+      new_nodes =
+        recursive(
+          Map.new(representatives, fn representative ->
+            generator = fn recur ->
+              map_nodes(to_descr(representative), fn node ->
+                case Map.fetch(class, node) do
+                  {:ok, representative} -> recur.(Map.fetch!(names, representative))
+                  :error -> node
+                end
+              end)
+            end
+
+            {Map.fetch!(names, representative), generator}
+          end)
+        )
+
+      map_nodes(descr, fn node ->
+        case Map.fetch(class, node) do
+          {:ok, representative} -> Map.fetch!(new_nodes, Map.fetch!(names, representative))
+          :error -> node
+        end
+      end)
+    end
+  end
+
+  @doc """
+  Replaces every recursive node that occurs in a type (at the top level or below
+  constructors, but not inside the definitions of the nodes) by `fun.(node)`.
+  """
+  def map_nodes(descr, fun) do
+    do_substitute(descr, %{}, {{:map_nodes, make_ref()}, &{:ok, fun.(&1)}}, false)
+  end
+
+  # The nodes reachable from a type, in depth-first order (reversed).
+  defp reachable_nodes(:term, acc, seen), do: {acc, seen}
+
+  defp reachable_nodes({_, :node, :node} = node, acc, seen) do
+    if MapSet.member?(seen, node),
+      do: {acc, seen},
+      else: reachable_nodes(to_descr(node), [node | acc], MapSet.put(seen, node))
+  end
+
+  defp reachable_nodes({:type_variables, bdd}, acc, seen),
+    do:
+      Poly.reduce_leaves(bdd, {acc, seen}, fn leaf, {acc, seen} ->
+        reachable_nodes(leaf, acc, seen)
+      end)
+
+  defp reachable_nodes(%{} = descr, acc, seen) do
+    Enum.reduce(descr, {acc, seen}, fn
+      {:dynamic, descr}, {acc, seen} -> reachable_nodes(descr, acc, seen)
+      {key, bdd}, {acc, seen} -> reachable_component_nodes(key, bdd, acc, seen)
+    end)
+  end
+
+  defp reachable_component_nodes(:list, bdd, acc, seen) do
+    bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(head, tail), {acc, seen} ->
+      {acc, seen} = reachable_nodes(head, acc, seen)
+      reachable_nodes(tail, acc, seen)
+    end)
+  end
+
+  defp reachable_component_nodes(:tuple, bdd, acc, seen) do
+    bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(_tag, elements), {acc, seen} ->
+      Enum.reduce(elements, {acc, seen}, fn e, {acc, seen} -> reachable_nodes(e, acc, seen) end)
+    end)
+  end
+
+  defp reachable_component_nodes(:map, bdd, acc, seen) do
+    bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(tag, fields), {acc, seen} ->
+      {acc, seen} = reachable_field_nodes(tag, acc, seen)
+      reachable_field_nodes(fields, acc, seen)
+    end)
+  end
+
+  defp reachable_component_nodes(:fun, {_kind, bdds}, acc, seen) do
+    Enum.reduce(bdds, {acc, seen}, fn {_arity, bdd}, {acc, seen} ->
+      bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(arguments, return), {acc, seen} ->
+        Enum.reduce(arguments ++ [return], {acc, seen}, fn e, {acc, seen} ->
+          reachable_nodes(e, acc, seen)
+        end)
+      end)
+    end)
+  end
+
+  defp reachable_component_nodes(_key, _value, acc, seen), do: {acc, seen}
+
+  defp reachable_field_nodes(fields, acc, seen) when is_list(fields) do
+    Enum.reduce(fields, {acc, seen}, fn {_key, descr}, {acc, seen} ->
+      reachable_nodes(descr, acc, seen)
+    end)
+  end
+
+  defp reachable_field_nodes(_tag, acc, seen), do: {acc, seen}
+
+  # The nodes that occur at the top level of a type, where connectives unfold them.
+  defp top_nodes({_, :node, :node} = node), do: [node]
+
+  defp top_nodes({:type_variables, bdd}),
+    do: Poly.reduce_leaves(bdd, [], fn leaf, acc -> top_nodes(leaf) ++ acc end)
+
+  defp top_nodes(_descr), do: []
+
+  defp top_level_cycle?(above) do
+    case Enum.find(above, fn {_node, tops} -> not Enum.any?(tops, &is_map_key(above, &1)) end) do
+      nil -> map_size(above) > 0
+      {node, _tops} -> top_level_cycle?(Map.delete(above, node))
+    end
+  end
+
+  defp node_position(node) do
+    {id, state, _generator} = node_info(node)
+    recursive_state_position(id, state)
+  end
+
+  # The names of the equations, for printing: those of the representatives, made
+  # distinct by a suffix.
+  defp factorized_names(representatives) do
+    {names, _used} =
+      Enum.map_reduce(representatives, MapSet.new(), fn representative, used ->
+        base =
+          case node_position(representative) do
+            {:node, name} when is_atom(name) -> Atom.to_string(name)
+            _ -> "rec"
+          end
+
+        name =
+          Stream.iterate(1, &(&1 + 1))
+          |> Stream.map(fn
+            1 -> String.to_atom(base)
+            n -> String.to_atom("#{base}_#{n}")
+          end)
+          |> Enum.find(&(not MapSet.member?(used, &1)))
+
+        {{representative, name}, MapSet.put(used, name)}
+      end)
+
+    Map.new(names)
+  end
+
+  @doc """
   Solves a finite set of subtype constraints by tallying.
 
   Each constraint is a `{left, right}` pair denoting `left <= right`. The
@@ -300,6 +571,15 @@ defmodule Module.Types.Descr do
   """
   def tally(constraints, fixed \\ MapSet.new()) when is_list(constraints) do
     Module.Types.Descr.Tally.tally(constraints, fixed)
+  end
+
+  @doc """
+  Like `tally/2`, but returns one solution only: `[substitution]`, or `[]`, in theory
+  exactly when `tally/2` does (the two may disagree where `subtype?/2` errs, see
+  `Module.Types.Descr.Tally.tally_first/2`).
+  """
+  def tally_first(constraints, fixed \\ MapSet.new()) when is_list(constraints) do
+    Module.Types.Descr.Tally.tally_first(constraints, fixed)
   end
 
   @doc false
@@ -387,8 +667,18 @@ defmodule Module.Types.Descr do
     do: descr
 
   defp substitute_normalized(descr, substitutions, simplify?) do
-    copy_ref = make_ref()
-    do_substitute(descr, substitutions, fn _node -> {:error, copy_ref} end, simplify?)
+    # The copies of recursive nodes made by a substitution are named after the
+    # substitution, not by a fresh reference: substituting again with the same map, as
+    # every unfolding of a recursive solution of tallying does, gives the same nodes, so
+    # that the assumptions of emptiness checks (seen) recognize them.
+    copy_ref = {:substitution, substitutions}
+
+    do_substitute(
+      descr,
+      substitutions,
+      {{:top, copy_ref}, fn _node -> {:error, copy_ref} end},
+      simplify?
+    )
   end
 
   defp variable_from_identity(identity) do
@@ -416,6 +706,13 @@ defmodule Module.Types.Descr do
   defp do_substitute(:term, _substitutions, _node_mapper, _simplify?), do: :term
 
   defp do_substitute({:type_variables, bdd}, substitutions, node_mapper, simplify?) do
+    # In structural mode, the connectives do not simplify either: simplification decides
+    # equivalence with subtype?/2, which would unfold the nodes being defined.
+    {union, intersection, difference} =
+      if simplify?,
+        do: {&bare_union/2, &bare_intersection/2, &bare_difference/2},
+        else: {&plain_union/2, &plain_intersection/2, &plain_difference/2}
+
     bdd =
       Poly.substitute(
         bdd,
@@ -424,17 +721,17 @@ defmodule Module.Types.Descr do
           do_substitute(descr, substitutions, node_mapper, simplify?)
         end,
         &polymorphic_bdd/1,
-        &bare_union/2,
-        &bare_intersection/2,
-        &bare_difference/2
+        union,
+        intersection,
+        difference
       )
 
-    bdd = if simplify?, do: simplify_polymorphic(bdd), else: bdd
+    bdd = if simplify?, do: simplify_polymorphic(bdd), else: flatten_polymorphic_leaves(bdd)
     wrap_polymorphic(bdd)
   end
 
   defp do_substitute({_, _, _} = node, substitutions, node_mapper, simplify?) do
-    case node_mapper.(node) do
+    case elem(node_mapper, 1).(node) do
       {:ok, replacement} ->
         replacement
 
@@ -455,8 +752,8 @@ defmodule Module.Types.Descr do
   defp substitute_component(:list, bdd, substitutions, node_mapper, simplify?) do
     bdd_map_reorder(bdd, fn bdd_leaf(head, tail) ->
       bdd_leaf_new(
-        do_substitute(head, substitutions, node_mapper, simplify?),
-        do_substitute(tail, substitutions, node_mapper, simplify?)
+        substitute_element(head, substitutions, node_mapper, simplify?),
+        substitute_element(tail, substitutions, node_mapper, simplify?)
       )
     end)
   end
@@ -464,7 +761,7 @@ defmodule Module.Types.Descr do
   defp substitute_component(:tuple, bdd, substitutions, node_mapper, simplify?) do
     bdd_map_reorder(bdd, fn bdd_leaf(tag, elements) ->
       elements =
-        Enum.map(elements, &do_substitute(&1, substitutions, node_mapper, simplify?))
+        Enum.map(elements, &substitute_element(&1, substitutions, node_mapper, simplify?))
 
       bdd_leaf_new(tag, elements)
     end)
@@ -477,7 +774,7 @@ defmodule Module.Types.Descr do
       fields =
         fields_map(
           fn _key, value ->
-            do_substitute(value, substitutions, node_mapper, simplify?)
+            substitute_element(value, substitutions, node_mapper, simplify?)
           end,
           fields
         )
@@ -493,9 +790,9 @@ defmodule Module.Types.Descr do
         bdd =
           bdd_map_reorder(bdd, fn bdd_leaf(arguments, return) ->
             arguments =
-              Enum.map(arguments, &do_substitute(&1, substitutions, node_mapper, simplify?))
+              Enum.map(arguments, &substitute_element(&1, substitutions, node_mapper, simplify?))
 
-            return = do_substitute(return, substitutions, node_mapper, simplify?)
+            return = substitute_element(return, substitutions, node_mapper, simplify?)
             bdd_leaf_new(arguments, return)
           end)
 
@@ -507,21 +804,138 @@ defmodule Module.Types.Descr do
 
   defp substitute_component(_key, value, _substitutions, _node_mapper, _simplify?), do: value
 
+  # Below a constructor, substituting a recursive node for a variable that occurs in a
+  # Boolean combination computes connectives on the node, which unfold it. Inside the
+  # generator of that very node (a recursive solution of tallying, or a copy made by
+  # substitute_recursive_node/4), the unfolding never ends. In structural mode such an
+  # element is substituted lazily, in a node of its own whose identity is the
+  # substitution itself: the generator then terminates, and unfolding the node again
+  # gives the same nodes, which the assumptions of emptiness checks recognize.
+  defp substitute_element({:type_variables, bdd} = element, substitutions, node_mapper, false) do
+    if lazy_substitution?(bdd, substitutions) do
+      lazy_substitution(element, substitutions, node_mapper)
+    else
+      do_substitute(element, substitutions, node_mapper, false)
+    end
+  end
+
+  defp substitute_element(element, substitutions, node_mapper, simplify?),
+    do: do_substitute(element, substitutions, node_mapper, simplify?)
+
+  defp lazy_substitution?({:node, _variable, {:leaf, :term}, {:leaf, none}}, _substitutions)
+       when none == @none,
+       do: false
+
+  defp lazy_substitution?(bdd, substitutions) do
+    replaced = bdd |> Poly.variables() |> Enum.filter(&is_map_key(substitutions, &1))
+
+    replaced != [] and
+      (Enum.any?(replaced, &node_at_top?(Map.fetch!(substitutions, &1))) or
+         Poly.reduce_leaves(bdd, false, &(&2 or match?({_, _, _}, &1))))
+  end
+
+  defp node_at_top?({_, _, _}), do: true
+
+  defp node_at_top?({:type_variables, bdd}),
+    do: Poly.reduce_leaves(bdd, false, &(&2 or match?({_, _, _}, &1)))
+
+  defp node_at_top?(_descr), do: false
+
+  # Connectives for structural substitution: as bare_union/2, bare_intersection/2 and
+  # bare_difference/2, whose clauses for term() and none() keep a node unevaluated, but
+  # without simplify_polymorphic/1. They may return polymorphic types, which Poly stores
+  # as leaves: flatten_polymorphic_leaves/1 merges them into the diagram.
+  defp plain_union(left, right) do
+    cond do
+      left == @none -> right
+      right == @none -> left
+      left == :term or right == :term -> bare_union(left, right)
+      true -> plain_operation(left, right, &Poly.union/3, &bare_union/2)
+    end
+  end
+
+  defp plain_intersection(left, right) do
+    cond do
+      left == :term or right == :term -> bare_intersection(left, right)
+      left == @none or right == @none -> @none
+      true -> plain_operation(left, right, &Poly.intersection/3, &bare_intersection/2)
+    end
+  end
+
+  defp plain_difference(left, right) do
+    cond do
+      left == @none -> @none
+      right == @none -> left
+      right == :term -> bare_difference(left, right)
+      true -> plain_operation(left, right, &Poly.difference/3, &bare_difference/2)
+    end
+  end
+
+  defp plain_operation(left, right, poly_operation, bare_operation) do
+    left = unfold(left)
+    right = unfold(right)
+
+    if is_polymorphic(left) or is_polymorphic(right) do
+      poly_operation.(exposed_bdd(left), exposed_bdd(right), bare_operation)
+      |> wrap_polymorphic()
+    else
+      bare_operation.(left, right)
+    end
+  end
+
+  defp flatten_polymorphic_leaves(bdd) do
+    if Poly.reduce_leaves(bdd, false, &(&2 or is_polymorphic(&1))) do
+      bdd
+      |> Poly.to_dnf()
+      |> Enum.reduce(Poly.leaf(none()), fn {positive, negative, leaf}, acc ->
+        line =
+          case leaf do
+            {:type_variables, leaf_bdd} -> flatten_polymorphic_leaves(leaf_bdd)
+            leaf -> Poly.leaf(leaf)
+          end
+
+        line =
+          Enum.reduce(positive, line, fn variable, line ->
+            Poly.intersection(
+              Poly.variable(variable, term(), none()),
+              line,
+              &plain_intersection/2
+            )
+          end)
+
+        line =
+          Enum.reduce(negative, line, fn variable, line ->
+            Poly.intersection(
+              Poly.variable(variable, none(), term()),
+              line,
+              &plain_intersection/2
+            )
+          end)
+
+        Poly.union(acc, line, &plain_union/2)
+      end)
+    else
+      bdd
+    end
+  end
+
+  defp lazy_substitution(element, substitutions, node_mapper) do
+    id = {:lazy_substitution, element, substitutions, elem(node_mapper, 0)}
+    generator = fn _recur -> do_substitute(element, substitutions, node_mapper, false) end
+    make_node(id, %{lazy: {id, {:if_set, id}, generator}}, generator)
+  end
+
   defp substitute_map_tag(tag, substitutions, node_mapper, simplify?) when is_list(tag) do
     fields_map(
-      fn _key, value -> do_substitute(value, substitutions, node_mapper, simplify?) end,
+      fn _key, value -> substitute_element(value, substitutions, node_mapper, simplify?) end,
       tag
     )
   end
 
   defp substitute_map_tag(tag, _substitutions, _node_mapper, _simplify?), do: tag
 
-  defp substitute_recursive_node(
-         {id, state, _generator} = node,
-         substitutions,
-         copy_ref,
-         _simplify?
-       ) do
+  defp substitute_recursive_node(node, substitutions, copy_ref, _simplify?) do
+    {id, state, _generator} = node_info(node)
     {variables, _seen} = collect_variables(node, MapSet.new(), MapSet.new())
     domain = substitutions |> Map.keys() |> MapSet.new()
 
@@ -536,8 +950,12 @@ defmodule Module.Types.Descr do
               make_node(original_id, state, original_generator)
             end
 
-            node_mapper = fn {nested_id, nested_state, _nested_generator} ->
-              if nested_state === state do
+            key = system_key(state)
+
+            mapper = fn nested ->
+              {nested_id, nested_state, _nested_generator} = node_info(nested)
+
+              if system_key(nested_state) == key do
                 case recursive_state_position(nested_id, state) do
                   {:node, old_name} -> {:ok, recur.(old_name)}
                   {:if_set, old_name} -> {:ok, recur.(old_name) |> map_domain_if_set()}
@@ -547,6 +965,8 @@ defmodule Module.Types.Descr do
                 {:error, copy_ref}
               end
             end
+
+            node_mapper = {{:copy, key, copy_ref}, mapper}
 
             generator.(original_recur)
             # Semantic simplification may unfold the graph being constructed.
@@ -1229,15 +1649,17 @@ defmodule Module.Types.Descr do
   defp empty_seen?(:term, _seen), do: false
 
   defp empty_seen?({:type_variables, bdd}, seen) do
-    Poly.all_leaves?(bdd, &empty_seen?(&1, seen))
+    Poly.all_leaves?(expose_node_leaves(bdd), &empty_seen?(&1, seen))
   end
 
   defp empty_seen?({id, _state, _generator} = node, seen) do
     if :erlang.is_map_key(id, seen) do
       true
     else
-      seen = Map.put(seen, id, true)
-      empty_seen?(to_descr(node), seen)
+      memo_empty({:node_seen, id}, fn ->
+        seen = Map.put(seen, id, true)
+        empty_seen?(to_descr(node), seen)
+      end)
     end
   end
 
@@ -1261,6 +1683,62 @@ defmodule Module.Types.Descr do
           (not Map.has_key?(descr, :list) or list_empty?(descr.list, seen)) and
           (not Map.has_key?(descr, :fun) or fun_empty?(descr.fun, seen))
     end
+  end
+
+  # Emptiness results are memoized in the process dictionary, as in Algorithm 2 of
+  # "Implementing Set-Theoretic Types" (Laurent et al.): a key being checked is assumed
+  # empty. When its check fails, every true result recorded since it was assumed is
+  # rolled back (false results are kept: emptiness is monotone in the assumptions).
+  # When no check is in progress, the recorded results are definitive.
+  defp memo_empty(key, check) do
+    memo_key = {__MODULE__, :empty, key}
+
+    case dict_get(memo_key) do
+      nil ->
+        {length, _entries} = log = dict_get({__MODULE__, :empty_log}, {0, []})
+        :erlang.put(memo_key, true)
+        empty_log_push(memo_key)
+
+        result =
+          try do
+            check.()
+          catch
+            kind, reason ->
+              empty_rollback(length)
+              :erlang.raise(kind, reason, __STACKTRACE__)
+          end
+
+        if not result do
+          empty_rollback(length)
+          :erlang.put(memo_key, false)
+        end
+
+        if length == 0 and elem(log, 1) == [] and result do
+          # The outermost check succeeded: its results are definitive.
+          :erlang.put({__MODULE__, :empty_log}, {0, []})
+        end
+
+        result
+
+      result ->
+        result
+    end
+  end
+
+  defp empty_log_push(memo_key) do
+    {length, entries} = dict_get({__MODULE__, :empty_log}, {0, []})
+    :erlang.put({__MODULE__, :empty_log}, {length + 1, [memo_key | entries]})
+  end
+
+  defp empty_rollback(base_length) do
+    {length, entries} = dict_get({__MODULE__, :empty_log}, {0, []})
+    {dropped, rest} = Enum.split(entries, length - base_length)
+
+    Enum.each(dropped, fn memo_key ->
+      if dict_get(memo_key) == true, do: :erlang.erase(memo_key)
+    end)
+
+    :erlang.put({__MODULE__, :empty_log}, {base_length, rest})
   end
 
   defp empty_or_optional?(type), do: empty?(remove_optional(type))
@@ -1388,6 +1866,23 @@ defmodule Module.Types.Descr do
     do_to_quoted(descr, opts)
   end
 
+  # A recursive node is printed as rec(x, body): body is one unfolding of the node, in
+  # which the node itself is printed as the variable x.
+  defp do_to_quoted({_, :node, :node} = node, opts) do
+    {id, state, _generator} = node_info(node)
+    bound = Keyword.get(opts, :recursive_nodes, %{})
+
+    case bound do
+      %{^id => name} ->
+        {name, [], nil}
+
+      %{} ->
+        name = recursive_node_name(id, state, bound)
+        opts = Keyword.put(opts, :recursive_nodes, Map.put(bound, id, name))
+        {:rec, [], [{name, [], nil}, do_to_quoted(to_descr(node), opts)]}
+    end
+  end
+
   defp do_to_quoted({:type_variables, bdd}, opts) do
     bdd
     |> Poly.to_dnf()
@@ -1405,6 +1900,25 @@ defmodule Module.Types.Descr do
     else
       non_term_type_to_quoted(descr, opts)
     end
+  end
+
+  # The name of the equation that defines the node, made distinct from the names of
+  # the nodes being printed around it.
+  defp recursive_node_name(id, state, bound) do
+    base =
+      case recursive_state_position(id, state) do
+        {_kind, name} when is_atom(name) -> Atom.to_string(name)
+        _ -> "rec"
+      end
+
+    used = bound |> Map.values() |> MapSet.new()
+
+    Stream.iterate(1, &(&1 + 1))
+    |> Stream.map(fn
+      1 -> String.to_unsafe_atom(base)
+      n -> String.to_unsafe_atom("#{base}_#{n}")
+    end)
+    |> Enum.find(&(not MapSet.member?(used, &1)))
   end
 
   defp polymorphic_line_to_quoted({positive, negative, descr}, opts) do
@@ -1663,7 +2177,7 @@ defmodule Module.Types.Descr do
     right = unfold(right)
 
     if is_polymorphic(left) or is_polymorphic(right) do
-      Poly.all_pairs?(polymorphic_bdd(left), polymorphic_bdd(right), &subtype?/2)
+      Poly.all_pairs?(exposed_bdd(left), exposed_bdd(right), &subtype?/2)
     else
       is_grad_left = gradual?(left)
       is_grad_right = gradual?(right)
@@ -1686,14 +2200,43 @@ defmodule Module.Types.Descr do
   defp subtype_static?(same, same), do: true
 
   defp subtype_static?(left, right) when is_polymorphic(left) or is_polymorphic(right) do
-    Poly.all_pairs?(polymorphic_bdd(left), polymorphic_bdd(right), &subtype_static?/2)
+    Poly.all_pairs?(exposed_bdd(left), exposed_bdd(right), &subtype_static?/2)
   end
 
   defp subtype_static?(left, right), do: empty_difference_subtype?(left, right)
 
   # Internal static subtype helper: unlike subtype?/2, it only checks empty?(left \ right) with seen.
   defp subtype_seen?(left, right, seen),
-    do: empty_seen?(bare_difference(left, right), seen)
+    do: empty_seen?(seen_difference(left, right), seen)
+
+  # Connectives for emptiness checks. On polymorphic types, bare_difference/2 and
+  # bare_intersection/2 simplify their result with simplify_polymorphic/1, which decides
+  # equivalence with subtype?/2: the emptiness check would start again without the
+  # assumptions in seen and, with recursive types, might not terminate. These work on
+  # exposed diagrams and do not simplify.
+  defp seen_difference(left, right) do
+    left = unfold(left)
+    right = unfold(right)
+
+    if is_polymorphic(left) or is_polymorphic(right) do
+      Poly.difference(exposed_bdd(left), exposed_bdd(right), &bare_difference/2)
+      |> wrap_polymorphic()
+    else
+      bare_difference(left, right)
+    end
+  end
+
+  defp seen_intersection(left, right) do
+    left = unfold(left)
+    right = unfold(right)
+
+    if is_polymorphic(left) or is_polymorphic(right) do
+      Poly.intersection(exposed_bdd(left), exposed_bdd(right), &bare_intersection/2)
+      |> wrap_polymorphic()
+    else
+      bare_intersection(left, right)
+    end
+  end
 
   # This function is designed to compute the difference during subtyping efficiently.
   # Do not use it for anything else.
@@ -1838,6 +2381,7 @@ defmodule Module.Types.Descr do
   """
   def term_type?(:term), do: true
   def term_type?({:type_variables, _bdd} = descr), do: subtype?(term(), descr)
+  def term_type?({_, _, _} = node), do: node |> to_descr() |> term_type?()
   def term_type?(descr), do: subtype_static?(unfolded_term(), Map.delete(descr, :dynamic))
 
   @doc """
@@ -2598,8 +3142,10 @@ defmodule Module.Types.Descr do
       if :erlang.is_map_key(key, seen) do
         true
       else
-        seen = Map.put(seen, key, true)
-        Enum.all?(bdd_to_dnf(bdd), fn {pos, neg} -> fun_line_empty?(pos, neg, seen) end)
+        memo_empty(key, fn ->
+          seen = Map.put(seen, key, true)
+          Enum.all?(bdd_to_dnf(bdd), fn {pos, neg} -> fun_line_empty?(pos, neg, seen) end)
+        end)
       end
     end)
   end
@@ -2659,10 +3205,10 @@ defmodule Module.Types.Descr do
     # input to the positive intersection yields a subtype of the return
     case disjoint_non_empty_domains?({arguments, return}, positives, seen) do
       :disjoint_non_empty ->
-        apply_disjoint(arguments, positives) |> subtype?(return)
+        apply_disjoint(arguments, positives) |> subtype_seen?(return, seen)
 
       :non_empty ->
-        fun_apply_static(arguments, [positives]) |> subtype?(return)
+        fun_apply_static(arguments, [positives]) |> subtype_seen?(return, seen)
 
       _ ->
         # Initialize memoization cache for the recursive phi computation
@@ -3285,14 +3831,16 @@ defmodule Module.Types.Descr do
     if :erlang.is_map_key(key, seen) do
       true
     else
-      seen = Map.put(seen, key, true)
+      memo_empty(key, fn ->
+        seen = Map.put(seen, key, true)
 
-      bdd_to_dnf(bdd)
-      |> Enum.all?(fn {pos, negs} ->
-        case non_empty_list_literals_intersection(pos, seen) do
-          :empty -> true
-          {list, last} -> list_line_empty?(list, last, negs, seen)
-        end
+        bdd_to_dnf(bdd)
+        |> Enum.all?(fn {pos, negs} ->
+          case non_empty_list_literals_intersection(pos, seen) do
+            :empty -> true
+            {list, last} -> list_line_empty?(list, last, negs, seen)
+          end
+        end)
       end)
     end
   end
@@ -3754,7 +4302,9 @@ defmodule Module.Types.Descr do
 
   # Map domains store if_set(value). For recursive nodes, keep that application lazy
   # so constructing the descriptor does not unfold the same map domain forever.
-  defp map_domain_if_set({id, state, _generator} = node) do
+  defp map_domain_if_set({_, :node, :node} = node) do
+    {id, state, _generator} = node_info(node)
+
     case if_set_node_id(id, state) do
       :already_if_set -> node
       if_set_id -> make_node(if_set_id, state, fn _recur -> node |> unfold() |> if_set() end)
@@ -4037,8 +4587,12 @@ defmodule Module.Types.Descr do
   end
 
   defp non_empty_intersection!(type1, type2, intersection_fun) do
-    type = intersection_fun.(type1, type2)
-    if empty?(type), do: throw(:empty), else: type
+    case intersection_fun.(type1, type2) do
+      # The intersection of two nodes is a node of its own (see lazy_intersection/2):
+      # its emptiness is decided when it is used, not while it is being defined.
+      {_, _, _} = node -> node
+      type -> if empty?(type), do: throw(:empty), else: type
+    end
   end
 
   defp non_empty_intersection!(type1, type2, intersection_fun, seen) do
@@ -5150,20 +5704,22 @@ defmodule Module.Types.Descr do
     if :erlang.is_map_key(key, seen) do
       true
     else
-      seen = Map.put(seen, key, true)
+      memo_empty(key, fn ->
+        seen = Map.put(seen, key, true)
 
-      bdd_to_dnf(bdd)
-      |> Enum.all?(fn {pos, negs} ->
-        case non_empty_map_literals_intersection(pos, seen) do
-          :empty ->
-            true
+        bdd_to_dnf(bdd)
+        |> Enum.all?(fn {pos, negs} ->
+          case non_empty_map_literals_intersection(pos, seen) do
+            :empty ->
+              true
 
-          {tag, fields} ->
-            # We check the emptiness of the fields because non_empty_map_literal_intersection
-            # will not return :empty on fields that are set to none() and that exist
-            # just in one map, but not the other.
-            init_map_line_empty?(tag, fields, negs, seen)
-        end
+            {tag, fields} ->
+              # We check the emptiness of the fields because non_empty_map_literal_intersection
+              # will not return :empty on fields that are set to none() and that exist
+              # just in one map, but not the other.
+              init_map_line_empty?(tag, fields, negs, seen)
+          end
+        end)
       end)
     end
   end
@@ -5807,15 +6363,17 @@ defmodule Module.Types.Descr do
     if :erlang.is_map_key(key, seen) do
       true
     else
-      seen = Map.put(seen, key, true)
+      memo_empty(key, fn ->
+        seen = Map.put(seen, key, true)
 
-      bdd_to_dnf(bdd)
-      |> Enum.all?(fn {pos, negs} ->
-        case non_empty_tuple_literals_intersection(pos, seen) do
-          :empty -> true
-          {_tag, _fields} when negs == [] -> false
-          {tag, fields} -> tuple_line_empty?(tag, fields, negs, seen)
-        end
+        bdd_to_dnf(bdd)
+        |> Enum.all?(fn {pos, negs} ->
+          case non_empty_tuple_literals_intersection(pos, seen) do
+            :empty -> true
+            {_tag, _fields} when negs == [] -> false
+            {tag, fields} -> tuple_line_empty?(tag, fields, negs, seen)
+          end
+        end)
       end)
     end
   end
@@ -5853,8 +6411,8 @@ defmodule Module.Types.Descr do
 
     # In this case, there is no intersection between the positive and this negative.
     # So we should just "go next"
-    diff = bare_difference(ty, neg_type)
-    meet = bare_intersection(ty, neg_type)
+    diff = seen_difference(ty, neg_type)
+    meet = seen_intersection(ty, neg_type)
 
     (empty_seen?(diff, seen) or
        tuple_line_empty?(tag, Enum.reverse(acc_meet, [diff | elements]), negs, seen)) and
@@ -7334,6 +7892,10 @@ defmodule Module.Types.Descr do
   def opt_intersection(:term, other), do: remove_optional(other)
   def opt_intersection(other, :term), do: remove_optional(other)
 
+  def opt_intersection({_, _, _} = node, node), do: node
+
+  def opt_intersection({_, _, _} = left, {_, _, _} = right), do: lazy_intersection(left, right)
+
   def opt_intersection({_, _, _} = left, right),
     do: opt_intersection(to_descr(left), to_descr(right))
 
@@ -7356,6 +7918,19 @@ defmodule Module.Types.Descr do
       true ->
         opt_intersection_static(left, right)
     end
+  end
+
+  # Unfolding two recursive nodes and intersecting their components reaches the same two
+  # nodes again, forever. The intersection of two different nodes is instead a node of
+  # its own, named after the pair: unfolding it intersects the unfoldings of the two
+  # nodes, and below the constructors the same pair gives the same node, so that the
+  # recursion closes. Whether the intersection is empty is decided when it is used.
+  defp lazy_intersection(left, right) do
+    {left_id, _, _} = node_info(left)
+    {right_id, _, _} = node_info(right)
+    id = {:lazy_intersection, Enum.sort([left_id, right_id])}
+    generator = fn _recur -> opt_intersection(to_descr(left), to_descr(right)) end
+    make_node(id, %{lazy: {id, {:if_set, id}, generator}}, generator)
   end
 
   @compile {:inline, opt_intersection_static: 2}

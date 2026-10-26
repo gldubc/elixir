@@ -322,20 +322,23 @@ defmodule Module.Types.RecursiveTest do
     end
 
     test "recursive map domains" do
-      # X = %{atom() => X}
-      %{X: node} =
-        recursive(%{
-          X: fn recur -> open_map([{to_domain_keys(atom()), recur.(:X)}]) end
-        })
+      # X = %{atom() => X}. Recursive nodes are interned in the process that builds them,
+      # so the types are built within the computation.
+      assert_finishes(fn ->
+        %{X: node} =
+          recursive(%{
+            X: fn recur -> open_map([{to_domain_keys(atom()), recur.(:X)}]) end
+          })
 
-      tx = to_descr(node)
-      rebuilt = open_map([{to_domain_keys(atom()), tx}])
-      closed = closed_map([{to_domain_keys(atom()), tx}])
+        tx = to_descr(node)
+        rebuilt = open_map([{to_domain_keys(atom()), tx}])
+        closed = closed_map([{to_domain_keys(atom()), tx}])
 
-      assert assert_finishes(fn -> subtype?(tx, rebuilt) end)
-      refute assert_finishes(fn -> empty?(opt_intersection(tx, rebuilt)) end)
-      refute assert_finishes(fn -> subtype?(tx, closed) end)
-      refute assert_finishes(fn -> disjoint?(tx, closed) end)
+        assert subtype?(tx, rebuilt)
+        refute empty?(opt_intersection(tx, rebuilt))
+        refute subtype?(tx, closed)
+        refute disjoint?(tx, closed)
+      end)
     end
 
     test "subtyping" do
@@ -417,6 +420,129 @@ defmodule Module.Types.RecursiveTest do
       tx = to_descr(nx)
       ty = to_descr(ny)
       assert subtype?(tx, ty)
+    end
+
+    test "subtyping through function codomains" do
+      # Each type is built twice, by two calls to recursive/1, and the copies compared
+
+      # W = (-> W)
+      w = fn -> recursive(%{W: fn recur -> fun([], recur.(:W)) end}) |> Map.fetch!(:W) end
+      assert assert_finishes(fn -> equal?(w.(), w.()) end)
+
+      # W = :bump | {:run, ((-> W) -> term())}
+      w = fn ->
+        recursive(%{
+          W: fn recur ->
+            job = fun([fun([], recur.(:W))], term())
+            atom([:bump]) |> bare_union(tuple([atom([:run]), job]))
+          end
+        })
+        |> Map.fetch!(:W)
+      end
+
+      assert assert_finishes(fn -> equal?(w.(), w.()) end)
+      refute assert_finishes(fn -> subtype?(w.(), atom([:bump])) end)
+    end
+
+    test "subtyping with type variables at the top level of a node" do
+      # K = {K} | a
+      a = var(:a)
+      b = var(:b)
+      k = recursive(%{K: fn recur -> tuple([recur.(:K)]) |> bare_union(a) end}) |> Map.fetch!(:K)
+
+      assert subtype?(a, k)
+      assert subtype?(tuple([k]), k)
+      refute subtype?(k, a)
+
+      # The node is a leaf of the diagram of b and K, whose unfolding has a at the top
+      assert subtype?(opt_intersection(b, k), k)
+      assert subtype?(opt_intersection(b, k), to_descr(k))
+      assert subtype?(opt_union(opt_intersection(b, k), opt_difference(tuple([k]), b)), k)
+    end
+
+    test "subtyping between copies of a type with type variables" do
+      # N = {N} | a, built twice
+      a = var(:a)
+
+      n = fn ->
+        recursive(%{N: fn recur -> tuple([recur.(:N)]) |> bare_union(a) end}) |> Map.fetch!(:N)
+      end
+
+      assert assert_finishes(fn -> subtype?(n.(), n.()) end)
+      assert assert_finishes(fn -> equal?(to_descr(n.()), to_descr(n.())) end)
+    end
+
+    # The intersection of two different nodes is a node of its own, named after the pair,
+    # instead of a descent through both nodes that never ends. The types are built in the
+    # process that uses them, since nodes are local to a process.
+    test "intersection of recursive tuple types" do
+      assert assert_finishes(fn ->
+               list = int_linked_list()
+               equal?(opt_intersection(list, list), list)
+             end)
+
+      assert assert_finishes(fn ->
+               list = int_linked_list()
+               equal?(opt_intersection(list, int_linked_list()), list)
+             end)
+
+      assert assert_finishes(fn ->
+               equal?(
+                 opt_intersection(int_linked_list(), number_linked_list()),
+                 int_linked_list()
+               )
+             end)
+
+      # Integers and floats share nothing but the empty list.
+      assert assert_finishes(fn ->
+               equal?(opt_intersection(int_linked_list(), linked_list(float())), atom([nil]))
+             end)
+
+      assert assert_finishes(fn ->
+               tree = binary_tree(integer())
+               equal?(opt_intersection(tree, binary_tree(integer())), tree)
+             end)
+    end
+
+    # factorize/1 merges the equivalent nodes of a type, as SSTT's factorize does.
+    test "factorize merges equivalent nodes" do
+      list = fn -> linked_list(integer()) end
+      components = fn t -> {tuple_fetch(t, 0) |> elem(1), tuple_fetch(t, 1) |> elem(1)} end
+
+      # Two copies of the same recursive type are two nodes...
+      two = tuple([list.(), list.()])
+      {first, second} = components.(two)
+      refute first === second
+
+      # ...which factorize replaces by one.
+      merged = factorize(two)
+      assert equal?(merged, two)
+      {first, second} = components.(merged)
+      assert first === second
+
+      # Different recursive types are not merged.
+      {first, second} = components.(factorize(tuple([list.(), linked_list(float())])))
+      refute first === second
+    end
+
+    test "factorize leaves a type without equivalent nodes as it is" do
+      list = int_linked_list()
+      assert factorize(list) == list
+      assert factorize(tuple([list])) == tuple([list])
+      assert factorize(integer()) == integer()
+      assert factorize(term()) == term()
+    end
+
+    test "factorize merges nodes below a node" do
+      outer =
+        recursive(%{
+          N: fn recur ->
+            bare_union(tuple([int_linked_list(), int_linked_list(), recur.(:N)]), atom([nil]))
+          end
+        })
+        |> Map.fetch!(:N)
+
+      assert equal?(factorize(outer), outer)
     end
 
     test "set operations accept nodes" do
@@ -558,6 +684,49 @@ defmodule Module.Types.RecursiveTest do
 
       assert {:ok, type} = fun_apply(fun([term()], integer()), [nx])
       assert equal?(type, integer())
+    end
+
+    test "printing" do
+      # X = {integer(), X} | nil
+      list =
+        recursive(%{X: fn recur -> tuple([integer(), recur.(:X)]) |> bare_union(atom([nil])) end})
+        |> Map.fetch!(:X)
+
+      assert to_quoted_string(list) == "rec(X, nil or {integer(), X})"
+
+      assert to_quoted_string(to_descr(list)) ==
+               "nil or {integer(), rec(X, nil or {integer(), X})}"
+
+      # X = {integer(), Y} | nil, Y = {boolean(), X} | nil
+      %{X: nx} =
+        recursive(%{
+          X: fn recur -> tuple([integer(), recur.(:Y)]) |> bare_union(atom([nil])) end,
+          Y: fn recur -> tuple([boolean(), recur.(:X)]) |> bare_union(atom([nil])) end
+        })
+
+      assert to_quoted_string(nx) == "rec(X, nil or {integer(), rec(Y, nil or {boolean(), X})})"
+
+      # Two systems that both name their equation X
+      nested =
+        recursive(%{
+          X: fn outer ->
+            recursive(%{
+              X: fn inner -> tuple([outer.(:X), inner.(:X)]) |> bare_union(atom([nil])) end
+            })
+            |> Map.fetch!(:X)
+          end
+        })
+        |> Map.fetch!(:X)
+
+      assert to_quoted_string(nested) == "rec(X, rec(X_2, nil or {X, X_2}))"
+
+      # Below a type variable, and in a solution of tallying
+      a = var(:a)
+      assert to_quoted_string(opt_intersection(a, list)) == "a and rec(X, nil or {integer(), X})"
+
+      x = var(:x)
+      assert [%{^x => solution}] = tally([{tuple([x]), x}])
+      assert to_quoted_string(solution) == "rec(solution, (not x and {solution}) or x)"
     end
   end
 end

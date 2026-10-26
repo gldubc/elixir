@@ -70,6 +70,108 @@ defmodule Module.Types.Descr.Tally do
     end
   end
 
+  # One solution instead of all (not in the branch). The solutions of the constraints
+  # are the union of those of the alternatives that normalization and propagation
+  # produce; tally_first/3 explores them depth first and stops at the first constraint
+  # set that solve/1 and valid_solution?/2 accept, without building the whole family.
+  # In theory it answers [] exactly when tally/2 does (normalization is sound and
+  # complete, and every saturated set has a solution); in practice both depend on
+  # solve/1 and valid_solution?/2, whose subtype?/2 has false negatives, on saturated
+  # sets that differ (no subsumption pruning here, another order), so they may
+  # disagree. The normal forms of the constraints are explored fewest alternatives
+  # first, so that those with a single alternative are capped before any choice.
+  def tally_first(constraints, fixed) when is_list(constraints) do
+    fixed = normalize_fixed(fixed)
+    constraints = validate_constraints!(constraints)
+
+    state = %{
+      fixed: fixed,
+      fixed_identities: MapSet.new(fixed, &variable_identity!/1),
+      memo: :ets.new(:descr_tally_memo, [:set, :private])
+    }
+
+    try do
+      alternatives =
+        Enum.map(constraints, fn {left, right} ->
+          normalize(Descr.difference(left, right), state)
+        end)
+
+      if css_empty() in alternatives do
+        []
+      else
+        case search(cs_any(), Enum.sort_by(alternatives, &length/1), constraints, state) do
+          {:ok, substitution} -> [substitution]
+          :error -> []
+        end
+      end
+    catch
+      :tally_unsatisfiable -> []
+    after
+      :ets.delete(state.memo)
+    end
+  end
+
+  defp search(cs, [], constraints, state) do
+    propagate_first(cs_any(), cs, MapSet.new(), state, fn saturated ->
+      with {:ok, substitution} <- solve(saturated),
+           true <- valid_solution?(substitution, constraints) do
+        {:ok, substitution}
+      else
+        _ -> :error
+      end
+    end)
+  end
+
+  defp search(cs, [alternatives | choices], constraints, state) do
+    first(alternatives, fn alternative ->
+      with {:ok, cs} <- try_cap(cs, alternative, state),
+           do: search(cs, choices, constraints, state)
+    end)
+  end
+
+  defp first(enumerable, fun) do
+    Enum.find_value(enumerable, :error, fn element ->
+      case fun.(element) do
+        {:ok, _} = found -> found
+        :error -> nil
+      end
+    end)
+  end
+
+  defp try_cap(left, right, state) do
+    {:ok, cs_cap(left, right, state)}
+  catch
+    :tally_unsatisfiable -> :error
+  end
+
+  defp try_add(constraint, constraints, state) do
+    {:ok, cs_add(constraint, constraints, state)}
+  catch
+    :tally_unsatisfiable -> :error
+  end
+
+  # propagate/4, depth first: k receives each saturated constraint set in turn, until it
+  # returns {:ok, _}.
+  defp propagate_first(previous, [], _seen, _state, k), do: k.(previous)
+
+  defp propagate_first(previous, [constraint | rest] = current, seen, state, k) do
+    {lower, _variable, upper} = constraint
+    induced = Descr.difference(lower, upper)
+
+    if MapSet.member?(seen, induced) do
+      with {:ok, previous} <- try_add(constraint, previous, state),
+           do: propagate_first(previous, rest, seen, state, k)
+    else
+      with {:ok, combined} <- try_cap(previous, current, state) do
+        seen = MapSet.put(seen, induced)
+
+        [combined]
+        |> css_cap(normalize(induced, state), state)
+        |> first(&propagate_first(cs_any(), &1, seen, state, k))
+      end
+    end
+  end
+
   defp normalize_fixed(%MapSet{} = fixed), do: validate_fixed!(fixed)
   defp normalize_fixed(fixed) when is_list(fixed), do: fixed |> MapSet.new() |> validate_fixed!()
 
@@ -1123,9 +1225,23 @@ defmodule Module.Types.Descr.Tally do
 
   ## Solve
 
+  # A saturated set gives one equation per variable, α = (lower ∨ α′) ∧ upper with α′
+  # fresh. They are solved at once, as one system of mutually recursive nodes, one per
+  # variable whose equation mentions a variable of the set: in the body of each node,
+  # every variable of the set is replaced by its node (or by its solution, when its
+  # equation mentions none) and every α′ by α, in one structural substitution. Solving
+  # the equations one after the other, substituting each solution into the others and
+  # back (solve_sequentially/1), gives equivalent types made of nested systems, on which
+  # emptiness, simplification and printing blow up. The nodes are well defined when no
+  # variable reaches itself through top-level occurrences: in a normalized set, the
+  # bounds of α only have larger variables at the top level, provided no recursive node
+  # whose unfolding has variables at the top level is itself at the top level of a
+  # constraint (normalize_summand/2 does not unfold such a node, and the sequential
+  # solve fails on it too). When top_vars/1 sees a cycle, the equations are solved one
+  # after the other, as before.
   defp solve(constraint_set) do
-    {equations, renaming} =
-      Enum.map_reduce(constraint_set, %{}, fn {lower, variable, upper}, renaming ->
+    equations =
+      Enum.map(constraint_set, fn {lower, variable, upper} ->
         original = Descr.__tally_variable__(variable)
         fresh = Descr.var(variable_name(variable))
 
@@ -1134,13 +1250,83 @@ defmodule Module.Types.Descr.Tally do
           |> Descr.union(fresh)
           |> Descr.intersection(upper)
 
-        {{original, equation}, Map.put(renaming, fresh, original)}
+        {original, fresh, equation}
       end)
 
-    with {:ok, substitution} <- solve_equations(equations) do
+    domain = MapSet.new(equations, &elem(&1, 0))
+
+    top =
+      Map.new(equations, fn {original, _fresh, equation} ->
+        {original, MapSet.intersection(Descr.top_vars(equation), domain)}
+      end)
+
+    if top_level_cycle?(top),
+      do: solve_sequentially(equations),
+      else: {:ok, solve_system(equations, domain)}
+  end
+
+  defp top_level_cycle?(top) do
+    case Enum.find(top, fn {_variable, above} -> not Enum.any?(above, &is_map_key(top, &1)) end) do
+      nil -> map_size(top) > 0
+      {variable, _above} -> top_level_cycle?(Map.delete(top, variable))
+    end
+  end
+
+  defp solve_system(equations, domain) do
+    renaming = Map.new(equations, fn {original, fresh, _equation} -> {fresh, original} end)
+
+    {closed, open} =
+      Enum.split_with(equations, fn {_original, _fresh, equation} ->
+        MapSet.disjoint?(Descr.syntactic_vars(equation), domain)
+      end)
+
+    closed =
+      Map.new(closed, fn {original, _fresh, equation} ->
+        {original, Descr.__tally_substitute__(equation, renaming)}
+      end)
+
+    names =
+      open
+      |> Enum.with_index(1)
+      |> Map.new(fn
+        {{original, _fresh, _equation}, 1} -> {original, :solution}
+        {{original, _fresh, _equation}, k} -> {original, String.to_atom("solution_#{k}")}
+      end)
+
+    nodes =
+      Descr.recursive(
+        Map.new(open, fn {original, _fresh, equation} ->
+          generator = fn recur ->
+            substitutions =
+              names
+              |> Map.new(fn {variable, name} -> {variable, recur.(name)} end)
+              |> Map.merge(closed)
+              |> Map.merge(renaming)
+
+            Descr.__tally_substitute__(equation, substitutions)
+          end
+
+          {Map.fetch!(names, original), generator}
+        end)
+      )
+
+    names
+    |> Map.new(fn {variable, name} -> {variable, Map.fetch!(nodes, name)} end)
+    |> Map.merge(closed)
+    |> Enum.reject(&identity_substitution?/1)
+    |> Map.new()
+  end
+
+  defp solve_sequentially(equations) do
+    renaming = Map.new(equations, fn {original, fresh, _equation} -> {fresh, original} end)
+
+    with {:ok, substitution} <-
+           equations
+           |> Enum.map(fn {original, _fresh, equation} -> {original, equation} end)
+           |> solve_equations() do
       substitution =
         Map.new(substitution, fn {variable, type} ->
-          {variable, Descr.substitute(type, renaming)}
+          {variable, Descr.__tally_substitute__(type, renaming)}
         end)
         |> Enum.reject(&identity_substitution?/1)
         |> Map.new()
@@ -1165,7 +1351,7 @@ defmodule Module.Types.Descr.Tally do
 
   defp solve_recursive_equation(variable, equation) do
     cond do
-      not MapSet.member?(Descr.vars(equation), variable) ->
+      not MapSet.member?(Descr.syntactic_vars(equation), variable) ->
         {:ok, equation}
 
       MapSet.member?(Descr.top_vars(equation), variable) ->
