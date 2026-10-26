@@ -383,6 +383,178 @@ defmodule Module.Types.Descr do
   end
 
   @doc """
+  Merges the equivalent recursive nodes of a type, as `factorize` does in SSTT (Laurent
+  and Nguyen, "Implementing Set-Theoretic Types"): every node reachable from the type
+  is replaced by the first node equivalent to it in depth-first order, and these
+  representatives are rebuilt as one system of equations. The result is equivalent to
+  the type, and printing it shows each recursive type once. The type is returned
+  unchanged when no two nodes are equivalent, and when merging would put a node at the
+  top level of its own definition.
+  """
+  def factorize(descr) do
+    nodes = descr |> reachable_nodes([], MapSet.new()) |> elem(0) |> Enum.reverse()
+
+    {representatives, class} =
+      Enum.reduce(nodes, {[], %{}}, fn node, {representatives, class} ->
+        case Enum.find(representatives, &equal?(&1, node)) do
+          nil -> {[node | representatives], Map.put(class, node, node)}
+          representative -> {representatives, Map.put(class, node, representative)}
+        end
+      end)
+
+    representatives = Enum.reverse(representatives)
+
+    above =
+      Map.new(representatives, fn representative ->
+        tops = representative |> to_descr() |> top_nodes() |> Enum.map(&Map.get(class, &1))
+        {representative, tops}
+      end)
+
+    if length(representatives) == length(nodes) or
+         Enum.any?(nodes, &match?({:if_set, _}, node_position(&1))) or
+         top_level_cycle?(above) do
+      descr
+    else
+      names = factorized_names(representatives)
+
+      new_nodes =
+        recursive(
+          Map.new(representatives, fn representative ->
+            generator = fn recur ->
+              map_nodes(to_descr(representative), fn node ->
+                case Map.fetch(class, node) do
+                  {:ok, representative} -> recur.(Map.fetch!(names, representative))
+                  :error -> node
+                end
+              end)
+            end
+
+            {Map.fetch!(names, representative), generator}
+          end)
+        )
+
+      map_nodes(descr, fn node ->
+        case Map.fetch(class, node) do
+          {:ok, representative} -> Map.fetch!(new_nodes, Map.fetch!(names, representative))
+          :error -> node
+        end
+      end)
+    end
+  end
+
+  @doc """
+  Replaces every recursive node that occurs in a type (at the top level or below
+  constructors, but not inside the definitions of the nodes) by `fun.(node)`.
+  """
+  def map_nodes(descr, fun) do
+    do_substitute(descr, %{}, {{:map_nodes, make_ref()}, &{:ok, fun.(&1)}}, false)
+  end
+
+  # The nodes reachable from a type, in depth-first order (reversed).
+  defp reachable_nodes(:term, acc, seen), do: {acc, seen}
+
+  defp reachable_nodes({_, :node, :node} = node, acc, seen) do
+    if MapSet.member?(seen, node),
+      do: {acc, seen},
+      else: reachable_nodes(to_descr(node), [node | acc], MapSet.put(seen, node))
+  end
+
+  defp reachable_nodes({:type_variables, bdd}, acc, seen),
+    do: Poly.reduce_leaves(bdd, {acc, seen}, fn leaf, {acc, seen} -> reachable_nodes(leaf, acc, seen) end)
+
+  defp reachable_nodes(%{} = descr, acc, seen) do
+    Enum.reduce(descr, {acc, seen}, fn
+      {:dynamic, descr}, {acc, seen} -> reachable_nodes(descr, acc, seen)
+      {key, bdd}, {acc, seen} -> reachable_component_nodes(key, bdd, acc, seen)
+    end)
+  end
+
+  defp reachable_component_nodes(:list, bdd, acc, seen) do
+    bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(head, tail), {acc, seen} ->
+      {acc, seen} = reachable_nodes(head, acc, seen)
+      reachable_nodes(tail, acc, seen)
+    end)
+  end
+
+  defp reachable_component_nodes(:tuple, bdd, acc, seen) do
+    bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(_tag, elements), {acc, seen} ->
+      Enum.reduce(elements, {acc, seen}, fn e, {acc, seen} -> reachable_nodes(e, acc, seen) end)
+    end)
+  end
+
+  defp reachable_component_nodes(:map, bdd, acc, seen) do
+    bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(tag, fields), {acc, seen} ->
+      {acc, seen} = reachable_field_nodes(tag, acc, seen)
+      reachable_field_nodes(fields, acc, seen)
+    end)
+  end
+
+  defp reachable_component_nodes(:fun, {_kind, bdds}, acc, seen) do
+    Enum.reduce(bdds, {acc, seen}, fn {_arity, bdd}, {acc, seen} ->
+      bdd_reduce(bdd, {acc, seen}, fn bdd_leaf(arguments, return), {acc, seen} ->
+        Enum.reduce(arguments ++ [return], {acc, seen}, fn e, {acc, seen} ->
+          reachable_nodes(e, acc, seen)
+        end)
+      end)
+    end)
+  end
+
+  defp reachable_component_nodes(_key, _value, acc, seen), do: {acc, seen}
+
+  defp reachable_field_nodes(fields, acc, seen) when is_list(fields) do
+    Enum.reduce(fields, {acc, seen}, fn {_key, descr}, {acc, seen} ->
+      reachable_nodes(descr, acc, seen)
+    end)
+  end
+
+  defp reachable_field_nodes(_tag, acc, seen), do: {acc, seen}
+
+  # The nodes that occur at the top level of a type, where connectives unfold them.
+  defp top_nodes({_, :node, :node} = node), do: [node]
+
+  defp top_nodes({:type_variables, bdd}),
+    do: Poly.reduce_leaves(bdd, [], fn leaf, acc -> top_nodes(leaf) ++ acc end)
+
+  defp top_nodes(_descr), do: []
+
+  defp top_level_cycle?(above) do
+    case Enum.find(above, fn {_node, tops} -> not Enum.any?(tops, &is_map_key(above, &1)) end) do
+      nil -> map_size(above) > 0
+      {node, _tops} -> top_level_cycle?(Map.delete(above, node))
+    end
+  end
+
+  defp node_position(node) do
+    {id, state, _generator} = node_info(node)
+    recursive_state_position(id, state)
+  end
+
+  # The names of the equations, for printing: those of the representatives, made
+  # distinct by a suffix.
+  defp factorized_names(representatives) do
+    {names, _used} =
+      Enum.map_reduce(representatives, MapSet.new(), fn representative, used ->
+        base =
+          case node_position(representative) do
+            {:node, name} when is_atom(name) -> Atom.to_string(name)
+            _ -> "rec"
+          end
+
+        name =
+          Stream.iterate(1, &(&1 + 1))
+          |> Stream.map(fn
+            1 -> String.to_atom(base)
+            n -> String.to_atom("#{base}_#{n}")
+          end)
+          |> Enum.find(&(not MapSet.member?(used, &1)))
+
+        {{representative, name}, MapSet.put(used, name)}
+      end)
+
+    Map.new(names)
+  end
+
+  @doc """
   Solves a finite set of subtype constraints by tallying.
 
   Each constraint is a `{left, right}` pair denoting `left <= right`. The

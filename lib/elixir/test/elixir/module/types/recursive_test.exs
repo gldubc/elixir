@@ -501,6 +501,47 @@ defmodule Module.Types.RecursiveTest do
              end)
     end
 
+    # factorize/1 merges the equivalent nodes of a type, as SSTT's factorize does.
+    test "factorize merges equivalent nodes" do
+      list = fn -> linked_list(integer()) end
+      components = fn t -> {tuple_fetch(t, 0) |> elem(1), tuple_fetch(t, 1) |> elem(1)} end
+
+      # Two copies of the same recursive type are two nodes...
+      two = tuple([list.(), list.()])
+      {first, second} = components.(two)
+      refute first === second
+
+      # ...which factorize replaces by one.
+      merged = factorize(two)
+      assert equal?(merged, two)
+      {first, second} = components.(merged)
+      assert first === second
+
+      # Different recursive types are not merged.
+      {first, second} = components.(factorize(tuple([list.(), linked_list(float())])))
+      refute first === second
+    end
+
+    test "factorize leaves a type without equivalent nodes as it is" do
+      list = int_linked_list()
+      assert factorize(list) == list
+      assert factorize(tuple([list])) == tuple([list])
+      assert factorize(integer()) == integer()
+      assert factorize(term()) == term()
+    end
+
+    test "factorize merges nodes below a node" do
+      outer =
+        recursive(%{
+          N: fn recur ->
+            bare_union(tuple([int_linked_list(), int_linked_list(), recur.(:N)]), atom([nil]))
+          end
+        })
+        |> Map.fetch!(:N)
+
+      assert equal?(factorize(outer), outer)
+    end
+
     test "set operations accept nodes" do
       n = recursive_node(integer())
       assert equal?(bare_union(n, float()), bare_union(integer(), float()))
