@@ -70,6 +70,108 @@ defmodule Module.Types.Descr.Tally do
     end
   end
 
+  # One solution instead of all (not in the branch). The solutions of the constraints
+  # are the union of those of the alternatives that normalization and propagation
+  # produce; tally_first/3 explores them depth first and stops at the first constraint
+  # set that solve/1 and valid_solution?/2 accept, without building the whole family.
+  # In theory it answers [] exactly when tally/2 does (normalization is sound and
+  # complete, and every saturated set has a solution); in practice both depend on
+  # solve/1 and valid_solution?/2, whose subtype?/2 has false negatives, on saturated
+  # sets that differ (no subsumption pruning here, another order), so they may
+  # disagree. The normal forms of the constraints are explored fewest alternatives
+  # first, so that those with a single alternative are capped before any choice.
+  def tally_first(constraints, fixed) when is_list(constraints) do
+    fixed = normalize_fixed(fixed)
+    constraints = validate_constraints!(constraints)
+
+    state = %{
+      fixed: fixed,
+      fixed_identities: MapSet.new(fixed, &variable_identity!/1),
+      memo: :ets.new(:descr_tally_memo, [:set, :private])
+    }
+
+    try do
+      alternatives =
+        Enum.map(constraints, fn {left, right} ->
+          normalize(Descr.difference(left, right), state)
+        end)
+
+      if css_empty() in alternatives do
+        []
+      else
+        case search(cs_any(), Enum.sort_by(alternatives, &length/1), constraints, state) do
+          {:ok, substitution} -> [substitution]
+          :error -> []
+        end
+      end
+    catch
+      :tally_unsatisfiable -> []
+    after
+      :ets.delete(state.memo)
+    end
+  end
+
+  defp search(cs, [], constraints, state) do
+    propagate_first(cs_any(), cs, MapSet.new(), state, fn saturated ->
+      with {:ok, substitution} <- solve(saturated),
+           true <- valid_solution?(substitution, constraints) do
+        {:ok, substitution}
+      else
+        _ -> :error
+      end
+    end)
+  end
+
+  defp search(cs, [alternatives | choices], constraints, state) do
+    first(alternatives, fn alternative ->
+      with {:ok, cs} <- try_cap(cs, alternative, state),
+           do: search(cs, choices, constraints, state)
+    end)
+  end
+
+  defp first(enumerable, fun) do
+    Enum.find_value(enumerable, :error, fn element ->
+      case fun.(element) do
+        {:ok, _} = found -> found
+        :error -> nil
+      end
+    end)
+  end
+
+  defp try_cap(left, right, state) do
+    {:ok, cs_cap(left, right, state)}
+  catch
+    :tally_unsatisfiable -> :error
+  end
+
+  defp try_add(constraint, constraints, state) do
+    {:ok, cs_add(constraint, constraints, state)}
+  catch
+    :tally_unsatisfiable -> :error
+  end
+
+  # propagate/4, depth first: k receives each saturated constraint set in turn, until it
+  # returns {:ok, _}.
+  defp propagate_first(previous, [], _seen, _state, k), do: k.(previous)
+
+  defp propagate_first(previous, [constraint | rest] = current, seen, state, k) do
+    {lower, _variable, upper} = constraint
+    induced = Descr.difference(lower, upper)
+
+    if MapSet.member?(seen, induced) do
+      with {:ok, previous} <- try_add(constraint, previous, state),
+           do: propagate_first(previous, rest, seen, state, k)
+    else
+      with {:ok, combined} <- try_cap(previous, current, state) do
+        seen = MapSet.put(seen, induced)
+
+        [combined]
+        |> css_cap(normalize(induced, state), state)
+        |> first(&propagate_first(cs_any(), &1, seen, state, k))
+      end
+    end
+  end
+
   defp normalize_fixed(%MapSet{} = fixed), do: validate_fixed!(fixed)
   defp normalize_fixed(fixed) when is_list(fixed), do: fixed |> MapSet.new() |> validate_fixed!()
 

@@ -398,6 +398,15 @@ defmodule Module.Types.Descr do
     Module.Types.Descr.Tally.tally(constraints, fixed)
   end
 
+  @doc """
+  Like `tally/2`, but returns one solution only: `[substitution]`, or `[]`, in theory
+  exactly when `tally/2` does (the two may disagree where `subtype?/2` errs, see
+  `Module.Types.Descr.Tally.tally_first/2`).
+  """
+  def tally_first(constraints, fixed \\ MapSet.new()) when is_list(constraints) do
+    Module.Types.Descr.Tally.tally_first(constraints, fixed)
+  end
+
   @doc false
   def __tally_variable_identity__(variable), do: variable_identity(variable)
 

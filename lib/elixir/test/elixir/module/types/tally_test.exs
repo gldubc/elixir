@@ -159,6 +159,56 @@ defmodule Module.Types.TallyTest do
     end
   end
 
+  describe "one solution" do
+    test "answers [] exactly when tally/2 does" do
+      x = var(:x)
+      y = var(:y)
+
+      satisfiable = [
+        [],
+        [{integer(), term()}],
+        [{x, integer()}],
+        [{tuple([x, y]), tuple([atom([:a]), integer()])}],
+        [{x, opt_union(atom([:a]), integer())}, {atom([:a]), x}]
+      ]
+
+      unsatisfiable = [
+        [{integer(), atom()}],
+        [{atom([:a]), x}, {x, atom([:b])}],
+        [{tuple([x, integer()]), tuple([atom([:a]), integer()])}, {atom([:b]), x}]
+      ]
+
+      for constraints <- satisfiable do
+        assert [_] = solutions = tally_first(constraints)
+        assert tally(constraints) != []
+        assert_sound(solutions, constraints)
+      end
+
+      for constraints <- unsatisfiable do
+        assert tally_first(constraints) == []
+        assert tally(constraints) == []
+      end
+    end
+
+    test "returns one solution where tally/2 returns several" do
+      [x, y, u, v] = Enum.map([:x, :y, :u, :v], &var/1)
+      # {term, term} <= {x, y} or {u, v}: the choice of the summand gives several solutions
+      constraints = [{tuple([term(), term()]), opt_union(tuple([x, y]), tuple([u, v]))}]
+      assert length(tally(constraints)) > 1
+      assert [_] = solutions = tally_first(constraints)
+      assert_sound(solutions, constraints)
+    end
+
+    @tag timeout: 2_000
+    test "solves recursive constraints" do
+      x = var(:x)
+      constraints = [{x, tuple([x])}]
+      assert [%{^x => solution}] = solutions = tally_first(constraints)
+      assert match?({_, _, _}, solution)
+      assert_sound(solutions, constraints)
+    end
+  end
+
   # Each computation is stopped after one second, or when its heap goes beyond 50M
   # words. Recursive nodes are interned in the process that builds them, so each test
   # builds its types, solves and checks within that computation.
