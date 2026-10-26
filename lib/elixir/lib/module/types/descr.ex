@@ -460,7 +460,10 @@ defmodule Module.Types.Descr do
   end
 
   defp reachable_nodes({:type_variables, bdd}, acc, seen),
-    do: Poly.reduce_leaves(bdd, {acc, seen}, fn leaf, {acc, seen} -> reachable_nodes(leaf, acc, seen) end)
+    do:
+      Poly.reduce_leaves(bdd, {acc, seen}, fn leaf, {acc, seen} ->
+        reachable_nodes(leaf, acc, seen)
+      end)
 
   defp reachable_nodes(%{} = descr, acc, seen) do
     Enum.reduce(descr, {acc, seen}, fn
@@ -669,7 +672,13 @@ defmodule Module.Types.Descr do
     # every unfolding of a recursive solution of tallying does, gives the same nodes, so
     # that the assumptions of emptiness checks (seen) recognize them.
     copy_ref = {:substitution, substitutions}
-    do_substitute(descr, substitutions, {{:top, copy_ref}, fn _node -> {:error, copy_ref} end}, simplify?)
+
+    do_substitute(
+      descr,
+      substitutions,
+      {{:top, copy_ref}, fn _node -> {:error, copy_ref} end},
+      simplify?
+    )
   end
 
   defp variable_from_identity(identity) do
@@ -4295,6 +4304,7 @@ defmodule Module.Types.Descr do
   # so constructing the descriptor does not unfold the same map domain forever.
   defp map_domain_if_set({_, :node, :node} = node) do
     {id, state, _generator} = node_info(node)
+
     case if_set_node_id(id, state) do
       :already_if_set -> node
       if_set_id -> make_node(if_set_id, state, fn _recur -> node |> unfold() |> if_set() end)

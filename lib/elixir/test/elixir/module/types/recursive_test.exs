@@ -487,7 +487,10 @@ defmodule Module.Types.RecursiveTest do
              end)
 
       assert assert_finishes(fn ->
-               equal?(opt_intersection(int_linked_list(), number_linked_list()), int_linked_list())
+               equal?(
+                 opt_intersection(int_linked_list(), number_linked_list()),
+                 int_linked_list()
+               )
              end)
 
       # Integers and floats share nothing but the empty list.
