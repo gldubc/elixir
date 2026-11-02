@@ -340,18 +340,18 @@ defmodule Module.Types.PatternTest do
                dynamic(non_empty_list(integer(), atom([:foo])))
 
       assert typecheck!([x = [1, 2, 3 | y], y = [1.0, 2.0, 3.0]], x) ==
-               dynamic(non_empty_list(opt_union(integer(), float())))
+               dynamic(non_empty_list(integer(), non_empty_list(float())))
 
-      assert typecheck!([x = [:ok | z]], {x, z}) ==
-               dynamic(tuple([non_empty_list(term(), term()), term()]))
+      assert typecheck!([x = [:ok | z]], {x, z})
+             |> equal?(dynamic(tuple([non_empty_list(atom([:ok]), term()), term()])))
 
       assert typecheck!([x = [a = :a, b = :b, c = :c]], {x, a, b, c}) ==
                dynamic(
                  tuple([non_empty_list(atom([:a, :b, :c])), atom([:a]), atom([:b]), atom([:c])])
                )
 
-      assert typecheck!([x = [y | z]], {x, y, z}) ==
-               dynamic(tuple([non_empty_list(term(), term()), term(), term()]))
+      assert typecheck!([x = [y | z]], {x, y, z})
+             |> equal?(dynamic(tuple([non_empty_list(term(), term()), term(), term()])))
     end
 
     test "in patterns with nested tails" do
@@ -386,7 +386,7 @@ defmodule Module.Types.PatternTest do
                dynamic(non_empty_list(integer(), atom([:foo])))
 
       assert typecheck!([x = [1, 2, 3] ++ y, y = [1.0, 2.0, 3.0]], x) ==
-               dynamic(non_empty_list(opt_union(integer(), float())))
+               dynamic(non_empty_list(integer(), non_empty_list(float())))
     end
 
     test "with lists inside tuples inside lists" do

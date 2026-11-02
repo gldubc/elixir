@@ -8,6 +8,7 @@ defmodule Module.Types.ExprTest do
 
   import TypeHelper
   import Module.Types.Descr
+
   defmacro domain_key(arg) when is_atom(arg), do: [arg]
 
   defmacro generated_foo_call(x) do
@@ -56,15 +57,43 @@ defmodule Module.Types.ExprTest do
     test "creating lists" do
       assert typecheck!([1, 2]) == non_empty_list(integer())
       assert typecheck!([1, 2 | 3]) == non_empty_list(integer(), integer())
-      assert typecheck!([1, 2 | [3, 4]]) == non_empty_list(integer())
-
+      assert typecheck!([1, 2 | [3, 4]]) == non_empty_list(integer(), non_empty_list(integer()))
       assert typecheck!([:ok, 123]) == non_empty_list(opt_union(atom([:ok]), integer()))
+
       assert typecheck!([:ok | 123]) == non_empty_list(atom([:ok]), integer())
 
       assert typecheck!([x], [:ok, x])
              |> equal?(opt_union(non_empty_list(atom([:ok])), dynamic(non_empty_list(term()))))
 
-      assert typecheck!([x], [:ok | x]) == dynamic(non_empty_list(term(), term()))
+      assert typecheck!([x], [:ok | x]) == non_empty_list(atom([:ok]), dynamic())
+    end
+
+    test "threads homogeneous expectations through lists" do
+      assert typecheck!(
+               [x, y],
+               [123, "foo"] = [String.to_integer(x), Atom.to_string(y)]
+             ) == non_empty_list(opt_union(integer(), binary()))
+
+      assert typecheck!(
+               [x, y],
+               case [x, y] do
+                 [:ok, 123] -> {x, y}
+               end
+             ) ==
+               dynamic(
+                 tuple([
+                   opt_union(atom([:ok]), integer()),
+                   opt_union(atom([:ok]), integer())
+                 ])
+               )
+
+      assert typecheck!(
+               [tail],
+               case [:ok, :skip | tail] do
+                 [:ok, :skip | 123] -> tail
+               end
+             ) ==
+               dynamic(opt_union(integer(), non_empty_list(atom([:ok, :skip]), integer())))
     end
 
     test "inference" do
