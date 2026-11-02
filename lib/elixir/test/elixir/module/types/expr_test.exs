@@ -8,6 +8,10 @@ defmodule Module.Types.ExprTest do
 
   import TypeHelper
   import Module.Types.Descr
+
+  defp exact_list(elements, tail \\ empty_list()),
+    do: Enum.reduce(Enum.reverse(elements), tail, &list_cons/2)
+
   defmacro domain_key(arg) when is_atom(arg), do: [arg]
 
   defmacro generated_foo_call(x) do
@@ -54,17 +58,35 @@ defmodule Module.Types.ExprTest do
 
   describe "lists" do
     test "creating lists" do
-      assert typecheck!([1, 2]) == non_empty_list(integer())
-      assert typecheck!([1, 2 | 3]) == non_empty_list(integer(), integer())
-      assert typecheck!([1, 2 | [3, 4]]) == non_empty_list(integer())
+      assert typecheck!([1, 2]) == exact_list(List.duplicate(integer(), 2))
+      assert typecheck!([1, 2 | 3]) == exact_list(List.duplicate(integer(), 2), integer())
+      assert typecheck!([1, 2 | [3, 4]]) == exact_list(List.duplicate(integer(), 4))
+      assert typecheck!([:ok, 123]) == exact_list([atom([:ok]), integer()])
 
-      assert typecheck!([:ok, 123]) == non_empty_list(opt_union(atom([:ok]), integer()))
-      assert typecheck!([:ok | 123]) == non_empty_list(atom([:ok]), integer())
+      assert typecheck!([:ok | 123]) == list_cons(atom([:ok]), integer())
+      assert typecheck!([x], [:ok, x]) == exact_list([atom([:ok]), dynamic()])
+      assert typecheck!([x], [:ok | x]) == list_cons(atom([:ok]), dynamic())
+    end
 
-      assert typecheck!([x], [:ok, x])
-             |> equal?(opt_union(non_empty_list(atom([:ok])), dynamic(non_empty_list(term()))))
+    test "threads positional expectations through list cells" do
+      assert typecheck!(
+               [x, y],
+               [123, "foo"] = [String.to_integer(x), Atom.to_string(y)]
+             ) == exact_list([integer(), binary()])
 
-      assert typecheck!([x], [:ok | x]) == dynamic(non_empty_list(term(), term()))
+      assert typecheck!(
+               [x, y],
+               case [x, y] do
+                 [:ok, 123] -> {x, y}
+               end
+             ) == dynamic(tuple([atom([:ok]), integer()]))
+
+      assert typecheck!(
+               [tail],
+               case [:ok, :skip | tail] do
+                 [:ok, :skip | 123] -> tail
+               end
+             ) == dynamic(integer())
     end
 
     test "inference" do
@@ -78,7 +100,7 @@ defmodule Module.Types.ExprTest do
     end
 
     test "hd" do
-      assert typecheck!([x = [123, :foo]], hd(x)) == dynamic(opt_union(atom([:foo]), integer()))
+      assert typecheck!([x = [123, :foo]], hd(x)) == dynamic(integer())
       assert typecheck!([x = [123 | :foo]], hd(x)) == dynamic(integer())
 
       assert typeerror!(hd([])) |> strip_ansi() ==
@@ -114,10 +136,10 @@ defmodule Module.Types.ExprTest do
 
     test "tl" do
       assert typecheck!([x = [123, :foo]], tl(x)) ==
-               dynamic(list(opt_union(atom([:foo]), integer())))
+               dynamic(list_cons(atom([:foo]), empty_list()))
 
       assert typecheck!([x = [123 | :foo]], tl(x)) ==
-               dynamic(opt_union(atom([:foo]), non_empty_list(integer(), atom([:foo]))))
+               dynamic(atom([:foo]))
 
       assert typeerror!(tl([])) |> strip_ansi() ==
                ~l"""

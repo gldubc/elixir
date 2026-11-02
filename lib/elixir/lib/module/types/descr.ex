@@ -48,7 +48,8 @@ defmodule Module.Types.Descr do
   @fun_top {:negation, %{}}
   @atom_top {:negation, :sets.new(version: 2)}
   @map_top {:erlang.phash2([:open | @fields_new]), :open, @fields_new}
-  @non_empty_list_top {:erlang.phash2([:term | :term]), :term, :term}
+  @non_empty_list_top {(2 <<< 27) + :erlang.phash2([:term, :term]) - (1 <<< 60), :closed,
+                       [:term, :term]}
   @tuple_top {:erlang.phash2([:open | []]), :open, []}
   @map_empty {:erlang.phash2(@fields_new) - (1 <<< 60), :closed, @fields_new}
 
@@ -72,7 +73,6 @@ defmodule Module.Types.Descr do
   }
   @list_top %{bitmap: @bit_empty_list, list: @non_empty_list_top}
   @empty_list %{bitmap: @bit_empty_list}
-  @not_non_empty_list Map.delete(@term, :list)
 
   @not_atom Map.delete(@term, :atom)
 
@@ -107,6 +107,9 @@ defmodule Module.Types.Descr do
   def float(), do: %{bitmap: @bit_float}
   def list(type), do: list_descr(type, @empty_list, true)
   def non_empty_list(type, tail \\ @empty_list), do: list_descr(type, tail, false)
+
+  @doc false
+  def list_cons(head, tail), do: list_pair_descr(head, tail, &list_cons_static/2)
   def open_map(), do: %{map: @map_top}
   def open_map(pairs), do: map_descr(:open, pairs)
   def open_tuple(elements, _fallback \\ term()), do: tuple_descr(:open, elements)
@@ -122,6 +125,14 @@ defmodule Module.Types.Descr do
   ## Nodes
 
   defp make_node(id, state, generator), do: {id, state, generator}
+
+  defp expand_node({{:list_closure, head, base}, :list_closure, nil} = node) do
+    bare_union(base, list_cons_static(head, node))
+  end
+
+  defp expand_node({_id, _state, {__MODULE__, :list_equation, [head, base]}}) do
+    expand_node(list_closure_node(head, base))
+  end
 
   defp expand_node({_id, state, generator}) do
     recur = fn name ->
@@ -556,7 +567,8 @@ defmodule Module.Types.Descr do
 
   Only types made of unions are converted, as widening a number
   under a negation or an intersection would shrink the type.
-  In such cases, as well as for recursive types, we return `term()`.
+  In such cases, as well as for arbitrary recursive types, we return `term()`.
+  Canonical homogeneous list closures are converted structurally.
   """
   def numberize_unions_or_term(:term), do: :term
 
@@ -567,6 +579,15 @@ defmodule Module.Types.Descr do
   end
 
   defp numberize(:term), do: :term
+
+  defp numberize({{:list_closure, head, base}, :list_closure, nil}) do
+    list_closure_node(numberize(head), numberize(base))
+  end
+
+  defp numberize({_id, _state, {__MODULE__, :list_equation, [head, base]}}) do
+    list_closure_node(numberize(head), numberize(base))
+  end
+
   defp numberize({_, _, _}), do: throw(:term)
   defp numberize(descr), do: numberize_each(descr, [:bitmap, :tuple, :map, :list, :dynamic])
 
@@ -602,8 +623,8 @@ defmodule Module.Types.Descr do
   end
 
   defp numberize(:list, bdd) do
-    numberize_bdd(bdd, fn bdd_leaf(head, tail) ->
-      bdd_leaf_new(numberize(head), numberize(tail))
+    numberize_bdd(bdd, fn bdd_leaf(:closed, [head, tail]) ->
+      list_new(numberize(head), numberize(tail))
     end)
   end
 
@@ -696,6 +717,9 @@ defmodule Module.Types.Descr do
 
     recur.(descr, opts)
   end
+
+  defp non_recursive_to_quoted({{:list_closure, head, base}, :list_closure, nil}, opts),
+    do: list_closure_to_quoted(head, base, &non_recursive_to_quoted/2, opts)
 
   defp non_recursive_to_quoted(descr, opts) do
     if term_type?(descr) do
@@ -818,8 +842,8 @@ defmodule Module.Types.Descr do
     {:%{}, [], fields}
   end
 
-  defp recursive_literal_to_quoted(:list, bdd_leaf(list_type, last_type), recur, opts),
-    do: {:non_empty_list, [], list_args_to_quoted(list_type, last_type, recur, opts)}
+  defp recursive_literal_to_quoted(:list, literal, recur, opts),
+    do: list_literal_to_quoted(literal, recur, opts)
 
   defp recursive_literal_to_quoted(:fun, bdd_leaf(args, return), recur, opts),
     do: {:__block__, [], [[{:->, [], [Enum.map(args, &recur.(&1, opts)), recur.(return, opts)]}]]}
@@ -2384,129 +2408,61 @@ defmodule Module.Types.Descr do
 
   ## List
 
-  # Represents list and improper list simultaneously as a BDD with nodes of the form
-  # `{list_type, last_type}`, where `list_type` is the type of elements in the list,
-  # and `last_type` is the type of the last element (so `[]` if the list is proper,
-  # and anything else but a list if the list is improper).
+  # A non-empty list atom is the exact product Cons(head, tail). It shares the
+  # closed-pair algorithms with tuples, but remains disjoint under the :list key.
+  # Homogeneous lists use the structural equation L(A, T) = T or Cons(A, L(A, T)).
+  defp list_descr(head, base, empty?) do
+    fallback = if empty?, do: @empty_list, else: @none
 
-  # The last_type may be stored as `:term` for optimization purposes. This is ok
-  # because operations like `tl` effectively return the list itself plus the union of
-  # the tail (and if the tail includes the list itself, they are equivalent). And, for other
-  # operations like difference, we expand the tail_type back into
-  # `not non_empty_list()` via `list_tail_unfold/1`. Overall, this simplifies
-  # the code because we don't need to special case `not non_empty_list()`.
-  #
-  # none() types can be given and, while stored, it means the list type is empty.
-  defp list_descr(list_type, last_type, empty?) do
-    {dynamic_list_type, static_list_type, dynamic_list?} = split_dynamic(list_type)
-    {dynamic_last_type, static_last_type, dynamic_last?} = split_dynamic(last_type)
-    dynamic? = dynamic_list? or dynamic_last?
-    dynamic_descr = list_descr_static(dynamic_list_type, dynamic_last_type, empty?)
-    # Just a syntactic check, to avoid a recursive empty? call
-    static_empty? = static_list_type == @none or static_last_type == @none
+    list_pair_descr(head, base, fallback, fn head, base ->
+      closure = list_closure_node(head, base)
+      if empty?, do: unfold(closure), else: list_cons_static(head, closure)
+    end)
+  end
+
+  defp list_descr_bdd(head, base), do: list_descr(head, base, false).list
+
+  defp list_pair_descr(head, tail, fallback \\ @none, builder) do
+    {dynamic_head, static_head, head_dynamic?} = split_dynamic(head)
+    {dynamic_tail, static_tail, tail_dynamic?} = split_dynamic(tail)
+    dynamic_descr = builder.(dynamic_head, dynamic_tail)
 
     cond do
-      not dynamic? ->
+      not head_dynamic? and not tail_dynamic? ->
         dynamic_descr
 
-      static_empty? and empty? ->
-        %{bitmap: @bit_empty_list, dynamic: dynamic_descr}
-
-      static_empty? ->
-        %{dynamic: dynamic_descr}
+      static_head == @none or static_tail == @none ->
+        Map.put(fallback, :dynamic, dynamic_descr)
 
       true ->
-        list_descr_static(static_list_type, static_last_type, empty?)
+        builder.(static_head, static_tail)
         |> Map.put(:dynamic, dynamic_descr)
     end
   end
 
-  defp list_descr_static(list_type, last_type, empty?) do
-    list_part =
-      case last_type do
-        :term ->
-          @non_empty_list_top
+  defp list_closure_node(head, base),
+    do: make_node({:list_closure, head, base}, :list_closure, nil)
 
-        {_, _, _} ->
-          list_new(list_type, last_type)
+  defp list_cons_static(head, tail), do: %{list: list_new(head, tail)}
+  defp list_new(:term, :term), do: @non_empty_list_top
 
-        %{} ->
-          case :maps.take(:list, last_type) do
-            :error ->
-              list_new(list_type, last_type)
-
-            {bdd, last_type_no_list} ->
-              # `last_type` may itself represent one or more list types.
-              # Our goal is to fold those list types into `list_type` while retaining the
-              # possible type of the final element (which can be `[]` or any non-list value).
-              #
-              # The list types inside `last_type` are stored in a BDD that includes possible
-              # negations, so we must evaluate each node with its sign taken into account.
-              #
-              # A negation only matters when the negated list type is a supertype of the
-              # corresponding positive list type; in that case we subtract the negated
-              # variant from the positive one. This is done in list_bdd_to_pos_dnf/1.
-              {list_type, last_type} =
-                list_bdd_to_pos_dnf(bdd)
-                |> Enum.reduce({list_type, last_type_no_list}, fn
-                  {list, last, _negs}, {acc_list, acc_last} ->
-                    {bare_union(list, acc_list), bare_union(last, acc_last)}
-                end)
-
-              list_new(list_type, last_type)
-          end
-      end
-
-    if empty?, do: %{list: list_part, bitmap: @bit_empty_list}, else: %{list: list_part}
+  defp list_new(head, tail) do
+    hash = :erlang.phash2([list_component_hash(head), list_component_hash(tail)])
+    {(2 <<< 27) + hash - (1 <<< 60), :closed, [head, tail]}
   end
 
-  defp list_new(list_type, last_type), do: bdd_leaf_new(list_type, last_type)
+  defp list_component_hash(%{dynamic: descr}), do: list_component_hash(descr)
+  defp list_component_hash(%{list: bdd}), do: bdd_hash(bdd)
+  defp list_component_hash(%{map: bdd}), do: bdd_hash(bdd)
+  defp list_component_hash(%{tuple: bdd}), do: bdd_hash(bdd)
+  defp list_component_hash(%{fun: _fun}), do: :erlang.phash2(:fun)
+  defp list_component_hash({_id, _state, _generator}), do: :erlang.phash2(:type_node)
+  defp list_component_hash(descr), do: :erlang.phash2(descr)
 
-  defp non_empty_list_literals_intersection(list_literals, seen) do
-    {list, last} =
-      Enum.reduce(list_literals, {:term, :term}, fn
-        bdd_leaf(next_list, next_last), {list, last} ->
-          {bare_intersection(list, next_list), bare_intersection(last, next_last)}
-      end)
-
-    if empty_seen?(list, seen) or empty_seen?(last, seen), do: :empty, else: {list, last}
-  end
-
-  # Takes all the lines from the root to the leaves finishing with a 1,
-  # and compile into tuples of positive and negative nodes. Keep only the non-empty positives,
-  # and include the impact of negations on the last type.
-  # To see if a negation changes the last type or the list type, we just need to check
-  # if the negative list type is a supertype of the positive list type. In that case,
-  # we can remove the negative last type from the positive one.
-
-  # (If this subtracted type was empty, the whole type would be empty)
-  defp list_bdd_to_pos_dnf(bdd) do
-    bdd_to_dnf(bdd)
-    |> Enum.reduce([], fn {pos_list, negs}, acc ->
-      case non_empty_list_literals_intersection(pos_list, %{}) do
-        :empty ->
-          acc
-
-        {list, last} ->
-          Enum.reduce_while(negs, {last, []}, fn bdd_leaf(neg_type, neg_last) = neg,
-                                                 {acc_last, acc_negs} ->
-            if subtype?(list, neg_type) do
-              difference = bare_difference(acc_last, neg_last)
-              if empty?(difference), do: {:halt, nil}, else: {:cont, {difference, acc_negs}}
-            else
-              {:cont, {acc_last, [neg | acc_negs]}}
-            end
-          end)
-          |> case do
-            nil -> acc
-            {last, negs} -> [{list, last, Enum.reverse(negs)} | acc]
-          end
-      end
-    end)
-  end
-
-  defp list_tail_unfold(:term), do: @not_non_empty_list
-  defp list_tail_unfold(other), do: Map.delete(unfold(other), :list)
+  # Logical BDD top means the top of the current sort. Restrict it to closed
+  # pairs before reusing tuple-product algorithms.
+  defp list_product_bdd(bdd),
+    do: bdd_intersection(@non_empty_list_top, bdd)
 
   @doc """
   Returns the element type of a list, assuming the list is proper.
@@ -2523,150 +2479,97 @@ defmodule Module.Types.Descr do
   def list_of(:term), do: :badproperlist
 
   def list_of(descr) do
+    proper = list(term())
+
     case :maps.take(:dynamic, descr) do
       :error ->
-        with {empty_list?, value} <- list_of_static(descr) do
-          cond do
-            not empty?(value) -> {empty_list?, value}
-            empty_list? -> {true, nil}
-            true -> :badproperlist
-          end
-        end
+        list_of_static(descr, proper)
 
-      {dynamic, static} ->
-        with {empty_list?, static_value} <- list_of_static(static) do
-          empty_list? =
-            empty_list? or dynamic == :term or
-              match?(
-                %{bitmap: bitmap} when (bitmap &&& @bit_empty_list) != 0,
-                dynamic
-              )
+      {dynamic_type, static_type} ->
+        proper_dynamic = opt_intersection(dynamic_type, proper)
 
-          dynamic_value =
-            case dynamic do
-              :term ->
-                dynamic()
+        if (not empty?(static_type) and not subtype?(static_type, proper)) or
+             (empty?(static_type) and empty?(proper_dynamic)) do
+          :badproperlist
+        else
+          static_value = list_elements(static_type, %{})
+          dynamic_value = list_elements(proper_dynamic, %{})
 
-              %{list: bdd} ->
-                Enum.reduce(list_bdd_to_pos_dnf(bdd), none(), fn {list, last, _negs}, acc ->
-                  if empty_list_type?(last) do
-                    bare_union(acc, list)
-                  else
-                    acc
-                  end
-                end)
+          value =
+            if empty?(dynamic_value),
+              do: static_value,
+              else: opt_union(static_value, dynamic(dynamic_value))
 
-              %{} ->
-                none()
-            end
-
-          if empty?(dynamic_value) do
-            # list_bdd_to_pos_dnf guarantees the lists actually exists,
-            # so we can match on none() rather than empty.
-            case empty_list? do
-              false -> :badproperlist
-              true -> {empty_list?, nil}
-            end
-          else
-            {empty_list?, bare_union(static_value, dynamic(dynamic_value))}
-          end
+          list_of_result(
+            empty_list_type?(static_type) or empty_list_type?(proper_dynamic),
+            value
+          )
         end
     end
   end
 
-  defp list_of_static(descr) do
-    case descr do
-      %{bitmap: @bit_empty_list} ->
-        case empty?(Map.drop(descr, [:bitmap, :list])) do
-          true -> list_of_static(descr, true)
-          false -> :badproperlist
-        end
+  defp list_of_static(descr, proper) do
+    if empty?(descr) or not subtype?(descr, proper) do
+      :badproperlist
+    else
+      list_of_result(empty_list_type?(descr), list_elements(descr, %{}))
+    end
+  end
 
-      %{bitmap: _} ->
-        :badproperlist
+  defp list_of_result(true, value) when value == @none, do: {true, nil}
+  defp list_of_result(empty?, value), do: {empty?, value}
 
-      %{} ->
-        case empty?(Map.delete(descr, :list)) do
-          true -> list_of_static(descr, false)
-          false -> :badproperlist
+  defp list_elements(type, seen) do
+    type = unfold(type)
+
+    cond do
+      empty?(type) ->
+        none()
+
+      :erlang.is_map_key(type, seen) ->
+        none()
+
+      true ->
+        seen = Map.put(seen, type, true)
+
+        case type do
+          %{list: bdd} ->
+            head = list_project_bdd(bdd, 0)
+            tail = list_project_bdd(bdd, 1)
+            opt_union(head, list_elements(tail, seen))
+
+          %{} ->
+            none()
         end
     end
   end
 
-  # A list is proper if it's either the empty list alone, or all non-empty
-  # list types have tails that are subtypes of empty list.
-  defp list_of_static(%{list: bdd}, empty_list) do
-    try do
-      result =
-        Enum.reduce(list_bdd_to_pos_dnf(bdd), none(), fn {list, last, _negs}, acc ->
-          if last == @empty_list or subtype?(last, @empty_list) do
-            bare_union(acc, list)
-          else
-            throw(:badproperlist)
-          end
-        end)
-
-      {empty_list, result}
-    catch
-      :badproperlist -> :badproperlist
+  defp list_union(bdd1, bdd2) do
+    cond do
+      bdd1 == @non_empty_list_top -> bdd1
+      bdd2 == @non_empty_list_top -> bdd2
+      true -> bdd_union(bdd1, bdd2)
     end
   end
 
-  defp list_of_static(%{}, empty_list) do
-    {empty_list, none()}
+  defp list_intersection(bdd1, bdd2) do
+    cond do
+      bdd1 == @non_empty_list_top -> bdd2
+      bdd2 == @non_empty_list_top -> bdd1
+      true -> bdd_intersection(bdd1, bdd2)
+    end
   end
 
-  defp list_union(bdd_leaf(:term, :term) = leaf, _), do: leaf
-  defp list_union(_, bdd_leaf(:term, :term) = leaf), do: leaf
-  defp list_union(bdd1, bdd2), do: bdd_union(bdd1, bdd2)
-
-  defp list_intersection(bdd_leaf(:term, :term), bdd), do: bdd
-  defp list_intersection(bdd, bdd_leaf(:term, :term)), do: bdd
-  defp list_intersection(bdd1, bdd2), do: bdd_intersection(bdd1, bdd2)
-
-  defp list_difference(bdd_leaf(:term, :term), bdd_leaf(:term, :term)), do: :bdd_bot
-  defp list_difference(bdd_leaf(:term, :term), bdd2), do: bdd_negation(bdd2)
-  defp list_difference(bdd1, bdd2), do: bdd_difference(bdd1, bdd2)
+  defp list_difference(bdd1, bdd2) do
+    cond do
+      bdd1 == bdd2 -> :bdd_bot
+      bdd1 == @non_empty_list_top -> bdd_negation(bdd2)
+      true -> bdd_difference(bdd1, bdd2)
+    end
+  end
 
   defp list_empty?(@non_empty_list_top, _seen), do: false
-
-  defp list_empty?(bdd, seen) do
-    key = empty_bdd_seen_key(:list, bdd)
-
-    if :erlang.is_map_key(key, seen) do
-      true
-    else
-      seen = Map.put(seen, key, true)
-
-      bdd_to_dnf(bdd)
-      |> Enum.all?(fn {pos, negs} ->
-        case non_empty_list_literals_intersection(pos, seen) do
-          :empty -> true
-          {list, last} -> list_line_empty?(list, last, negs, seen)
-        end
-      end)
-    end
-  end
-
-  defp list_line_empty?(list_type, last_type, negs, seen) do
-    last_type = list_tail_unfold(last_type)
-
-    # To make a list {list, last} empty with some negative lists:
-    # 1. Ignore negative lists which do not have a list type that is a supertype of the positive one.
-    # 2. Each of the list supertypes:
-    #     a. either completely covers the type, if its last type is a supertype of the positive one,
-    #     b. or it removes part of the last type.
-    empty_seen?(list_type, seen) or empty_seen?(last_type, seen) or
-      Enum.reduce_while(negs, last_type, fn bdd_leaf(neg_type, neg_last), acc_last_type ->
-        if subtype_seen?(list_type, neg_type, seen) do
-          d = bare_difference(acc_last_type, list_tail_unfold(neg_last))
-          if empty_seen?(d, seen), do: {:halt, nil}, else: {:cont, d}
-        else
-          {:cont, acc_last_type}
-        end
-      end)
-      |> is_nil()
-  end
+  defp list_empty?(bdd, seen), do: product_empty?(:list, list_product_bdd(bdd), seen)
 
   defp non_empty_list_only?(descr), do: empty?(Map.delete(descr, :list))
 
@@ -2703,10 +2606,7 @@ defmodule Module.Types.Descr do
 
   defp list_hd_static(:term), do: :term
 
-  defp list_hd_static(%{list: bdd}) do
-    list_bdd_to_pos_dnf(bdd)
-    |> Enum.reduce(none(), fn {list, _last, _negs}, acc -> opt_union(acc, list) end)
-  end
+  defp list_hd_static(%{list: bdd}), do: unfold_list_component(list_project_bdd(bdd, 0))
 
   defp list_hd_static(%{}), do: none()
 
@@ -2743,154 +2643,79 @@ defmodule Module.Types.Descr do
 
   defp list_tl_static(:term), do: :term
 
-  defp list_tl_static(%{list: bdd} = descr) do
-    initial =
-      case descr do
-        %{bitmap: bitmap} when (bitmap &&& @bit_empty_list) != 0 ->
-          %{list: bdd, bitmap: @bit_empty_list}
-
-        %{} ->
-          %{list: bdd}
-      end
-
-    list_bdd_to_pos_dnf(bdd)
-    |> Enum.reduce(initial, fn {_list, last, _negs}, acc -> opt_union(acc, last) end)
-  end
+  defp list_tl_static(%{list: bdd}), do: unfold_list_component(list_project_bdd(bdd, 1))
 
   defp list_tl_static(%{}), do: none()
 
+  defp list_project_bdd(bdd_leaf(:closed, [head, _tail]), 0), do: head
+  defp list_project_bdd(bdd_leaf(:closed, [_head, tail]), 1), do: tail
+
+  defp list_project_bdd(bdd, index) do
+    {value, false} = tuple_bdd_fetch_static(list_product_bdd(bdd), index)
+    value
+  end
+
+  defp unfold_list_component(:term), do: :term
+  defp unfold_list_component(value) when value == @term, do: :term
+  defp unfold_list_component(value), do: unfold(value)
+
+  # Compatibility with the existing printer only. List normalization and
+  # recursive-list presentation are a separate change.
   defp list_to_quoted(bdd, empty?, recur, opts) do
-    dnf = list_normalize(bdd)
+    case {empty?, homogeneous_list_leaf(bdd)} do
+      {true, {:ok, head, base}} when base == @empty_list ->
+        [{:list, [], [recur.(head, opts)]}]
 
-    {unions, list_rendered?} =
-      dnf
-      |> Enum.reduce({[], false}, fn {list_type, last_type, negs}, {acc, list_rendered?} ->
-        {name, arguments, list_rendered?} =
-          case list_canonical_to_quoted(list_type, last_type, recur, opts) do
-            [_] = arguments when empty? -> {:list, arguments, true}
-            arguments -> {:non_empty_list, arguments, list_rendered?}
-          end
-
-        acc =
-          if negs == [] do
-            [{name, [], arguments} | acc]
-          else
-            negs
-            |> non_empty_map_or(fn bdd_leaf(ty, lst) ->
-              {:non_empty_list, [],
-               list_canonical_to_quoted(ty, list_tail_unfold(lst), recur, opts)}
-            end)
-            |> Kernel.then(
-              &[
-                {:and, [], [{name, [], arguments}, {:not, [], [&1]}]}
-                | acc
-              ]
-            )
-          end
-
-        {acc, list_rendered?}
-      end)
-
-    if empty? and not list_rendered? do
-      [{:empty_list, [], []} | unions]
-    else
-      unions
+      _ ->
+        top = {:non_empty_list, [], [{:term, [], []}, {:term, [], []}]}
+        quoted = boolean_to_quoted(bdd, top, &list_literal_to_quoted(&1, recur, opts))
+        if empty?, do: [{:empty_list, [], []} | quoted], else: quoted
     end
   end
 
-  # Returns the arguments to print a non empty list with the given list and last types.
-  # A single argument is returned if the list is proper.
-  #
-  # This is also used by the recursive printer, so all checks must be syntactic.
-  # Callers which can perform semantic checks must canonicalize the types first.
-  defp list_args_to_quoted(list_type, last_type, recur, opts) do
-    case last_type do
-      last_type when last_type == @empty_list ->
-        [recur.(list_type, opts)]
+  defp list_literal_to_quoted(
+         bdd_leaf(:closed, [head, {{:list_closure, head, base}, :list_closure, nil}]),
+         recur,
+         opts
+       ) do
+    args = if base == @empty_list, do: [head], else: [head, base]
+    {:non_empty_list, [], Enum.map(args, &recur.(&1, opts))}
+  end
 
-      # The last type can only be printed as term() if the list type is also term(),
-      # as non_empty_list(list_type, term()) folds the lists in term() into list_type.
-      last_type when last_type == :term or last_type == @not_non_empty_list ->
-        term = {:term, [], []}
+  defp list_literal_to_quoted(bdd_leaf(:closed, [head, tail]), recur, opts),
+    do: {:list_cons, [], [recur.(head, opts), recur.(tail, opts)]}
 
-        if list_type == :term do
-          [term, term]
-        else
-          [recur.(list_type, opts), {:not, [], [{:non_empty_list, [], [term, term]}]}]
-        end
+  defp list_closure_to_quoted(head, base, recur, opts) when base == @empty_list,
+    do: {:list, [], [recur.(head, opts)]}
 
-      # Lists in the last type would also be folded into list_type, so we remove them.
-      %{} ->
-        [recur.(list_type, opts), recur.(Map.delete(last_type, :list), opts)]
+  defp list_closure_to_quoted(head, base, recur, opts),
+    do:
+      {:or, [],
+       [recur.(base, opts), {:non_empty_list, [], [recur.(head, opts), recur.(base, opts)]}]}
 
-      {_, _, _} ->
-        [recur.(list_type, opts), recur.(last_type, opts)]
+  defp homogeneous_list_bdd(
+         bdd_leaf(:closed, [head, {{:list_closure, node_head, base}, :list_closure, nil}])
+       ) do
+    if head == node_head, do: {:ok, head, base}, else: :error
+  end
+
+  defp homogeneous_list_bdd(bdd) do
+    case list_product_bdd(bdd) |> tuple_bdd_to_dnf_with_negations() do
+      [{:closed, [head, {{:list_closure, node_head, base}, :list_closure, nil}], []}]
+      when head == node_head ->
+        {:ok, head, base}
+
+      _ ->
+        :error
     end
   end
 
-  # Canonicalizes list types for printing via list_args_to_quoted/4.
-  # The last type must not contain lists (see list_tail_unfold/1).
-  defp list_canonical_to_quoted(list_type, last_type, recur, opts) do
-    list_type = if term_type?(list_type), do: :term, else: list_type
+  defp homogeneous_list_leaf(
+         bdd_leaf(:closed, [head, {{:list_closure, head, base}, :list_closure, nil}])
+       ),
+       do: {:ok, head, base}
 
-    last_type =
-      cond do
-        subtype?(last_type, @empty_list) -> @empty_list
-        subtype?(@not_non_empty_list, last_type) -> @not_non_empty_list
-        true -> last_type
-      end
-
-    list_args_to_quoted(list_type, last_type, recur, opts)
-  end
-
-  # Eliminate empty lists from the union, and redundant types (that are subtypes of others,
-  # or that can be merged with others). List_bdd_to_pos_dnf already takes into account the
-  # impact of negations on the last type.
-  defp list_normalize(bdd) do
-    list_bdd_to_pos_dnf(bdd)
-    |> Enum.reduce([], fn {list, last, negs}, acc ->
-      # The last type may be stored as term() or, after differences, contain lists.
-      # Since lists in the last type would be folded into the list type once printed,
-      # we remove them (which is equivalent from the last type perspective).
-      last = list_tail_unfold(last)
-
-      # Prune negations from those with empty intersections.
-      negs =
-        Enum.uniq(negs)
-        |> Enum.filter(fn bdd_leaf(nlist, nlast) ->
-          not empty?(bare_intersection(list, nlist)) and
-            not empty?(bare_intersection(last, nlast))
-        end)
-
-      add_to_list_normalize(acc, list, last, negs)
-    end)
-  end
-
-  # List of possible union merges:
-  # Case 1: when a list is a subtype of another
-  # Case 2: when two lists have the same list type, then the last types are united
-  defp add_to_list_normalize([{t, l, []} = cur | rest], list, last, []) do
-    cond do
-      subtype?(list, t) and subtype?(last, l) -> [cur | rest]
-      subtype?(t, list) and subtype?(l, last) -> [{list, last, []} | rest]
-      equal?(t, list) -> [{t, bare_union(l, last), []} | rest]
-      true -> [cur | add_to_list_normalize(rest, list, last, [])]
-    end
-  end
-
-  # Case 3: when a list with negations is united with one of its negations
-  defp add_to_list_normalize([{t, l, n} = cur | rest], list, last, []) do
-    case delete_elem(n, bdd_leaf_new(list, last), []) do
-      :error -> [cur, {list, last, []} | rest]
-      n1 -> [{t, l, n1} | rest]
-    end
-  end
-
-  defp add_to_list_normalize(rest, list, last, negs), do: [{list, last, negs} | rest]
-
-  defp delete_elem([key | t], key, acc), do: :lists.reverse(acc, t)
-  defp delete_elem([h | t], key, acc), do: delete_elem(t, key, [h | acc])
-  defp delete_elem([], _key, _acc), do: :error
+  defp homogeneous_list_leaf(_bdd), do: :error
 
   ## Dynamic
   #
@@ -5446,8 +5271,10 @@ defmodule Module.Types.Descr do
     zip_intersection(rest1, rest2, [intersection_fun.(type1, type2) | acc], intersection_fun)
   end
 
-  defp tuple_empty?(bdd, seen) do
-    key = empty_bdd_seen_key(:tuple, bdd)
+  defp tuple_empty?(bdd, seen), do: product_empty?(:tuple, bdd, seen)
+
+  defp product_empty?(kind, bdd, seen) do
+    key = empty_bdd_seen_key(kind, bdd)
 
     if :erlang.is_map_key(key, seen) do
       true
@@ -6902,7 +6729,7 @@ defmodule Module.Types.Descr do
   defp opt_union(:dynamic, v1, v2, seen),
     do: dynamic_union(v1, v2, &opt_union(&1, &2, &3, seen))
 
-  defp opt_union(:list, v1, v2, _seen), do: list_union(v1, v2)
+  defp opt_union(:list, v1, v2, seen), do: opt_list_union(v1, v2, seen)
   defp opt_union(:map, v1, v2, seen), do: opt_map_union(v1, v2, seen)
   defp opt_union(:tuple, v1, v2, _seen), do: opt_tuple_union(v1, v2)
   defp opt_union(:fun, v1, v2, _seen), do: fun_union(v1, v2)
@@ -6984,67 +6811,108 @@ defmodule Module.Types.Descr do
     opt_difference(term(), descr)
   end
 
-  defp opt_list_intersection(bdd_leaf(:term, :term), bdd, _seen), do: bdd
-  defp opt_list_intersection(bdd, bdd_leaf(:term, :term), _seen), do: bdd
+  defp opt_list_union(bdd1, bdd2, seen) do
+    case {homogeneous_list_leaf(bdd1), homogeneous_list_leaf(bdd2)} do
+      {{:ok, head1, base1}, {:ok, head2, base2}} ->
+        cond do
+          subtype_seen?(head1, head2, seen) and subtype_seen?(base1, base2, seen) -> bdd2
+          subtype_seen?(head2, head1, seen) and subtype_seen?(base2, base1, seen) -> bdd1
+          head1 == head2 -> list_descr_bdd(head1, bare_union(base1, base2))
+          true -> list_union(bdd1, bdd2)
+        end
 
-  defp opt_list_intersection(bdd_leaf(_, _) = bdd1, bdd_leaf(_, _) = bdd2, seen) do
-    case opt_bdd_seen(seen, :list_intersection, bdd1, bdd2) do
-      :seen -> list_intersection(bdd1, bdd2)
-      {:ok, seen} -> opt_list_leaf_intersection(bdd1, bdd2, seen)
+      _ ->
+        list_union(bdd1, bdd2)
     end
   end
 
-  defp opt_list_intersection(bdd1, bdd2, _seen), do: list_intersection(bdd1, bdd2)
-
-  defp opt_list_leaf_intersection(bdd_leaf(list1, last1), bdd_leaf(list2, last2), seen) do
-    intersection_fun = &opt_intersection(&1, &2, seen)
-
-    try do
-      list = non_empty_intersection!(list1, list2, intersection_fun)
-      last = non_empty_intersection!(last1, last2, intersection_fun)
-      bdd_leaf_new(list, last)
-    catch
-      :empty -> :bdd_bot
-    end
-  end
-
-  defp opt_list_difference(bdd_leaf(:term, :term), bdd_leaf(:term, :term), _seen), do: :bdd_bot
-  defp opt_list_difference(bdd_leaf(:term, :term), bdd2, _seen), do: bdd_negation(bdd2)
-
-  # Computes the difference between two BDD (Binary Decision Diagram) list types.
-  # It progressively subtracts each type in bdd2 from all types in bdd1.
-  # The algorithm handles three cases:
-  # 1. Disjoint types: keeps the original type from bdd1
-  # 2. Subtype relationship:
-  #    a) If bdd2 type is a supertype, keeps only the negations
-  #    b) If only the last type differs, subtracts it
-  # 3. Base case: adds bdd2 type to negations of bdd1 type
-  # The result may be larger than the initial bdd1, which is maintained in the accumulator.
-  defp opt_list_difference(bdd_leaf(list1, last1) = bdd1, bdd_leaf(list2, last2) = bdd2, seen) do
+  defp opt_list_intersection(bdd1, bdd2, seen) do
     cond do
-      not subtype?(list1, list2) ->
-        bdd_difference(bdd1, bdd2, &opt_list_leaf_difference/3)
+      bdd1 == bdd2 -> bdd1
+      bdd1 == @non_empty_list_top -> bdd2
+      bdd2 == @non_empty_list_top -> bdd1
+      true -> opt_list_intersection_products(bdd1, bdd2, seen)
+    end
+  end
 
-      subtype?(last1, last2) ->
-        :bdd_bot
+  defp opt_list_intersection_products(bdd1, bdd2, seen) do
+    case {homogeneous_list_bdd(bdd1), homogeneous_list_bdd(bdd2)} do
+      {{:ok, head1, base1}, {:ok, head2, base2}} ->
+        cond do
+          subtype_seen?(head1, head2, seen) and subtype_seen?(base1, base2, seen) ->
+            bdd1
 
-      true ->
-        case opt_bdd_seen(seen, :list_difference, bdd1, bdd2) do
-          :seen -> list_difference(bdd1, bdd2)
-          {:ok, seen} -> bdd_leaf_new(list1, opt_difference(last1, last2, seen))
+          subtype_seen?(head2, head1, seen) and subtype_seen?(base2, base1, seen) ->
+            bdd2
+
+          list_terminal_only?(base1) and list_terminal_only?(base2) ->
+            head = opt_intersection(head1, head2, seen)
+            base = opt_intersection(base1, base2, seen)
+
+            if empty?(head) or empty?(base), do: :bdd_bot, else: list_descr_bdd(head, base)
+
+          true ->
+            case opt_bdd_seen(seen, :list_intersection, bdd1, bdd2) do
+              :seen -> bdd_intersection(bdd1, bdd2)
+              {:ok, seen} -> opt_list_leaf_intersection(bdd1, bdd2, seen)
+            end
+        end
+
+      _ ->
+        cond do
+          match?(bdd_leaf(_, _), bdd1) and match?(bdd_leaf(_, _), bdd2) ->
+            case opt_bdd_seen(seen, :list_intersection, bdd1, bdd2) do
+              :seen -> bdd_intersection(bdd1, bdd2)
+              {:ok, seen} -> opt_list_leaf_intersection(bdd1, bdd2, seen)
+            end
+
+          true ->
+            bdd_intersection(list_product_bdd(bdd1), list_product_bdd(bdd2))
         end
     end
   end
 
-  defp opt_list_difference(bdd1, bdd2, _seen),
-    do: bdd_difference(bdd1, bdd2, &opt_list_leaf_difference/3)
-
-  defp opt_list_leaf_difference(bdd_leaf(list1, last1), bdd_leaf(list2, last2), _) do
-    if disjoint?(list1, list2) or disjoint?(last1, last2) do
-      :disjoint
-    else
-      :none
+  defp opt_list_leaf_intersection(bdd1, bdd2, seen) do
+    case opt_tuple_leaf_intersection(bdd1, bdd2, seen) do
+      bdd_leaf(:closed, [head, tail]) -> list_new(head, tail)
+      :bdd_bot -> :bdd_bot
     end
+  end
+
+  defp list_terminal_only?(type),
+    do: empty?(bare_intersection(type, %{list: @non_empty_list_top}))
+
+  defp opt_list_difference(bdd, bdd, _seen), do: :bdd_bot
+
+  defp opt_list_difference(@non_empty_list_top, bdd, _seen),
+    do: bdd_negation(bdd)
+
+  defp opt_list_difference(_bdd, @non_empty_list_top, _seen), do: :bdd_bot
+
+  defp opt_list_difference(bdd1, bdd2, seen) do
+    case {homogeneous_list_bdd(bdd1), homogeneous_list_bdd(bdd2)} do
+      {{:ok, head1, base1}, {:ok, head2, base2}}
+      when base1 != :term and base2 != :term ->
+        if list_terminal_only?(base1) and list_terminal_only?(base2) and
+             subtype_seen?(head1, head2, seen) do
+          base = opt_difference(base1, base2, seen)
+
+          if empty?(base), do: :bdd_bot, else: list_descr_bdd(head1, base)
+        else
+          opt_list_product_difference(bdd1, bdd2)
+        end
+
+      _ ->
+        opt_list_product_difference(bdd1, bdd2)
+    end
+  end
+
+  defp opt_list_product_difference(bdd1, bdd2) do
+    bdd_difference(
+      list_product_bdd(bdd1),
+      list_product_bdd(bdd2),
+      &opt_tuple_leaf_difference/3
+    )
   end
 
   defp opt_map_union(bdd_leaf(tag1, fields1) = bdd1, bdd_leaf(tag2, fields2) = bdd2, seen) do

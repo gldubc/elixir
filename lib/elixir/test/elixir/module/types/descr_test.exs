@@ -1093,6 +1093,7 @@ defmodule Module.Types.DescrTest do
             {closed_map([{domain_key(:integer), gradual}]),
              closed_map([{domain_key(:integer), static}]),
              closed_map([{domain_key(:integer), upper_bound}])},
+            {list_cons(gradual, x), list_cons(static, x), list_cons(upper_bound, x)},
             {list(dynamic()), empty_list(), list(term())},
             {non_empty_list(gradual), non_empty_list(static), non_empty_list(upper_bound)},
             {non_empty_list(head, gradual), non_empty_list(head, static),
@@ -1337,6 +1338,19 @@ defmodule Module.Types.DescrTest do
   end
 
   describe "empty?" do
+    test "recursive lists" do
+      %{x: ungrounded} =
+        recursive(%{x: fn recur -> list_cons(integer(), recur.(:x)) end})
+
+      %{x: grounded} =
+        recursive(%{
+          x: fn recur -> opt_union(empty_list(), list_cons(integer(), recur.(:x))) end
+        })
+
+      assert empty?(ungrounded)
+      assert equal?(grounded, list(integer()))
+    end
+
     test "tuple" do
       assert tuple([none()]) |> empty?()
       assert open_tuple([integer(), none()]) |> empty?()
@@ -2062,9 +2076,7 @@ defmodule Module.Types.DescrTest do
       assert list_hd(opt_union(dynamic(list(float())), non_empty_list(atom()))) ==
                {:ok, opt_union(dynamic(float()), atom())}
 
-      # If term() is in the tail, it means list(term()) is in the tail
-      # and therefore any term can be returned from hd.
-      assert list_hd(non_empty_list(atom(), term())) == {:ok, term()}
+      assert list_hd(non_empty_list(atom(), term())) == {:ok, atom()}
       assert list_hd(non_empty_list(atom(), opt_negation(list(term(), term())))) == {:ok, atom()}
     end
 
@@ -2123,7 +2135,31 @@ defmodule Module.Types.DescrTest do
       assert list_tl(dynamic(list(integer()))) == {:ok, dynamic(list(integer()))}
 
       assert list_tl(dynamic(list(integer(), atom()))) ==
-               {:ok, dynamic(opt_union(atom(), list(integer(), atom())))}
+               {:ok, dynamic(opt_union(atom(), non_empty_list(integer(), atom())))}
+    end
+
+    test "exact list cells" do
+      tail = list_cons(integer(), empty_list())
+      proper = list_cons(atom([:ok]), tail)
+      improper = list_cons(atom([:ok]), list_cons(integer(), atom([:stop])))
+
+      assert list_hd(proper) == {:ok, atom([:ok])}
+      assert list_tl(proper) == {:ok, tail}
+      assert list_of(proper) == {false, opt_union(atom([:ok]), integer())}
+      assert list_of(improper) == :badproperlist
+      assert empty?(opt_intersection(proper, tuple([atom([:ok]), tail])))
+
+      numeric = list_cons(integer(), atom())
+      assert opt_intersection(list_cons(number(), term()), numeric) |> equal?(numeric)
+      assert opt_difference(numeric, list_cons(number(), term())) |> empty?()
+
+      alternative = list_cons(float(), binary())
+      correlated = opt_union(numeric, alternative)
+      refute subtype?(list_cons(integer(), binary()), correlated)
+
+      negative = opt_difference(list_cons(term(), term()), list_cons(integer(), atom()))
+      refute empty?(negative)
+      assert empty?(opt_intersection(negative, list_cons(integer(), atom())))
     end
 
     test "tuple_fetch" do

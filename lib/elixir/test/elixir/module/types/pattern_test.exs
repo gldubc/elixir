@@ -9,6 +9,9 @@ defmodule Module.Types.PatternTest do
   import TypeHelper
   import Module.Types.Descr
 
+  defp exact_list(elements, tail \\ empty_list()),
+    do: Enum.reduce(Enum.reverse(elements), tail, &list_cons/2)
+
   describe "variables" do
     test "captures variables from simple assignment in head" do
       assert typecheck!([x = :foo], x) == dynamic(atom([:foo]))
@@ -316,24 +319,29 @@ defmodule Module.Types.PatternTest do
   describe "lists" do
     test "in patterns" do
       assert typecheck!([x = [1, 2, 3]], x) ==
-               dynamic(non_empty_list(integer()))
+               dynamic(exact_list(List.duplicate(integer(), 3)))
 
       assert typecheck!([x = [1, 2, 3 | y], y = :foo], x) ==
-               dynamic(non_empty_list(integer(), atom([:foo])))
+               dynamic(exact_list(List.duplicate(integer(), 3), atom([:foo])))
 
       assert typecheck!([x = [1, 2, 3 | y], y = [1.0, 2.0, 3.0]], x) ==
-               dynamic(non_empty_list(opt_union(integer(), float())))
+               dynamic(exact_list(List.duplicate(integer(), 3) ++ List.duplicate(float(), 3)))
 
       assert typecheck!([x = [:ok | z]], {x, z}) ==
-               dynamic(tuple([non_empty_list(term(), term()), term()]))
+               dynamic(tuple([list_cons(atom([:ok]), term()), term()]))
 
       assert typecheck!([x = [a = :a, b = :b, c = :c]], {x, a, b, c}) ==
                dynamic(
-                 tuple([non_empty_list(atom([:a, :b, :c])), atom([:a]), atom([:b]), atom([:c])])
+                 tuple([
+                   exact_list(Enum.map([:a, :b, :c], &atom([&1]))),
+                   atom([:a]),
+                   atom([:b]),
+                   atom([:c])
+                 ])
                )
 
       assert typecheck!([x = [y | z]], {x, y, z}) ==
-               dynamic(tuple([non_empty_list(term(), term()), term(), term()]))
+               dynamic(tuple([list_cons(term(), term()), term(), term()]))
     end
 
     test "in patterns through ++" do
@@ -343,10 +351,10 @@ defmodule Module.Types.PatternTest do
                dynamic(atom([:foo]))
 
       assert typecheck!([x = [1, 2, 3] ++ y, y = :foo], x) ==
-               dynamic(non_empty_list(integer(), atom([:foo])))
+               dynamic(exact_list(List.duplicate(integer(), 3), atom([:foo])))
 
       assert typecheck!([x = [1, 2, 3] ++ y, y = [1.0, 2.0, 3.0]], x) ==
-               dynamic(non_empty_list(opt_union(integer(), float())))
+               dynamic(exact_list(List.duplicate(integer(), 3) ++ List.duplicate(float(), 3)))
     end
 
     test "with lists inside tuples inside lists" do
@@ -354,8 +362,8 @@ defmodule Module.Types.PatternTest do
              |> equal?(
                dynamic(
                  tuple([
-                   tuple([non_empty_list(term())]),
-                   tuple([non_empty_list(term())]),
+                   tuple([list_cons(term(), empty_list())]),
+                   tuple([list_cons(term(), empty_list())]),
                    term()
                  ])
                )
