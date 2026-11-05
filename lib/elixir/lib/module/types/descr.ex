@@ -2657,8 +2657,12 @@ defmodule Module.Types.Descr do
 
   defp list_tl_static(%{}), do: none()
 
-  defp list_project_bdd(bdd_leaf(:closed, [head, _tail]), 0), do: head
-  defp list_project_bdd(bdd_leaf(:closed, [_head, tail]), 1), do: tail
+  # An empty component makes the entire cons cell empty.
+  defp list_project_bdd(bdd_leaf(:closed, [head, tail]), 0),
+    do: if(empty?(tail), do: @none, else: head)
+
+  defp list_project_bdd(bdd_leaf(:closed, [head, tail]), 1),
+    do: if(empty?(head), do: @none, else: tail)
 
   defp list_project_bdd(bdd, index) do
     {value, false} = tuple_bdd_fetch_static(list_product_bdd(bdd), index)
