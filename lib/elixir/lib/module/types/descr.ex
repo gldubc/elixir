@@ -652,9 +652,11 @@ defmodule Module.Types.Descr do
   def singleton?(descr), do: static_singleton?(upper_bound(descr))
 
   defp static_singleton?(:term), do: false
-  defp static_singleton?(%{list: _}), do: false
+  defp static_singleton?({_, _, _}), do: false
   defp static_singleton?(%{fun: _}), do: false
-  defp static_singleton?(descr), do: each_singleton?(descr, [:atom, :bitmap, :map, :tuple], false)
+
+  defp static_singleton?(descr),
+    do: each_singleton?(descr, [:atom, :bitmap, :map, :tuple, :list], false)
 
   defp each_singleton?(descr, [key | keys], acc) do
     case descr do
@@ -677,6 +679,14 @@ defmodule Module.Types.Descr do
   defp each_singleton?(:bitmap, bitmap), do: bitmap == @bit_empty_list
 
   defp each_singleton?(:atom, atoms), do: match?({:union, set} when map_size(set) == 1, atoms)
+
+  defp each_singleton?(:list, bdd) do
+    case tuple_bdd_to_dnf_no_negations(list_product_bdd(bdd)) do
+      [] -> :empty
+      [{:closed, [head, tail]}] -> static_singleton?(head) and static_singleton?(tail)
+      _ -> false
+    end
+  end
 
   defp each_singleton?(:tuple, bdd) do
     case tuple_bdd_to_dnf_no_negations(bdd) do
