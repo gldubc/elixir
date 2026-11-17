@@ -2261,6 +2261,52 @@ defmodule Module.Types.DescrTest do
       assert singleton?(opt_union(empty_list(), @disguised_empty_map))
     end
 
+    test "exact list cells" do
+      proper = list_cons(atom([:foo]), empty_list())
+      improper = list_cons(atom([:foo]), atom([:stop]))
+
+      assert singleton?(proper)
+      assert singleton?(improper)
+      assert singleton?(list_cons(proper, list_cons(improper, empty_list())))
+      assert singleton?(tuple([proper]))
+      assert singleton?(closed_map(key: {proper, false}))
+      assert singleton?(dynamic(proper))
+
+      refute singleton?(list_cons(atom([:foo, :bar]), empty_list()))
+      refute singleton?(list_cons(atom([:foo]), term()))
+      refute singleton?(list_cons(none(), empty_list()))
+      refute singleton?(list_cons(atom([:foo]), none()))
+      refute singleton?(opt_union(proper, empty_list()))
+      refute singleton?(opt_union(proper, improper))
+      refute singleton?(opt_union(proper, atom([:other])))
+
+      empty = list_cons(atom([:foo]), none())
+      assert singleton?(opt_union(atom([:value]), empty))
+      assert singleton?(opt_union(empty_list(), empty))
+    end
+
+    test "list exclusions" do
+      a = atom([:a])
+      one_or_more = non_empty_list(a)
+      two_or_more = non_empty_list(a, one_or_more)
+      assert singleton?(opt_difference(one_or_more, two_or_more))
+
+      # Both BDD lines produce the same singleton improper list.
+      a = list_cons(opt_union(integer(), atom([:ok])), atom([:x]))
+      b = list_cons(integer(), atom([:x, :y]))
+      c = list_cons(integer(), opt_union(atom([:x]), binary()))
+      assert singleton?(opt_union(opt_difference(a, b), opt_difference(a, c)))
+    end
+
+    test "recursive list tails are conservatively rejected" do
+      refute singleton?(non_empty_list(atom([:foo])))
+      refute singleton?(list_cons(atom([:foo]), list(atom([:bar]))))
+
+      %{x: recursive} = recursive(%{x: fn recur -> list_cons(atom([:foo]), recur.(:x)) end})
+      refute singleton?(recursive)
+      refute singleton?(list_cons(atom([:foo]), recursive))
+    end
+
     test "maps" do
       assert singleton?(empty_map())
       assert singleton?(closed_map(key: {atom([:value]), false}))
@@ -2506,6 +2552,46 @@ defmodule Module.Types.DescrTest do
       negative = opt_difference(list_cons(term(), term()), list_cons(integer(), atom()))
       refute empty?(negative)
       assert empty?(opt_intersection(negative, list_cons(integer(), atom())))
+    end
+
+    test "list projections reject empty cells" do
+      for empty <- [none(), tuple([none()]), list_cons(none(), empty_list())],
+          type <- [
+            list_cons(atom([:a]), empty),
+            list_cons(empty, atom([:stop])),
+            non_empty_list(atom([:a]), empty),
+            non_empty_list(empty, atom([:stop]))
+          ] do
+        assert empty?(type)
+        assert list_hd(type) == :badnonemptylist
+        assert list_tl(type) == :badnonemptylist
+        assert list_hd(dynamic(type)) == :badnonemptylist
+        assert list_tl(dynamic(type)) == :badnonemptylist
+      end
+    end
+
+    test "empty static cells do not affect gradual list projections" do
+      proper = list_cons(atom([:b]), empty_list())
+      improper = list_cons(atom([:c]), atom([:stop]))
+
+      for empty <- [
+            list_cons(atom([:a]), none()),
+            list_cons(none(), atom([:a])),
+            list_cons(atom([:a]), tuple([none()])),
+            non_empty_list(atom([:a]), none())
+          ],
+          type <- [proper, dynamic(proper), opt_union(proper, dynamic(improper))] do
+        with_empty = opt_union(type, empty)
+        assert equal?(type, with_empty)
+
+        assert {:ok, expected_head} = list_hd(type)
+        assert {:ok, actual_head} = list_hd(with_empty)
+        assert equal?(expected_head, actual_head)
+
+        assert {:ok, expected_tail} = list_tl(type)
+        assert {:ok, actual_tail} = list_tl(with_empty)
+        assert equal?(expected_tail, actual_tail)
+      end
     end
 
     test "tuple_fetch" do
@@ -5188,7 +5274,7 @@ defmodule Module.Types.DescrTest do
              |> opt_difference(list(integer()))
              |> opt_difference(list(atom()))
              |> to_quoted_string() ==
-               "non_empty_list(term()) and not (non_empty_list(integer()) or non_empty_list(atom()))"
+               "non_empty_list(term()) and not non_empty_list(atom()) and not non_empty_list(integer())"
 
       assert list(term(), integer()) |> to_quoted_string() ==
                "empty_list() or non_empty_list(term(), integer())"
@@ -5212,10 +5298,10 @@ defmodule Module.Types.DescrTest do
       assert non_empty_list(integer(), opt_union(atom(), empty_list())) |> to_quoted_string() ==
                "non_empty_list(integer(), atom() or empty_list())"
 
-      # The last type may contain lists after differences, which must not be printed
+      # Subtracting proper lists leaves exactly the non-empty improper lists.
       assert opt_difference(non_empty_list(term(), term()), non_empty_list(term()))
              |> to_quoted_string() ==
-               "non_empty_list(term(), not empty_list() and not non_empty_list(term(), term()))"
+               "non_empty_list(term(), term()) and not non_empty_list(term())"
 
       # Test normalization
 
@@ -5236,7 +5322,16 @@ defmodule Module.Types.DescrTest do
              |> to_quoted_string() ==
                "dynamic(empty_list() or non_empty_list(integer(), float() or pid()))"
 
-      # Keep branch exclusions separate
+      list_with_tail =
+        non_empty_list(atom(), opt_union(integer(), empty_list()))
+        |> opt_difference(non_empty_list(atom([:ok]), integer()))
+        |> opt_difference(non_empty_list(atom(), integer()))
+
+      # Check that simplifications occur.
+      assert to_quoted_string(list_with_tail) == "non_empty_list(atom())"
+    end
+
+    test "list unions with branch exclusions" do
       assert list(atom([:a, :b, :c]))
              |> opt_difference(bare_intersection(list(atom([:a, :b])), list(atom([:b, :d]))))
              |> opt_union(bare_intersection(list(atom([:b, :d])), list(atom([:b, :c, :d]))))
@@ -5245,14 +5340,6 @@ defmodule Module.Types.DescrTest do
                (list(:a or :b) and not non_empty_list(:b or :d)) or
                  (list(:a or :b or :c) and not non_empty_list(:a or :b)) or list(:b or :d)\
                """
-
-      list_with_tail =
-        non_empty_list(atom(), opt_union(integer(), empty_list()))
-        |> opt_difference(non_empty_list(atom([:ok]), integer()))
-        |> opt_difference(non_empty_list(atom(), integer()))
-
-      # Check that simplifications occur.
-      assert to_quoted_string(list_with_tail) == "non_empty_list(atom())"
     end
 
     test "list (negation)" do

@@ -6664,10 +6664,25 @@ defmodule Module.Types.Descr do
   @max_leaf_size (1 <<< 31) - 1
 
   defp bdd_leaf_new(:closed, arg2),
-    do: {bdd_leaf_key(arg2, :erlang.phash2(arg2)) - @closed_offset, :closed, arg2}
+    do: {bdd_leaf_key(arg2, :erlang.phash2(bdd_hash_term(arg2))) - @closed_offset, :closed, arg2}
 
   defp bdd_leaf_new(arg1, arg2),
-    do: {bdd_leaf_key(arg2, :erlang.phash2([arg1 | arg2])), arg1, arg2}
+    do: {bdd_leaf_key(arg2, :erlang.phash2(bdd_hash_term([arg1 | arg2]))), arg1, arg2}
+
+  # Reuse nested BDD hashes instead of traversing shared recursive-list heads.
+  # Hash collisions still compare the complete original literals.
+  defp bdd_hash_term({hash, _, _}) when is_integer(hash), do: {:bdd, hash}
+  defp bdd_hash_term({hash, _, _, _, _}) when is_integer(hash), do: {:bdd, hash}
+  defp bdd_hash_term({_, _, _}), do: :type_node
+
+  defp bdd_hash_term(term) when is_map(term),
+    do: Map.new(term, fn {key, value} -> {bdd_hash_term(key), bdd_hash_term(value)} end)
+
+  defp bdd_hash_term(term) when is_tuple(term),
+    do: term |> Tuple.to_list() |> Enum.map(&bdd_hash_term/1) |> List.to_tuple()
+
+  defp bdd_hash_term([head | tail]), do: [bdd_hash_term(head) | bdd_hash_term(tail)]
+  defp bdd_hash_term(term), do: term
 
   defp bdd_leaf_key(arg, hash) when is_list(arg),
     do: (min(length(arg), @max_leaf_size) <<< 27) + hash
