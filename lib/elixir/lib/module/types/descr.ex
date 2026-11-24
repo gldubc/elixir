@@ -108,7 +108,6 @@ defmodule Module.Types.Descr do
   def list(type), do: list_descr(type, @empty_list, true)
   def non_empty_list(type, tail \\ @empty_list), do: list_descr(type, tail, false)
 
-  @doc false
   def list_cons(head, tail), do: list_pair_descr(head, tail, &list_cons_static/2)
   def open_map(), do: %{map: @map_top}
   def open_map(pairs), do: map_descr(:open, pairs)
@@ -722,6 +721,11 @@ defmodule Module.Types.Descr do
 
     * `:collapse_structs` - do not show struct fields that match
       their default type
+
+    * `:roll_lists` - when `true`, print cons chains as
+      `non_empty_list(elem, ending)` over-approximations, where `elem` is
+      the union of the heads along the chain. Defaults to `false`, which
+      prints the exact type
   """
   def to_quoted(descr, opts \\ []) do
     recur =
@@ -731,6 +735,70 @@ defmodule Module.Types.Descr do
 
     recur.(descr, opts)
   end
+
+  # Recognize only the regular list equations in the finite printed syntax.
+  # Other recursive shapes keep their binder and exact cons representation.
+  # Rolled lists no longer reference their binder.
+  defp quoted_recur(var, body) do
+    if quoted_list_body?(body) and quoted_var_absent?(body, var),
+      do: body,
+      else: quoted_recur_equation(var, body)
+  end
+
+  defp quoted_list_body?({:or, _, [left, right]}),
+    do: quoted_list_body?(left) or quoted_list_body?(right)
+
+  defp quoted_list_body?({kind, _, _}), do: kind in [:list, :non_empty_list]
+  defp quoted_list_body?(_), do: false
+
+  defp quoted_recur_equation(var, {:or, _, [left, right]} = body) do
+    with {:ok, kind, head} <- quoted_list_equation(left, right, var),
+         true <- quoted_var_absent?(head, var) do
+      {kind, [], [head]}
+    else
+      _ -> {:recur, [], [var, body]}
+    end
+  end
+
+  defp quoted_recur_equation(var, body), do: {:recur, [], [var, body]}
+
+  defp quoted_list_equation({:empty_list, _, []}, {:list_cons, _, [head, var]}, var),
+    do: {:ok, :list, head}
+
+  defp quoted_list_equation({:list_cons, _, [head, var]}, {:empty_list, _, []}, var),
+    do: {:ok, :list, head}
+
+  defp quoted_list_equation({:empty_list, _, []}, {:non_empty_list, _, [head, var]}, var),
+    do: {:ok, :list, head}
+
+  defp quoted_list_equation({:non_empty_list, _, [head, var]}, {:empty_list, _, []}, var),
+    do: {:ok, :list, head}
+
+  defp quoted_list_equation(
+         {:list_cons, _, [head, {:empty_list, _, []}]},
+         {:list_cons, _, [head, var]},
+         var
+       ),
+       do: {:ok, :non_empty_list, head}
+
+  defp quoted_list_equation(
+         {:list_cons, _, [head, var]},
+         {:list_cons, _, [head, {:empty_list, _, []}]},
+         var
+       ),
+       do: {:ok, :non_empty_list, head}
+
+  defp quoted_list_equation(_left, _right, _var), do: :error
+
+  defp quoted_var_absent?(var, var), do: false
+
+  defp quoted_var_absent?(quoted, var) when is_tuple(quoted),
+    do: quoted_var_absent?(Tuple.to_list(quoted), var)
+
+  defp quoted_var_absent?([head | tail], var),
+    do: quoted_var_absent?(head, var) and quoted_var_absent?(tail, var)
+
+  defp quoted_var_absent?(_quoted, _var), do: true
 
   defp non_recursive_to_quoted({{:list_closure, head, base}, :list_closure, nil}, opts),
     do: list_closure_to_quoted(head, base, &non_recursive_to_quoted/2, opts)
@@ -754,14 +822,19 @@ defmodule Module.Types.Descr do
           %{} ->
             name = :"t#{map_size(bound) + 1}"
             recur = recursive_to_quoted(Map.put(bound, id, name))
-            {:recur, [], [{name, [], nil}, recur.(expand_node(node), opts)]}
+            quoted_recur({name, [], nil}, recur.(expand_node(node), opts))
         end
 
       :term, _opts ->
         {:term, [], []}
 
       descr, opts ->
-        recursive_descr_to_quoted(descr, recursive_to_quoted(bound), opts)
+        # Keep recursive bindings and explicit gradual bounds on the raw path.
+        if contains_recur?(descr) or is_map_key(descr, :dynamic) do
+          recursive_descr_to_quoted(descr, recursive_to_quoted(bound), opts)
+        else
+          non_recursive_to_quoted(descr, opts)
+        end
     end
   end
 
@@ -813,12 +886,14 @@ defmodule Module.Types.Descr do
     end
   end
 
-  defp recursive_component_to_quoted(key, bdd, recur, opts) when key in [:tuple, :map, :list] do
+  defp recursive_component_to_quoted(:list, bdd, recur, opts),
+    do: list_to_quoted(bdd, false, recur, opts)
+
+  defp recursive_component_to_quoted(key, bdd, recur, opts) when key in [:tuple, :map] do
     all_values =
       case key do
         :tuple -> tuple_fields_to_quoted(:open, [], recur, opts)
         :map -> {:map, [], []}
-        :list -> {:non_empty_list, [], [{:term, [], []}, {:term, [], []}]}
       end
 
     boolean_to_quoted(bdd, all_values, &recursive_literal_to_quoted(key, &1, recur, opts))
@@ -859,14 +934,15 @@ defmodule Module.Types.Descr do
     {:%{}, [], fields}
   end
 
-  defp recursive_literal_to_quoted(:list, literal, recur, opts),
-    do: list_literal_to_quoted(literal, recur, opts)
-
   defp recursive_literal_to_quoted(:fun, bdd_leaf(args, return), recur, opts),
     do: {:__block__, [], [[{:->, [], [Enum.map(args, &recur.(&1, opts)), recur.(return, opts)]}]]}
 
   defp boolean_to_quoted(bdd, all_values, literal_to_quoted) do
-    Enum.map(bdd_to_dnf(bdd), fn {pos, negs} ->
+    boolean_dnf_to_quoted(bdd_to_dnf(bdd), all_values, literal_to_quoted)
+  end
+
+  defp boolean_dnf_to_quoted(lines, all_values, literal_to_quoted) do
+    Enum.map(lines, fn {pos, negs} ->
       positive =
         case Enum.map(pos, literal_to_quoted) do
           [] -> all_values
@@ -880,7 +956,15 @@ defmodule Module.Types.Descr do
   end
 
   defp quoted_union([]), do: {:none, [], []}
-  defp quoted_union(parts), do: Enum.reduce(parts, &{:or, [], [&2, &1]})
+  defp quoted_union(parts), do: Enum.reduce(parts, &quoted_union(&2, &1))
+
+  defp quoted_union({:empty_list, _, []}, {:non_empty_list, _, [head]}),
+    do: {:list, [], [head]}
+
+  defp quoted_union({:non_empty_list, _, [head]}, {:empty_list, _, []}),
+    do: {:list, [], [head]}
+
+  defp quoted_union(left, right), do: {:or, [], [left, right]}
 
   defp non_term_type_to_quoted(descr, recur, opts) do
     {dynamic, static, extra} =
@@ -922,10 +1006,7 @@ defmodule Module.Types.Descr do
       to_quoted(:dynamic, dynamic, recur, opts) ++
         static_non_term_type_to_quoted(static, extra, recur, opts)
 
-    case unions do
-      [] -> {:none, [], []}
-      unions -> Enum.reduce(unions, &{:or, [], [&2, &1]})
-    end
+    quoted_union(unions)
   end
 
   defp static_non_term_type_to_quoted(static, extra, recur, opts) do
@@ -1018,6 +1099,11 @@ defmodule Module.Types.Descr do
 
     * `:collapse_structs` - do not show struct fields that match
       their default type
+
+    * `:roll_lists` - when `true`, print cons chains as
+      `non_empty_list(elem, ending)` over-approximations, where `elem` is
+      the union of the heads along the chain. Defaults to `false`, which
+      prints the exact type
   """
   def to_quoted_string(descr, opts \\ []) do
     descr
@@ -2648,10 +2734,37 @@ defmodule Module.Types.Descr do
   defp list_component_hash({_id, _state, _generator}), do: :erlang.phash2(:type_node)
   defp list_component_hash(descr), do: :erlang.phash2(descr)
 
+  defp list_product_bdd(bdd_leaf(:closed, [_, _]) = bdd), do: bdd
+
   # Logical BDD top means the top of the current sort. Restrict it to closed
   # pairs before reusing tuple-product algorithms.
   defp list_product_bdd(bdd),
     do: bdd_intersection(@non_empty_list_top, bdd)
+
+  @doc """
+  Converts a list BDD into a list of `list_cons/2` types.
+
+  The result is equivalent to `%{list: bdd}`. Intersections and negations are
+  eliminated at the outer cons layer; heads and tails may still contain
+  Boolean combinations and recursive types. The empty-list value is a separate
+  descriptor component and is not included.
+  """
+  def list_bdd_to_cons_union(bdd), do: list_cons_union(bdd)
+
+  defp list_cons_union(bdd) do
+    Enum.reduce(list_cons_pairs(bdd), @none, fn {head, tail}, acc ->
+      opt_union(acc, list_cons(head, tail))
+    end)
+  end
+
+  defp list_cons_pairs(bdd) do
+    bdd
+    |> list_product_bdd()
+    |> tuple_bdd_to_dnf_no_negations(&opt_difference/2, &opt_intersection/2)
+    |> Enum.flat_map(fn {:closed, [head, tail]} ->
+      if empty?(head) or empty?(tail), do: [], else: [{head, tail}]
+    end)
+  end
 
   @doc """
   Returns the element type of a list, assuming the list is proper.
@@ -2855,56 +2968,281 @@ defmodule Module.Types.Descr do
   defp unfold_list_component(value) when value == @term, do: :term
   defp unfold_list_component(value), do: unfold(value)
 
-  # Compatibility with the existing printer only. List normalization and
-  # recursive-list presentation are a separate change.
   defp list_to_quoted(bdd, empty?, recur, opts) do
-    case {empty?, homogeneous_list_leaf(bdd)} do
-      {true, {:ok, head, base}} when base == @empty_list ->
-        [{:list, [], [recur.(head, opts)]}]
+    cond do
+      Keyword.get(opts, :list_cons_normalized, false) ->
+        list_lines_to_quoted(list_printable_lines(bdd), empty?, recur, opts)
 
-      _ ->
-        top = {:non_empty_list, [], [{:term, [], []}, {:term, [], []}]}
-        quoted = boolean_to_quoted(bdd, top, &list_literal_to_quoted(&1, recur, opts))
-        if empty?, do: [{:empty_list, [], []} | quoted], else: quoted
+      Keyword.get(opts, :roll_lists, false) ->
+        list_rolled_to_quoted(bdd, empty?, recur, opts)
+
+      true ->
+        compact = Enum.map(list_printable_lines(bdd), &list_line_compact/1)
+
+        if :error not in compact do
+          # Lines over recognized lists already print compactly.
+          lines = Enum.reject(compact, &(&1 == :empty))
+          list_compact_lines_to_quoted(lines, empty?, recur, opts)
+        else
+          lines = bdd |> list_cons_union() |> Map.get(:list, :bdd_bot) |> bdd_to_dnf()
+
+          # A generated tail can be the original type again. Render generated
+          # heads and tails without normalizing them a second time.
+          opts = Keyword.put(opts, :list_cons_normalized, true)
+          list_lines_to_quoted(lines, empty?, recur, opts)
+        end
     end
   end
+
+  # A line is compact when all its literals are recognized lists. Recognized
+  # lists whose endings contain no cons cells have a unique ending, so their
+  # intersections, and differences with larger heads, fold exactly into one list:
+  #
+  #   non_empty_list(h1, b1) and non_empty_list(h2, b2)
+  #     == non_empty_list(h1 and h2, b1 and b2)
+  #
+  #   non_empty_list(h1, b1) and not non_empty_list(h2, b2)
+  #     == non_empty_list(h1, b1 and not b2) when h1 <= h2
+  #
+  defp list_line_compact({pos, negs} = line) do
+    if Enum.all?(pos, &list_literal_recognized?/1) and
+         Enum.all?(negs, &list_literal_recognized?/1),
+       do: list_line_fold(line),
+       else: :error
+  end
+
+  defp list_line_fold({pos, negs} = line) do
+    case Enum.map(pos, &list_flat_closure/1) do
+      [_ | _] = closures when length(closures) > 1 or negs != [] ->
+        cond do
+          # An unfolded intersection is not compact.
+          :error in closures and length(closures) > 1 ->
+            :error
+
+          :error in closures ->
+            line
+
+          true ->
+            [{head, base} | rest] = closures
+
+            {head, base} =
+              Enum.reduce(rest, {head, base}, fn {h, b}, {head, base} ->
+                {list_print_intersection(head, h), list_print_intersection(base, b)}
+              end)
+
+            fallback = if length(closures) > 1, do: :error, else: line
+            list_line_rebuild(head, base, negs, fallback)
+        end
+
+      _ ->
+        line
+    end
+  end
+
+  defp list_line_rebuild(head, base, negs, fallback) do
+    {base, negs} =
+      Enum.reduce(negs, {base, []}, fn neg, {base, kept} ->
+        case list_flat_closure(neg) do
+          {h, b} ->
+            if subtype?(head, h),
+              do: {opt_difference(base, b), kept},
+              else: {base, [neg | kept]}
+
+          :error ->
+            {base, [neg | kept]}
+        end
+      end)
+
+    case non_empty_list(head, base) do
+      descr when descr == @none ->
+        :empty
+
+      %{list: literal} = descr when map_size(descr) == 1 ->
+        if list_literal_recognized?(literal), do: {[literal], Enum.reverse(negs)}, else: fallback
+
+      _ ->
+        fallback
+    end
+  end
+
+  # Keeps an existing operand, such as a recursive node, when it is the result.
+  defp list_print_intersection(left, right) do
+    cond do
+      subtype?(left, right) -> left
+      subtype?(right, left) -> right
+      true -> opt_intersection(left, right)
+    end
+  end
+
+  # A recognized non_empty_list(head, base) whose base has no cons cells.
+  defp list_flat_closure(
+         bdd_leaf(:closed, [head, {{:list_closure, head, base}, :list_closure, nil}])
+       )
+       when is_map(base) and not is_map_key(base, :list) and not is_map_key(base, :dynamic),
+       do: {head, base}
+
+  defp list_flat_closure(_literal), do: :error
+
+  defp list_literal_recognized?(@non_empty_list_top), do: true
+
+  defp list_literal_recognized?(
+         bdd_leaf(:closed, [head, {{:list_closure, head, _base}, :list_closure, nil}])
+       ),
+       do: true
+
+  defp list_literal_recognized?(_literal), do: false
+
+  # On compact lines, the empty list folds into every line whose single positive
+  # is a proper list: each line becomes `list(head) and not ...`. Every negative
+  # literal is a cons literal and cannot exclude `[]`, so each such line denotes
+  # `[] or line`, and the union of all lines remains exact.
+  defp list_compact_lines_to_quoted(lines, true, recur, opts) do
+    if Enum.any?(lines, &list_proper_line?/1) do
+      top = {:non_empty_list, [], [{:term, [], []}, {:term, [], []}]}
+
+      Enum.flat_map(lines, fn line ->
+        if list_proper_line?(line),
+          do: [list_proper_line_to_quoted(line, recur, opts)],
+          else: boolean_dnf_to_quoted([line], top, &list_literal_to_quoted(&1, recur, opts))
+      end)
+    else
+      list_lines_to_quoted(lines, true, recur, opts)
+    end
+  end
+
+  defp list_compact_lines_to_quoted(lines, false, recur, opts),
+    do: list_lines_to_quoted(lines, false, recur, opts)
+
+  defp list_proper_line?(
+         {[bdd_leaf(:closed, [head, {{:list_closure, head, base}, :list_closure, nil}])], _negs}
+       ),
+       do: base == @empty_list
+
+  defp list_proper_line?(_line), do: false
+
+  defp list_proper_line_to_quoted(
+         {[bdd_leaf(:closed, [head, {{:list_closure, head, _}, :list_closure, nil}])], negs},
+         recur,
+         opts
+       ) do
+    Enum.reduce(negs, {:list, [], [recur.(head, opts)]}, fn literal, acc ->
+      {:and, [], [acc, {:not, [], [list_literal_to_quoted(literal, recur, opts)]}]}
+    end)
+  end
+
+  defp list_lines_to_quoted(lines, empty?, recur, opts) do
+    case {empty?, lines} do
+      {true, [line]} ->
+        if list_proper_line?(line),
+          do: [list_proper_line_to_quoted(line, recur, opts)],
+          else: list_lines_to_quoted_default(lines, true, recur, opts)
+
+      _ ->
+        list_lines_to_quoted_default(lines, empty?, recur, opts)
+    end
+  end
+
+  defp list_lines_to_quoted_default(lines, empty?, recur, opts) do
+    top = {:non_empty_list, [], [{:term, [], []}, {:term, [], []}]}
+    quoted = boolean_dnf_to_quoted(lines, top, &list_literal_to_quoted(&1, recur, opts))
+    if empty?, do: [{:empty_list, [], []} | quoted], else: quoted
+  end
+
+  # Prints each cons chain as a non_empty_list(elem, ending) over-approximation.
+  defp list_rolled_to_quoted(bdd, empty?, recur, opts) do
+    # A generated element can contain the original type again. Render
+    # generated elements and endings without rolling them a second time.
+    opts = Keyword.put(opts, :list_cons_normalized, true)
+
+    quoted =
+      bdd
+      |> list_roll()
+      |> Enum.map(fn
+        {elem, ending} when ending == @empty_list ->
+          {:non_empty_list, [], [recur.(elem, opts)]}
+
+        {elem, ending} ->
+          quoted_list(:non_empty_list, recur.(elem, opts), recur.(ending, opts))
+      end)
+      |> Enum.sort()
+
+    case {empty?, Enum.find_index(quoted, &match?({:non_empty_list, _, [_]}, &1))} do
+      {false, _} -> quoted
+      {true, nil} -> [{:empty_list, [], []} | quoted]
+      {true, index} -> List.update_at(quoted, index, fn {_, _, args} -> {:list, [], args} end)
+    end
+  end
+
+  defp list_printable_lines(bdd) do
+    bdd
+    |> bdd_to_dnf()
+    |> Enum.reject(&list_line_empty?/1)
+    |> Enum.map(&list_line_drop_top/1)
+  end
+
+  defp list_line_empty?({pos, negs}) do
+    case list_line_positive([@non_empty_list_top | pos], {:open, []}) do
+      :empty ->
+        true
+
+      {tag, elements} ->
+        tuple_line_elements_empty?(elements, %{}) or tuple_line_empty?(tag, elements, negs)
+    end
+  end
+
+  defp list_line_positive([lit | pos], acc) do
+    case tuple_line_intersection(acc, lit) do
+      :empty -> :empty
+      acc -> list_line_positive(pos, acc)
+    end
+  end
+
+  defp list_line_positive([], acc), do: acc
+
+  # Another positive cons literal already enforces the cons-sort bound.
+  defp list_line_drop_top({[_, _ | _] = pos, negs}),
+    do: {List.delete(pos, @non_empty_list_top), negs}
+
+  defp list_line_drop_top(line), do: line
 
   defp list_literal_to_quoted(
          bdd_leaf(:closed, [head, {{:list_closure, head, base}, :list_closure, nil}]),
          recur,
          opts
        ) do
-    args = if base == @empty_list, do: [head], else: [head, base]
-    {:non_empty_list, [], Enum.map(args, &recur.(&1, opts))}
+    head = recur.(head, opts)
+
+    if base == @empty_list,
+      do: {:non_empty_list, [], [head]},
+      else: quoted_list(:non_empty_list, head, recur.(base, opts))
   end
 
+  defp list_literal_to_quoted(@non_empty_list_top, _recur, _opts),
+    do: {:non_empty_list, [], [{:term, [], []}, {:term, [], []}]}
+
   defp list_literal_to_quoted(bdd_leaf(:closed, [head, tail]), recur, opts),
-    do: {:list_cons, [], [recur.(head, opts), recur.(tail, opts)]}
+    do: quoted_list(:list_cons, recur.(head, opts), recur.(tail, opts))
 
   defp list_closure_to_quoted(head, base, recur, opts) when base == @empty_list,
     do: {:list, [], [recur.(head, opts)]}
 
-  defp list_closure_to_quoted(head, base, recur, opts),
-    do:
-      {:or, [],
-       [recur.(base, opts), {:non_empty_list, [], [recur.(head, opts), recur.(base, opts)]}]}
-
-  defp homogeneous_list_bdd(
-         bdd_leaf(:closed, [head, {{:list_closure, node_head, base}, :list_closure, nil}])
-       ) do
-    if head == node_head, do: {:ok, head, base}, else: :error
+  defp list_closure_to_quoted(head, base, recur, opts) do
+    head = recur.(head, opts)
+    base = recur.(base, opts)
+    quoted_union(base, quoted_list(:non_empty_list, head, base))
   end
 
-  defp homogeneous_list_bdd(bdd) do
-    case list_product_bdd(bdd) |> tuple_bdd_to_dnf_with_negations() do
-      [{:closed, [head, {{:list_closure, node_head, base}, :list_closure, nil}], []}]
-      when head == node_head ->
-        {:ok, head, base}
+  defp quoted_list(_kind, head, {:list, _, [head]}), do: {:non_empty_list, [], [head]}
 
-      _ ->
-        :error
-    end
-  end
+  # With unrestricted heads, every finite cons chain reaches a non-cons ending.
+  defp quoted_list(
+         :non_empty_list,
+         {:term, _, []} = top,
+         {:not, _, [{:non_empty_list, _, [top, top]}]}
+       ),
+       do: {:non_empty_list, [], [top, top]}
+
+  defp quoted_list(kind, head, tail), do: {kind, [], [head, tail]}
 
   defp homogeneous_list_leaf(
          bdd_leaf(:closed, [head, {{:list_closure, head, base}, :list_closure, nil}])
@@ -2912,6 +3250,79 @@ defmodule Module.Types.Descr do
        do: {:ok, head, base}
 
   defp homogeneous_list_leaf(_bdd), do: :error
+
+  # This function rolls forward the list_cons to print an approximation of the list.
+  # The goal is to eliminate all list_cons. Each cons chain becomes `{elem, ending}`,
+  # meaning non_empty_list(elem, ending), where elem is the union of every head
+  # along the chain: element order and list length are lost.
+  # For instance, list_cons(integer(), list_cons(boolean(), empty_list())) will be
+  # printed as non_empty_list(integer() or boolean()).
+  defp list_roll(bdd) do
+    bdd
+    |> list_cons_pairs()
+    |> Enum.reduce([], fn
+      # Recognized non_empty_list(head, base) keeps its exact ending.
+      {head, {{:list_closure, head, base}, :list_closure, nil}}, rolled ->
+        [{head, base} | rolled]
+
+      {head, tail}, rolled ->
+        list_roll_tail(tail, head, %{}, rolled)
+    end)
+    |> Enum.reverse()
+    |> list_roll_simplify()
+  end
+
+  # Repeating the closure head any number of times only extends elem.
+  defp list_roll_tail({{:list_closure, head, base}, :list_closure, nil}, elem, seen, rolled),
+    do: list_roll_tail(base, opt_union(elem, head), seen, rolled)
+
+  # Tails repeat along a path through recursive types and unfolded intersections.
+  # Going around the cycle again only matters if elem has grown since.
+  defp list_roll_tail(tail, elem, seen, rolled) do
+    case seen do
+      %{^tail => previous} ->
+        if subtype?(elem, previous),
+          do: rolled,
+          else: list_roll_visit(tail, opt_union(previous, elem), seen, rolled)
+
+      %{} ->
+        list_roll_visit(tail, elem, seen, rolled)
+    end
+  end
+
+  defp list_roll_visit(tail, elem, seen, rolled) do
+    seen = Map.put(seen, tail, elem)
+
+    case if tail == :term, do: :term, else: unfold(tail) do
+      %{list: bdd} = descr when not is_map_key(descr, :dynamic) ->
+        ending = Map.delete(descr, :list)
+        rolled = if ending == @none, do: rolled, else: [{elem, ending} | rolled]
+
+        Enum.reduce(list_cons_pairs(bdd), rolled, fn {head, tail}, rolled ->
+          list_roll_tail(tail, opt_union(elem, head), seen, rolled)
+        end)
+
+      _ ->
+        [{elem, tail} | rolled]
+    end
+  end
+
+  # non_empty_list(e1, t1) is contained in non_empty_list(e2, t2) when e1 <= e2
+  # and t1 <= t2. Lists sharing elem merge their endings exactly.
+  defp list_roll_simplify(rolled) do
+    rolled
+    |> Enum.reduce([], fn {elem, ending}, kept ->
+      if Enum.any?(kept, fn {e, t} -> subtype?(elem, e) and subtype?(ending, t) end) do
+        kept
+      else
+        {same, others} = Enum.split_with(kept, fn {e, _} -> e == elem end)
+        ending = Enum.reduce(same, ending, fn {_, t}, acc -> opt_union(t, acc) end)
+        others = Enum.reject(others, fn {e, t} -> subtype?(e, elem) and subtype?(t, ending) end)
+        [{elem, ending} | others]
+      end
+    end)
+    |> Enum.reverse()
+  end
 
   ## Dynamic
   #
@@ -5668,26 +6079,29 @@ defmodule Module.Types.Descr do
   # literals. We intersect the positive literals as we traverse the BDD, so
   # we can discard whole subtrees as soon as their sizes are disjoint. The
   # emptiness of the elements is checked once per line, see tuple_line_elements_empty?/2.
-  defp tuple_bdd_to_dnf(acc, _pos, _negs, :bdd_bot), do: acc
-  defp tuple_bdd_to_dnf(acc, {tag, elements}, negs, :bdd_top), do: [{tag, elements, negs} | acc]
+  defp tuple_bdd_to_dnf(acc, pos, negs, bdd, intersection_fun \\ &bare_intersection/2)
+  defp tuple_bdd_to_dnf(acc, _pos, _negs, :bdd_bot, _fun), do: acc
 
-  defp tuple_bdd_to_dnf(acc, pos, negs, bdd_leaf(_, _) = lit) do
-    case tuple_line_intersection(pos, lit) do
+  defp tuple_bdd_to_dnf(acc, {tag, elements}, negs, :bdd_top, _fun),
+    do: [{tag, elements, negs} | acc]
+
+  defp tuple_bdd_to_dnf(acc, pos, negs, bdd_leaf(_, _) = lit, intersection_fun) do
+    case tuple_line_intersection(pos, lit, intersection_fun) do
       :empty -> acc
       {tag, elements} -> [{tag, elements, negs} | acc]
     end
   end
 
-  defp tuple_bdd_to_dnf(acc, pos, negs, {_, lit, c, u, d}) do
-    acc = tuple_bdd_to_dnf(acc, pos, negs, u)
+  defp tuple_bdd_to_dnf(acc, pos, negs, {_, lit, c, u, d}, intersection_fun) do
+    acc = tuple_bdd_to_dnf(acc, pos, negs, u, intersection_fun)
 
     acc =
-      case tuple_line_intersection(pos, lit) do
+      case tuple_line_intersection(pos, lit, intersection_fun) do
         :empty -> acc
-        pos -> tuple_bdd_to_dnf(acc, pos, negs, c)
+        pos -> tuple_bdd_to_dnf(acc, pos, negs, c, intersection_fun)
       end
 
-    tuple_bdd_to_dnf(acc, pos, [lit | negs], d)
+    tuple_bdd_to_dnf(acc, pos, [lit | negs], d, intersection_fun)
   end
 
   # Same as tuple_bdd_to_dnf/4 but checks if all lines are empty,
@@ -5721,14 +6135,18 @@ defmodule Module.Types.Descr do
     end
   end
 
-  defp tuple_line_intersection({tag1, elements1}, bdd_leaf(tag2, elements2)) do
+  defp tuple_line_intersection(
+         {tag1, elements1},
+         bdd_leaf(tag2, elements2),
+         intersection_fun \\ &bare_intersection/2
+       ) do
     case tuple_sizes_strategy(tag1, length(elements1), tag2, length(elements2)) do
       :disjoint ->
         :empty
 
       _ ->
         tag = if tag1 == :open and tag2 == :open, do: :open, else: :closed
-        {tag, zip_intersection(elements1, elements2, [], &bare_intersection/2)}
+        {tag, zip_intersection(elements1, elements2, [], intersection_fun)}
     end
   end
 
@@ -5855,12 +6273,18 @@ defmodule Module.Types.Descr do
 
   defp tuple_empty_sizes?(_n, _m, _elements, _negs, _seen), do: true
 
-  defp tuple_eliminate_negations(tag, elements, negs) do
+  defp tuple_eliminate_negations(tag, elements, negs, difference_fun, intersection_fun) do
     :lists.foldl(
       fn bdd_leaf(neg_tag, neg_elements), acc ->
         :lists.flatmap(
           fn {tag, elements} ->
-            tuple_eliminate_single_negation(tag, elements, {neg_tag, neg_elements})
+            tuple_eliminate_single_negation(
+              tag,
+              elements,
+              {neg_tag, neg_elements},
+              difference_fun,
+              intersection_fun
+            )
           end,
           acc
         )
@@ -5872,7 +6296,13 @@ defmodule Module.Types.Descr do
 
   # Returns tuples whose union is the difference. The size and content
   # branches may overlap.
-  defp tuple_eliminate_single_negation(tag, elements, {neg_tag, neg_elements}) do
+  defp tuple_eliminate_single_negation(
+         tag,
+         elements,
+         {neg_tag, neg_elements},
+         difference_fun,
+         intersection_fun
+       ) do
     n = length(elements)
     m = length(neg_elements)
 
@@ -5885,7 +6315,7 @@ defmodule Module.Types.Descr do
       [{tag, elements}]
     else
       tuple_elim_size(n, m, tag, elements, neg_tag) ++
-        tuple_elim_content([], tag, elements, neg_elements)
+        tuple_elim_content([], tag, elements, neg_elements, difference_fun, intersection_fun)
     end
   end
 
@@ -5899,12 +6329,19 @@ defmodule Module.Types.Descr do
   # - `neg_elements` are the corresponding negative tuple element types.
   #
   # For position i:
-  #   - One branch mismatches here:  (ti \ ui), with earlier positions fixed to bare_intersection(tj, uj).
-  #   - The other recursive path forces match here: bare_intersection(ti, ui) and continues to i+1.
+  #   - One branch mismatches here:  (ti \ ui), with earlier positions fixed to intersection(tj, uj).
+  #   - The other recursive path forces match here: intersection(ti, ui) and continues to i+1.
   #
   # This yields disjoint branches like:
   #   {t1 /\ not u1, t2, t3, ...} OR {t1 /\ u1, t2 /\ not u2, t3, ...} OR {t1/\u1, t2/\u2, t3/\ not u3, ...} ...
-  defp tuple_elim_content(acc, tag, elements, [neg_type | neg_elements]) do
+  defp tuple_elim_content(
+         acc,
+         tag,
+         elements,
+         [neg_type | neg_elements],
+         difference_fun,
+         intersection_fun
+       ) do
     # If `elements` is shorter, default to top type `term()` (as in your example).
     [ty | rest] =
       case elements do
@@ -5913,9 +6350,9 @@ defmodule Module.Types.Descr do
       end
 
     # ti \ ui  (i.e., ti and not ui)
-    diff = bare_difference(ty, neg_type)
+    diff = difference_fun.(ty, neg_type)
     # ti /\ ui
-    meet = bare_intersection(ty, neg_type)
+    meet = intersection_fun.(ty, neg_type)
 
     # Branch where the earliest difference is *here*.
     # Earlier positions are the accumulated matches in `acc`;
@@ -5932,7 +6369,14 @@ defmodule Module.Types.Descr do
       if empty?(meet) do
         []
       else
-        tuple_elim_content([meet | acc], tag, rest, neg_elements)
+        tuple_elim_content(
+          [meet | acc],
+          tag,
+          rest,
+          neg_elements,
+          difference_fun,
+          intersection_fun
+        )
       end
 
     here_branch ++ later_branches
@@ -5940,7 +6384,7 @@ defmodule Module.Types.Descr do
 
   # No more negative elements to process: there is no "all-equal" branch to add,
   # because we're constructing {t} ant not {u}, which must differ somewhere.
-  defp tuple_elim_content(_acc, _tag, _elements, []) do
+  defp tuple_elim_content(_acc, _tag, _elements, [], _difference_fun, _intersection_fun) do
     []
   end
 
@@ -5977,14 +6421,18 @@ defmodule Module.Types.Descr do
   end
 
   # Transforms a bdd into a union of tuples with no negations.
-  defp tuple_bdd_to_dnf_no_negations(bdd) do
+  defp tuple_bdd_to_dnf_no_negations(
+         bdd,
+         difference_fun \\ &bare_difference/2,
+         intersection_fun \\ &bare_intersection/2
+       ) do
     :lists.flatmap(
       fn {tag, elements, negs} ->
         if tuple_line_elements_empty?(elements, %{}),
           do: [],
-          else: tuple_eliminate_negations(tag, elements, negs)
+          else: tuple_eliminate_negations(tag, elements, negs, difference_fun, intersection_fun)
       end,
-      tuple_bdd_to_dnf([], {:open, []}, [], bdd)
+      tuple_bdd_to_dnf([], {:open, []}, [], bdd, intersection_fun)
     )
     # We want to avoid each_singleton? from failing,
     # so we remove contiguous duplicates (cheaper than uniq)
@@ -7402,7 +7850,7 @@ defmodule Module.Types.Descr do
     opt_difference(term(), descr)
   end
 
-  defp opt_list_union(bdd1, bdd2, seen) do
+  defp opt_list_union(bdd_leaf(_, _) = bdd1, bdd_leaf(_, _) = bdd2, seen) do
     case {homogeneous_list_leaf(bdd1), homogeneous_list_leaf(bdd2)} do
       {{:ok, head1, base1}, {:ok, head2, base2}} ->
         cond do
@@ -7417,17 +7865,24 @@ defmodule Module.Types.Descr do
     end
   end
 
-  defp opt_list_intersection(bdd1, bdd2, seen) do
-    cond do
-      bdd1 == bdd2 -> bdd1
-      bdd1 == @non_empty_list_top -> bdd2
-      bdd2 == @non_empty_list_top -> bdd1
-      true -> opt_list_intersection_products(bdd1, bdd2, seen)
+  defp opt_list_union(bdd1, bdd2, _seen), do: list_union(bdd1, bdd2)
+
+  defp opt_list_intersection(bdd, bdd, _seen), do: bdd
+  defp opt_list_intersection(@non_empty_list_top, bdd, _seen), do: bdd
+  defp opt_list_intersection(bdd, @non_empty_list_top, _seen), do: bdd
+
+  defp opt_list_intersection(bdd_leaf(_, _) = bdd1, bdd_leaf(_, _) = bdd2, seen) do
+    case opt_bdd_seen(seen, :list_intersection, bdd1, bdd2) do
+      :seen -> bdd_intersection(bdd1, bdd2)
+      {:ok, seen} -> opt_list_intersection_products(bdd1, bdd2, seen)
     end
   end
 
+  defp opt_list_intersection(bdd1, bdd2, _seen),
+    do: bdd_intersection(list_product_bdd(bdd1), list_product_bdd(bdd2))
+
   defp opt_list_intersection_products(bdd1, bdd2, seen) do
-    case {homogeneous_list_bdd(bdd1), homogeneous_list_bdd(bdd2)} do
+    case {homogeneous_list_leaf(bdd1), homogeneous_list_leaf(bdd2)} do
       {{:ok, head1, base1}, {:ok, head2, base2}} ->
         cond do
           subtype_seen?(head1, head2, seen) and subtype_seen?(base1, base2, seen) ->
@@ -7443,23 +7898,11 @@ defmodule Module.Types.Descr do
             if empty?(head) or empty?(base), do: :bdd_bot, else: list_descr_bdd(head, base)
 
           true ->
-            case opt_bdd_seen(seen, :list_intersection, bdd1, bdd2) do
-              :seen -> bdd_intersection(bdd1, bdd2)
-              {:ok, seen} -> opt_list_leaf_intersection(bdd1, bdd2, seen)
-            end
+            opt_list_leaf_intersection(bdd1, bdd2, seen)
         end
 
       _ ->
-        cond do
-          match?(bdd_leaf(_, _), bdd1) and match?(bdd_leaf(_, _), bdd2) ->
-            case opt_bdd_seen(seen, :list_intersection, bdd1, bdd2) do
-              :seen -> bdd_intersection(bdd1, bdd2)
-              {:ok, seen} -> opt_list_leaf_intersection(bdd1, bdd2, seen)
-            end
-
-          true ->
-            bdd_intersection(list_product_bdd(bdd1), list_product_bdd(bdd2))
-        end
+        opt_list_leaf_intersection(bdd1, bdd2, seen)
     end
   end
 
@@ -7480,8 +7923,8 @@ defmodule Module.Types.Descr do
 
   defp opt_list_difference(_bdd, @non_empty_list_top, _seen), do: :bdd_bot
 
-  defp opt_list_difference(bdd1, bdd2, seen) do
-    case {homogeneous_list_bdd(bdd1), homogeneous_list_bdd(bdd2)} do
+  defp opt_list_difference(bdd_leaf(_, _) = bdd1, bdd_leaf(_, _) = bdd2, seen) do
+    case {homogeneous_list_leaf(bdd1), homogeneous_list_leaf(bdd2)} do
       {{:ok, head1, base1}, {:ok, head2, base2}}
       when base1 != :term and base2 != :term ->
         if list_terminal_only?(base1) and list_terminal_only?(base2) and
@@ -7497,6 +7940,8 @@ defmodule Module.Types.Descr do
         opt_list_product_difference(bdd1, bdd2)
     end
   end
+
+  defp opt_list_difference(bdd1, bdd2, _seen), do: opt_list_product_difference(bdd1, bdd2)
 
   defp opt_list_product_difference(bdd1, bdd2) do
     bdd_difference(

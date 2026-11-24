@@ -615,11 +615,8 @@ defmodule Module.Types.RecursiveTest do
       right = recursive(equations).x
       type = bare_intersection(non_empty_list(left), non_empty_list(right))
 
-      assert to_quoted_string(type) ==
-               """
-               non_empty_list(recur(t1, nil or non_empty_list(t1))) and
-                 non_empty_list(recur(t1, nil or non_empty_list(t1)))\
-               """
+      assert equal?(type, non_empty_list(left))
+      assert to_quoted_string(type) == "non_empty_list(recur(t1, nil or non_empty_list(t1)))"
     end
 
     test "terminates on an intersection of recursive list tails" do
@@ -631,11 +628,8 @@ defmodule Module.Types.RecursiveTest do
       right = recursive(equations).x
       type = bare_intersection(non_empty_list(integer(), left), non_empty_list(integer(), right))
 
-      assert to_quoted_string(type) ==
-               """
-               non_empty_list(integer(), recur(t1, empty_list() or non_empty_list(integer(), t1))) and
-                 non_empty_list(integer(), recur(t1, empty_list() or non_empty_list(integer(), t1)))\
-               """
+      assert to_quoted_string(type) == "non_empty_list(integer())"
+      assert equal?(type, non_empty_list(integer()))
     end
 
     test "preserves the list element type in another tuple field" do
@@ -645,6 +639,42 @@ defmodule Module.Types.RecursiveTest do
 
       assert to_quoted_string(type) ==
                "{recur(t1, nil or {t1}), non_empty_list(integer(), not non_empty_list(term(), term()))}"
+    end
+
+    test "prints recursion-free children with the ordinary printer" do
+      node = recursive(%{x: fn recur -> bare_union(atom([nil]), tuple([recur.(:x)])) end}).x
+
+      for child <- [
+            bare_difference(tuple(), tuple([integer()])),
+            bare_negation(non_empty_list(term(), term())),
+            list_cons(integer(), none())
+          ] do
+        assert {:{}, [], [_, quoted_child]} = to_quoted(tuple([node, child]))
+        assert quoted_child == to_quoted(child)
+      end
+
+      child =
+        closed_map(
+          __struct__: {atom([Point]), false},
+          x: {term(), false},
+          y: {term(), false},
+          z: {term(), false}
+        )
+
+      refute to_quoted(child) == to_quoted(child, collapse_structs: false)
+
+      for opts <- [[], [collapse_structs: false]] do
+        assert {:{}, [], [_, quoted_child]} = to_quoted(tuple([node, child]), opts)
+        assert quoted_child == to_quoted(child, opts)
+      end
+    end
+
+    test "preserves gradual bounds beside recursive children" do
+      node = recursive(%{x: fn recur -> bare_union(atom([nil]), tuple([recur.(:x)])) end}).x
+      type = tuple([node, bare_union(integer(), dynamic())])
+
+      assert to_quoted_string(type) ==
+               "dynamic({recur(t1, nil or {t1}), term()}) or {recur(t1, nil or {t1}), integer()}"
     end
 
     test "list last types" do
@@ -686,7 +716,8 @@ defmodule Module.Types.RecursiveTest do
       right = recursive(equations).x
       type = opt_intersection(non_empty_list(integer(), left), non_empty_list(integer(), right))
 
-      assert to_quoted_string(type) == "non_empty_list(integer(), nil)"
+      assert to_quoted_string(type) ==
+               "non_empty_list(integer(), recur(t1, nil or non_empty_list(atom(), t1)))"
     end
 
     test "prints an intersection of recursive function results" do

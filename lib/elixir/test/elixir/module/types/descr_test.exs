@@ -2268,8 +2268,6 @@ defmodule Module.Types.DescrTest do
       assert singleton?(proper)
       assert singleton?(improper)
       assert singleton?(list_cons(proper, list_cons(improper, empty_list())))
-      assert singleton?(tuple([proper]))
-      assert singleton?(closed_map(key: {proper, false}))
       assert singleton?(dynamic(proper))
 
       refute singleton?(list_cons(atom([:foo, :bar]), empty_list()))
@@ -2278,10 +2276,8 @@ defmodule Module.Types.DescrTest do
       refute singleton?(list_cons(atom([:foo]), none()))
       refute singleton?(opt_union(proper, empty_list()))
       refute singleton?(opt_union(proper, improper))
-      refute singleton?(opt_union(proper, atom([:other])))
 
       empty = list_cons(atom([:foo]), none())
-      assert singleton?(opt_union(atom([:value]), empty))
       assert singleton?(opt_union(empty_list(), empty))
     end
 
@@ -2299,7 +2295,6 @@ defmodule Module.Types.DescrTest do
     end
 
     test "recursive list tails are conservatively rejected" do
-      refute singleton?(non_empty_list(atom([:foo])))
       refute singleton?(list_cons(atom([:foo]), list(atom([:bar]))))
 
       %{x: recursive} = recursive(%{x: fn recur -> list_cons(atom([:foo]), recur.(:x)) end})

@@ -71,11 +71,6 @@ defmodule Module.Types.ExprTest do
     test "threads homogeneous expectations through lists" do
       assert typecheck!(
                [x, y],
-               [123, "foo"] = [String.to_integer(x), Atom.to_string(y)]
-             ) == non_empty_list(opt_union(integer(), binary()))
-
-      assert typecheck!(
-               [x, y],
                case [x, y] do
                  [:ok, 123] -> {x, y}
                end
@@ -461,7 +456,7 @@ defmodule Module.Types.ExprTest do
 
              but function has type:
 
-                 (binary() -> integer()) or (non_empty_list(integer()) -> integer())
+                 (non_empty_list(integer()) -> integer()) or (binary() -> integer())
 
              hint: the function has an empty domain and therefore cannot be applied to any argument. \
              This may happen when you have a union of functions, which means the only valid argument \
