@@ -145,7 +145,7 @@ consolidate(Map, Checker, TypeSpecs, DocsChunk) ->
 checker_chunk(nil, _ChunkOpts) ->
   [];
 checker_chunk(Contents, ChunkOpts) ->
-  [{<<"ExCk">>, term_to_binary({checker_version(), Contents}, ChunkOpts)}].
+  [{<<"ExCk">>, term_to_binary({checker_version(), Contents}, [compressed | ChunkOpts])}].
 
 %% Dynamic compilation hook, used in regular compiler
 
